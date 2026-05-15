@@ -197,7 +197,7 @@ fn forget_passphrase_in_memory() {
 
 /// How long we wait for `serve.url` to appear after spawning the daemon.
 const TUNNEL_STARTUP_TIMEOUT_SECS: u64 = 60;
-/// How much of `serve.log` to keep in memory for the tail pane.
+/// How much of the configured log file to keep in memory for the tail pane.
 const LOG_TAIL_LINES: usize = 200;
 
 pub enum ServeViewState {
@@ -231,9 +231,10 @@ pub enum ServeViewState {
     },
     /// We issued `aoe serve --daemon`; now polling `serve.url`.
     /// `passphrase` is Some only for Tunnel spawns from this TUI.
-    /// `log_tail` is a rolling window of the daemon's serve.log so the
-    /// user sees real progress during the 30-60s cert-provisioning
-    /// wait on a fresh Tailscale node instead of a frozen screen.
+    /// `log_tail` is a rolling window of the configured log file (since the
+    /// captured offset taken before spawn) so the user sees real progress
+    /// during the 30-60s cert-provisioning wait on a fresh Tailscale node
+    /// instead of a frozen screen.
     Starting {
         mode: ServeMode,
         /// Remembered for restart. None for Local mode or external daemons.
@@ -472,6 +473,13 @@ impl ServeView {
                             ServeAction::Continue
                         }
                         ServeMode::Local => {
+                            // Capture the offset before spawn so the tail
+                            // pane starts at the byte boundary just past any
+                            // pre-existing TUI/runner content; the new
+                            // daemon's startup marker and first events are
+                            // appended past this point and stream in via
+                            // append_new_log_lines.
+                            let offset = log_file_size();
                             match spawn_daemon(ServeMode::Local, None, None) {
                                 Ok(()) => {
                                     remember_last_mode(ServeMode::Local);
@@ -481,7 +489,7 @@ impl ServeView {
                                         passphrase: None,
                                         started_at: Instant::now(),
                                         log_tail: initial_log_tail(),
-                                        log_offset: log_file_size(),
+                                        log_offset: offset,
                                     };
                                 }
                                 Err(e) => dialog.state = ServeViewState::Error(e),
@@ -591,6 +599,9 @@ impl ServeView {
                         }
                         return ServeAction::Continue;
                     }
+                    // Capture offset before spawn so the tail pane streams in
+                    // only the new daemon's startup events.
+                    let offset = log_file_size();
                     match spawn_daemon(
                         ServeMode::Tunnel,
                         Some(&dialog.pending_passphrase),
@@ -604,7 +615,7 @@ impl ServeView {
                                 passphrase: Some(dialog.pending_passphrase.clone()),
                                 started_at: Instant::now(),
                                 log_tail: initial_log_tail(),
-                                log_offset: log_file_size(),
+                                log_offset: offset,
                             };
                         }
                         Err(e) => dialog.state = ServeViewState::Error(e),
@@ -812,6 +823,9 @@ impl ServeView {
         passphrase: Option<String>,
     ) {
         let pp_ref = passphrase.as_deref();
+        // Capture offset before restart so the tail pane streams in only
+        // the new daemon's events.
+        let offset = log_file_size();
         match restart_daemon(mode, pp_ref, transport) {
             Ok(()) => {
                 if let Some(ref pp) = passphrase {
@@ -831,7 +845,7 @@ impl ServeView {
                         passphrase,
                         opened_at: Instant::now(),
                         log_tail: initial_log_tail(),
-                        log_offset: log_file_size(),
+                        log_offset: offset,
                     };
                 } else {
                     self.state = ServeViewState::Starting {
@@ -840,7 +854,7 @@ impl ServeView {
                         passphrase,
                         started_at: Instant::now(),
                         log_tail: initial_log_tail(),
-                        log_offset: log_file_size(),
+                        log_offset: offset,
                     };
                 }
             }
@@ -899,7 +913,7 @@ impl ServeView {
                 log_tail,
                 log_offset,
             } => {
-                // Tail the daemon's serve.log so the user watches real
+                // Tail the configured log file so the user watches real
                 // progress (cert generation, tunnel handshake, etc.)
                 // during the 30-60s wait instead of a frozen screen.
                 let log_changed = append_new_log_lines(log_tail, log_offset);
@@ -1143,8 +1157,9 @@ fn spawn_daemon(
         }
     }
     cmd.stdin(std::process::Stdio::null())
-        // The daemon path forks and logs to serve.log; we only need its
-        // exit status here (it's synchronous since it just double-forks).
+        // The daemon path forks; the child's tracing + stdio land in the
+        // configured log file via stdio_redirect_path. We only need this
+        // wrapper's exit status (synchronous, just double-forks).
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
@@ -1289,7 +1304,7 @@ fn load_or_generate_port() -> u16 {
 }
 
 fn log_file_path() -> Option<PathBuf> {
-    crate::cli::serve::daemon_log_path().ok()
+    crate::cli::serve::stdio_redirect_path().ok()
 }
 
 fn log_file_size() -> u64 {
@@ -1307,8 +1322,19 @@ fn initial_log_tail() -> Vec<String> {
         return Vec::new();
     };
     let all: Vec<&str> = contents.lines().collect();
-    let start = all.len().saturating_sub(LOG_TAIL_LINES);
-    all[start..].iter().map(|s| s.to_string()).collect()
+    // debug.log carries TUI + runner + daemon lines now that serve.log is
+    // gone. Anchor the initial tail at the last [AOE_START_MARKER] (written
+    // by `init_subscriber` for every process) so we show the current
+    // daemon's run rather than mixed history. Falls back to the trailing
+    // window when no marker is found.
+    let anchor = all
+        .iter()
+        .rposition(|line| line.contains("[AOE_START_MARKER]"))
+        .unwrap_or_else(|| all.len().saturating_sub(LOG_TAIL_LINES));
+    let from = anchor.min(all.len());
+    let window = &all[from..];
+    let start = window.len().saturating_sub(LOG_TAIL_LINES);
+    window[start..].iter().map(|s| s.to_string()).collect()
 }
 
 /// Read any new bytes appended to the log file since `offset` and push the
@@ -2580,7 +2606,7 @@ mod tests {
     #[test]
     fn append_new_log_lines_initial_read() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("serve.log");
+        let path = tmp.path().join("debug.log");
         std::fs::write(&path, "first line\nsecond line\n").unwrap();
 
         let mut tail: Vec<String> = Vec::new();
@@ -2594,7 +2620,7 @@ mod tests {
     #[test]
     fn append_new_log_lines_detects_growth_and_truncation() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("serve.log");
+        let path = tmp.path().join("debug.log");
 
         // Seed.
         std::fs::write(&path, "one\ntwo\n").unwrap();
@@ -2624,7 +2650,7 @@ mod tests {
     #[test]
     fn append_new_log_lines_clamps_to_max_lines() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("serve.log");
+        let path = tmp.path().join("debug.log");
 
         // Write well over LOG_TAIL_LINES.
         let mut big = String::new();
