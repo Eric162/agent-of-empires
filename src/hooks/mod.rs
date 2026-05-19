@@ -864,12 +864,13 @@ fn render_hermes_allowlist(config_dir: &Path) -> Result<(std::path::PathBuf, Str
 /// Kiro CLI currently exposes only five hook events: `agentSpawn`,
 /// `userPromptSubmit`, `preToolUse`, `postToolUse`, and `stop`. There is no
 /// equivalent of Claude's `Notification` (with `permission_prompt` matcher),
-/// Codex's `PermissionRequest`, or Hermes's `pre_approval_request` that fires
-/// when the agent pauses waiting for the user to approve a tool. Until Kiro
-/// adds such an event, a Kiro session blocked on tool approval will continue
-/// to show as `running` rather than flipping to `waiting`. Tracked upstream
-/// at <https://github.com/kirodotdev/Kiro/issues> (see AoE issue #961 for the
-/// AoE-side follow-up).
+/// Gemini's `Notification` (with `ToolPermission` matcher), Codex's
+/// `PermissionRequest`, or Hermes's `pre_approval_request` that fires when
+/// the agent pauses waiting for the user to approve a tool. Until Kiro adds
+/// such an event, a Kiro session blocked on tool approval will continue to
+/// show as `running` rather than flipping to `waiting`. Feature request to
+/// be filed against <https://github.com/kirodotdev/Kiro>; see AoE issue
+/// #961 for the AoE-side follow-up.
 const KIRO_HOOKS: &[(&str, &str)] = &[
     ("preToolUse", "running"),
     ("userPromptSubmit", "running"),
