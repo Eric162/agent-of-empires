@@ -6863,6 +6863,7 @@ mod new_session_attach_mode {
             extra_env: Vec::new(),
             extra_args: String::new(),
             command_override: String::new(),
+            throwaway: false,
         }
     }
 
