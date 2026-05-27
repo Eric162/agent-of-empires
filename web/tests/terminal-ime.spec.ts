@@ -99,4 +99,20 @@ test.describe("Terminal IME input", () => {
       .toContain("你好");
     expect(sentText(handle, start)).not.toContain("n");
   });
+
+  test("Shift+Enter sends ESC+CR instead of bare CR", async ({ page }) => {
+    const handle = await mockTerminalApis(page);
+    await page.goto("/");
+    await openSession(page, handle);
+
+    const start = handle.wsMessages.length;
+    await page.locator(".xterm").first().locator("textarea").focus();
+    await page.keyboard.down("Shift");
+    await page.keyboard.press("Enter");
+    await page.keyboard.up("Shift");
+
+    await expect
+      .poll(() => sentText(handle, start), { timeout: 5_000 })
+      .toContain("\x1b\r");
+  });
 });

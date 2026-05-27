@@ -259,6 +259,19 @@ export function useTerminal(
 
     term.open(termEl);
 
+    // Shift+Enter → ESC+CR so tmux/crossterm sees it as a distinct key
+    // (most physical terminals emit this sequence natively; xterm.js does not).
+    term.attachCustomKeyEventHandler((ev) => {
+      if (ev.type === "keydown" && ev.key === "Enter" && ev.shiftKey) {
+        const ws = wsRef.current;
+        if (ws?.readyState === WebSocket.OPEN) {
+          ws.send(new TextEncoder().encode("\x1b\r"));
+        }
+        return false;
+      }
+      return true;
+    });
+
     // GPU renderer. Loaded after .open() per the addon's contract. Falls
     // back to the DOM renderer silently on machines where the context is
     // unavailable (Safari private mode, headless CI, software-render VMs)
