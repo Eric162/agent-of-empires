@@ -259,14 +259,17 @@ export function useTerminal(
 
     term.open(termEl);
 
-    // Shift+Enter → CSI 13;2 u (kitty keyboard protocol) so tmux
-    // extended-keys forwards it and the inner app sees Shift+Enter, not
-    // bare Enter. xterm.js does not emit modifier info for Enter natively.
+    // Shift+Enter → bracketed paste containing a newline. Agents like
+    // Claude Code treat pasted newlines as literal text (inserted, not
+    // submitted). Bracketed paste passes cleanly through tmux without
+    // requiring extended-keys negotiation.
     term.attachCustomKeyEventHandler((ev) => {
-      if (ev.type === "keydown" && ev.key === "Enter" && ev.shiftKey) {
-        const ws = wsRef.current;
-        if (ws?.readyState === WebSocket.OPEN) {
-          ws.send(new TextEncoder().encode("\x1b[13;2u"));
+      if (ev.key === "Enter" && ev.shiftKey) {
+        if (ev.type === "keydown") {
+          const ws = wsRef.current;
+          if (ws?.readyState === WebSocket.OPEN) {
+            ws.send(new TextEncoder().encode("\x1b[200~\n\x1b[201~"));
+          }
         }
         return false;
       }
