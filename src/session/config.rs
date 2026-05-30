@@ -1138,6 +1138,10 @@ pub struct SandboxConfig {
     #[serde(default, deserialize_with = "super::serde_helpers::string_or_vec")]
     pub volume_ignores: Vec<String>,
 
+    /// Strategy for mounting volume_ignores paths (anonymous or named)
+    #[serde(default)]
+    pub volume_ignores_strategy: VolumeIgnoresStrategy,
+
     /// Mount ~/.ssh into sandbox containers (default: false)
     #[serde(default)]
     pub mount_ssh: bool,
@@ -1161,6 +1165,21 @@ pub enum ContainerRuntimeName {
     Podman,
 }
 
+/// Volume mounting strategy for volume_ignores paths.
+///
+/// On macOS with Docker Desktop's VirtioFS, anonymous volumes don't always shadow
+/// bind-mount subdirectories. Use `Named` to mount deterministic named Docker/Podman
+/// volumes instead, which live in the Docker VM and bypass VirtioFS reliably.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeIgnoresStrategy {
+    /// Use anonymous volumes (default; works on Linux; may not shadow on macOS/VirtioFS)
+    #[default]
+    Anonymous,
+    /// Use deterministic named volumes (required on macOS/VirtioFS; explicitly cleaned up on session delete)
+    Named,
+}
+
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
@@ -1174,6 +1193,7 @@ impl Default for SandboxConfig {
             port_mappings: Vec::new(),
             default_terminal_mode: DefaultTerminalMode::default(),
             volume_ignores: Vec::new(),
+            volume_ignores_strategy: VolumeIgnoresStrategy::default(),
             mount_ssh: false,
             custom_instruction: None,
             container_runtime: ContainerRuntimeName::default(),
@@ -2261,5 +2281,42 @@ keep_count = 10
         let reparsed: LoggingConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(reparsed.output, SinkKind::Stdout);
         assert_eq!(reparsed.rotation, RotationKind::Never);
+    }
+
+    #[test]
+    fn test_volume_ignores_strategy_defaults_to_anonymous() {
+        let config: SandboxConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            config.volume_ignores_strategy,
+            VolumeIgnoresStrategy::Anonymous
+        );
+    }
+
+    #[test]
+    fn test_volume_ignores_strategy_named_roundtrip() {
+        let toml_str = r#"
+volume_ignores = ["node_modules"]
+volume_ignores_strategy = "named"
+"#;
+        let config: SandboxConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.volume_ignores_strategy, VolumeIgnoresStrategy::Named);
+        assert_eq!(config.volume_ignores, vec!["node_modules"]);
+
+        let serialized = toml::to_string(&config).unwrap();
+        let reparsed: SandboxConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            reparsed.volume_ignores_strategy,
+            VolumeIgnoresStrategy::Named
+        );
+    }
+
+    #[test]
+    fn test_volume_ignores_strategy_anonymous_roundtrip() {
+        let toml_str = r#"volume_ignores_strategy = "anonymous""#;
+        let config: SandboxConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.volume_ignores_strategy,
+            VolumeIgnoresStrategy::Anonymous
+        );
     }
 }

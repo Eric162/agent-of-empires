@@ -867,6 +867,11 @@ impl SettingsView {
                     s.container_runtime = None;
                 }
             }
+            FieldKey::VolumeIgnoresStrategy => {
+                if let Some(ref mut s) = config.sandbox {
+                    s.volume_ignores_strategy = None;
+                }
+            }
             // Sound
             FieldKey::SoundEnabled => {
                 if let Some(ref mut s) = config.sound {

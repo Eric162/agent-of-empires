@@ -3,6 +3,7 @@
 use crate::session::{
     validate_check_interval, validate_snooze_duration, Config, ContainerRuntimeName,
     DefaultTerminalMode, ProfileConfig, TmuxClipboardMode, TmuxMouseMode, TmuxStatusBarMode,
+    VolumeIgnoresStrategy,
 };
 use crate::sound::{
     validate_sound_exists, volume_from_option, volume_options, volume_to_index, SoundMode,
@@ -85,6 +86,7 @@ pub enum FieldKey {
     ExtraVolumes,
     PortMappings,
     VolumeIgnores,
+    VolumeIgnoresStrategy,
     MountSsh,
     CustomInstruction,
     ContainerRuntime,
@@ -1250,6 +1252,11 @@ fn build_sandbox_fields(
         global.sandbox.container_runtime,
         sb.and_then(|s| s.container_runtime),
     );
+    let (volume_ignores_strategy, o_vis) = resolve_value(
+        scope,
+        global.sandbox.volume_ignores_strategy,
+        sb.and_then(|s| s.volume_ignores_strategy),
+    );
 
     let terminal_mode_selected = match default_terminal_mode {
         DefaultTerminalMode::Host => 0,
@@ -1275,6 +1282,16 @@ fn build_sandbox_fields(
     };
     let container_runtime_options =
         vec!["Docker".into(), "Podman".into(), "Apple Container".into()];
+
+    let volume_ignores_strategy_selected = match volume_ignores_strategy {
+        VolumeIgnoresStrategy::Anonymous => 0,
+        VolumeIgnoresStrategy::Named => 1,
+    };
+    let global_volume_ignores_strategy_selected = match global.sandbox.volume_ignores_strategy {
+        VolumeIgnoresStrategy::Anonymous => 0,
+        VolumeIgnoresStrategy::Named => 1,
+    };
+    let volume_ignores_strategy_options = vec!["anonymous".into(), "named".into()];
 
     vec![
         SettingField {
@@ -1398,6 +1415,24 @@ fn build_sandbox_fields(
             inherited_display: inherited_if(
                 o7,
                 FieldValue::List(global.sandbox.volume_ignores.clone()),
+            ),
+        },
+        SettingField {
+            key: FieldKey::VolumeIgnoresStrategy,
+            label: "Volume Ignores Strategy",
+            description: "anonymous: default, works on Linux. named: use deterministic Docker/Podman named volumes, required on macOS/VirtioFS to reliably shadow bind-mount subdirectories.",
+            value: FieldValue::Select {
+                selected: volume_ignores_strategy_selected,
+                options: volume_ignores_strategy_options.clone(),
+            },
+            category: SettingsCategory::Sandbox,
+            has_override: o_vis,
+            inherited_display: inherited_if(
+                o_vis,
+                FieldValue::Select {
+                    selected: global_volume_ignores_strategy_selected,
+                    options: volume_ignores_strategy_options,
+                },
             ),
         },
         SettingField {
@@ -2568,6 +2603,12 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
                 _ => ContainerRuntimeName::AppleContainer,
             };
         }
+        (FieldKey::VolumeIgnoresStrategy, FieldValue::Select { selected, .. }) => {
+            config.sandbox.volume_ignores_strategy = match selected {
+                1 => VolumeIgnoresStrategy::Named,
+                _ => VolumeIgnoresStrategy::Anonymous,
+            };
+        }
         // Tmux
         (FieldKey::StatusBar, FieldValue::Select { selected, .. }) => {
             config.tmux.status_bar = match selected {
@@ -2951,6 +2992,15 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
             };
             set_profile_override(runtime, &mut config.sandbox, |s, val| {
                 s.container_runtime = val
+            });
+        }
+        (FieldKey::VolumeIgnoresStrategy, FieldValue::Select { selected, .. }) => {
+            let strategy = match selected {
+                1 => VolumeIgnoresStrategy::Named,
+                _ => VolumeIgnoresStrategy::Anonymous,
+            };
+            set_profile_override(strategy, &mut config.sandbox, |s, val| {
+                s.volume_ignores_strategy = val
             });
         }
         // Tmux

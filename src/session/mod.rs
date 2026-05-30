@@ -25,7 +25,7 @@ pub use config::{
     get_update_settings, load_config, save_config, validate_snooze_duration, ClickAction, Config,
     ContainerRuntimeName, DefaultTerminalMode, GroupByMode, NewSessionAttachMode, RowTagMode,
     SandboxConfig, SessionConfig, ThemeConfig, TmuxClipboardMode, TmuxMouseMode, TmuxStatusBarMode,
-    UpdatesConfig, WorktreeConfig,
+    UpdatesConfig, VolumeIgnoresStrategy, WorktreeConfig,
 };
 pub(crate) use environment::user_shell;
 pub use environment::{validate_env_entries, validate_env_entry};

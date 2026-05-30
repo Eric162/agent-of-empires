@@ -10,7 +10,7 @@ use std::fs;
 
 use super::config::{
     ColorMode, Config, ContainerRuntimeName, DefaultTerminalMode, TmuxClipboardMode, TmuxMouseMode,
-    TmuxStatusBarMode,
+    TmuxStatusBarMode, VolumeIgnoresStrategy,
 };
 use super::get_profile_dir;
 
@@ -206,6 +206,9 @@ pub struct SandboxConfigOverride {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_runtime: Option<ContainerRuntimeName>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_ignores_strategy: Option<VolumeIgnoresStrategy>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -408,6 +411,9 @@ pub fn apply_sandbox_overrides(
     }
     if let Some(container_runtime) = source.container_runtime {
         target.container_runtime = container_runtime;
+    }
+    if let Some(volume_ignores_strategy) = source.volume_ignores_strategy {
+        target.volume_ignores_strategy = volume_ignores_strategy;
     }
 }
 
