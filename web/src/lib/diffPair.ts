@@ -79,36 +79,42 @@ export function diffPair(oldText: string, newText: string): DiffPairResult {
     for (const hunk of meta.hunks) {
       for (const segment of hunk.hunkContent) {
         if (segment.type === "context") {
-          for (let k = 0; k < segment.lines; k++) {
+          const idx = segment.additionLineIndex;
+          for (const raw of meta.additionLines.slice(
+            idx,
+            idx + segment.lines,
+          )) {
             lines.push({
               type: "equal",
               old_line_num: oldNum++,
               new_line_num: newNum++,
-              content: stripNewline(
-                meta.additionLines[segment.additionLineIndex + k] ?? "",
-              ),
+              content: stripNewline(raw),
             });
           }
         } else {
-          for (let k = 0; k < segment.deletions; k++) {
+          const delIdx = segment.deletionLineIndex;
+          for (const raw of meta.deletionLines.slice(
+            delIdx,
+            delIdx + segment.deletions,
+          )) {
             lines.push({
               type: "delete",
               old_line_num: oldNum++,
               new_line_num: null,
-              content: stripNewline(
-                meta.deletionLines[segment.deletionLineIndex + k] ?? "",
-              ),
+              content: stripNewline(raw),
             });
             dels += 1;
           }
-          for (let k = 0; k < segment.additions; k++) {
+          const addIdx = segment.additionLineIndex;
+          for (const raw of meta.additionLines.slice(
+            addIdx,
+            addIdx + segment.additions,
+          )) {
             lines.push({
               type: "add",
               old_line_num: null,
               new_line_num: newNum++,
-              content: stripNewline(
-                meta.additionLines[segment.additionLineIndex + k] ?? "",
-              ),
+              content: stripNewline(raw),
             });
             adds += 1;
           }
