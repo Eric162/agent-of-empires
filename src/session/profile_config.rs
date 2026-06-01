@@ -96,6 +96,8 @@ pub struct CockpitConfigOverride {
     pub silent_orphan_grace_secs: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub silent_orphan_fast_grace_secs: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_stop_idle_secs: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -253,6 +255,9 @@ pub struct SessionConfigOverride {
     pub agent_detect_as: Option<HashMap<String, String>>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_cockpit_cmd: Option<HashMap<String, String>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict_hotkeys: Option<bool>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -266,6 +271,9 @@ pub struct SessionConfigOverride {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_send_exit_chord: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_send_leader: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_session_attach_mode: Option<super::config::NewSessionAttachMode>,
@@ -502,6 +510,9 @@ pub fn apply_session_overrides(
     if let Some(ref detect_as) = source.agent_detect_as {
         target.agent_detect_as = detect_as.clone();
     }
+    if let Some(ref cockpit_cmd) = source.agent_cockpit_cmd {
+        target.agent_cockpit_cmd = cockpit_cmd.clone();
+    }
     if let Some(strict_hotkeys) = source.strict_hotkeys {
         target.strict_hotkeys = strict_hotkeys;
     }
@@ -516,6 +527,9 @@ pub fn apply_session_overrides(
     }
     if let Some(ref live_send_exit_chord) = source.live_send_exit_chord {
         target.live_send_exit_chord = live_send_exit_chord.clone();
+    }
+    if let Some(ref live_send_leader) = source.live_send_leader {
+        target.live_send_leader = live_send_leader.clone();
     }
     if let Some(new_session_attach_mode) = source.new_session_attach_mode {
         target.new_session_attach_mode = new_session_attach_mode;
@@ -645,6 +659,9 @@ pub fn merge_configs(mut global: Config, profile: &ProfileConfig) -> Config {
         }
         if let Some(v) = cockpit_override.silent_orphan_fast_grace_secs {
             global.cockpit.silent_orphan_fast_grace_secs = v;
+        }
+        if let Some(v) = cockpit_override.auto_stop_idle_secs {
+            global.cockpit.auto_stop_idle_secs = v;
         }
     }
 

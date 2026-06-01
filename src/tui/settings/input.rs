@@ -569,6 +569,7 @@ impl SettingsView {
                             }
                             FieldKey::CustomAgents => Some(validate_custom_agent_entry(&text)),
                             FieldKey::AgentDetectAs => Some(validate_detect_as_entry(&text)),
+                            FieldKey::AgentCockpitCmd => Some(validate_cockpit_cmd_entry(&text)),
                             _ => None,
                         };
                         if let Some(Err(msg)) = validation_result {
@@ -777,6 +778,11 @@ impl SettingsView {
                     s.live_send_exit_chord = None;
                 }
             }
+            FieldKey::LiveSendLeader => {
+                if let Some(ref mut s) = config.session {
+                    s.live_send_leader = None;
+                }
+            }
             FieldKey::NewSessionAttachMode => {
                 if let Some(ref mut s) = config.session {
                     s.new_session_attach_mode = None;
@@ -815,6 +821,11 @@ impl SettingsView {
             FieldKey::AgentDetectAs => {
                 if let Some(ref mut s) = config.session {
                     s.agent_detect_as = None;
+                }
+            }
+            FieldKey::AgentCockpitCmd => {
+                if let Some(ref mut s) = config.session {
+                    s.agent_cockpit_cmd = None;
                 }
             }
             FieldKey::AgentStatusHooks => {
@@ -1057,6 +1068,11 @@ impl SettingsView {
                     c.silent_orphan_fast_grace_secs = None;
                 }
             }
+            FieldKey::CockpitAutoStopIdleSecs => {
+                if let Some(c) = config.cockpit.as_mut() {
+                    c.auto_stop_idle_secs = None;
+                }
+            }
             // Logging is global-only for v1 (no profile overrides); the
             // "clear override" gesture is a no-op for these keys.
             // SessionIdPollerMaxThreads and ConfirmBeforeQuit are also
@@ -1292,6 +1308,31 @@ fn validate_custom_agent_entry(text: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Validate an agent_cockpit_cmd entry: name=command. The command is the
+/// ACP launch line, split with shell-word rules into argv, so it must be
+/// non-empty and have balanced quoting.
+fn validate_cockpit_cmd_entry(text: &str) -> Result<(), String> {
+    let Some((key, value)) = text.split_once('=') else {
+        return Err(
+            "Must be in name=command format (e.g. oc-superpowers=ocp run sp acp)".to_string(),
+        );
+    };
+    if key.is_empty() {
+        return Err("Agent name cannot be empty".to_string());
+    }
+    if crate::agents::get_agent(key).is_some() {
+        return Err(format!(
+            "'{}' is a built-in agent, which already has a cockpit adapter.",
+            key
+        ));
+    }
+    match shell_words::split(value) {
+        Ok(argv) if argv.is_empty() => Err("Command cannot be empty".to_string()),
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("Malformed command: {e}")),
+    }
 }
 
 /// Validate a detect_as entry: name=builtin_agent. Value must be a known built-in agent.
