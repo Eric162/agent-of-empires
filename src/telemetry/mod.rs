@@ -273,16 +273,74 @@ pub async fn flush_cli_process_start() {
     }
 }
 
+/// Fingerprint of the last `usage_snapshot` whose send we initiated this
+/// process. Lets [`flush_snapshot_if_changed`] drop a redundant exit snapshot
+/// that would otherwise repeat the boot (or last periodic) snapshot verbatim
+/// within seconds. Process-local on purpose: a fresh launch starts empty, which
+/// is correct because `process_start` already carries the per-launch signal, so
+/// the snapshot only needs to report state and identical state is not worth
+/// re-sending back to back.
+static LAST_SNAPSHOT_FP: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+
+/// Content fingerprint of a snapshot, excluding the volatile `sent_at` stamp.
+/// Everything else is included: `install_id` is stable per install, so two
+/// snapshots with the same counts hash equal. Used only for in-process dedup,
+/// never sent anywhere.
+fn snapshot_fingerprint(snapshot: &UsageSnapshot) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut probe = snapshot.clone();
+    probe.sent_at = String::new();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(&probe)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Record that we just initiated a send for `snapshot`, so a later
+/// [`flush_snapshot_if_changed`] can tell whether anything changed since.
+fn record_snapshot_fp(snapshot: &UsageSnapshot) {
+    if let Ok(mut last) = LAST_SNAPSHOT_FP.lock() {
+        *last = Some(snapshot_fingerprint(snapshot));
+    }
+}
+
+/// True (and records the new fingerprint) when `snapshot` differs from the last
+/// one we initiated a send for this process; false when it is identical. A
+/// poisoned lock fails open: sending is the safe default.
+fn snapshot_is_new(snapshot: &UsageSnapshot) -> bool {
+    let fp = snapshot_fingerprint(snapshot);
+    match LAST_SNAPSHOT_FP.lock() {
+        Ok(mut last) => {
+            let is_new = *last != Some(fp);
+            if is_new {
+                *last = Some(fp);
+            }
+            is_new
+        }
+        Err(_) => true,
+    }
+}
+
 /// Send a pre-built usage snapshot, detached. Caller builds via
-/// [`build_usage_snapshot`] (returns `None` when not opted in).
+/// [`build_usage_snapshot`] (returns `None` when not opted in). Records the
+/// fingerprint so a redundant exit snapshot can be suppressed.
 pub fn spawn_snapshot(snapshot: UsageSnapshot) {
+    record_snapshot_fp(&snapshot);
     tokio::spawn(async move { post(&snapshot).await });
 }
 
-/// Send a usage snapshot and await delivery with a hard timeout. Used on
-/// graceful shutdown so the final snapshot has a chance to flush without
-/// risking a hang.
-pub async fn flush_snapshot(snapshot: UsageSnapshot) {
+/// Send the best-effort snapshot on graceful exit, awaiting delivery with a
+/// hard timeout so the final snapshot can flush without risking a hang, but
+/// skipping the send when the snapshot is identical (ignoring `sent_at`) to the
+/// last one already emitted this run. A boot (or periodic) snapshot followed by
+/// a quit with unchanged session state would otherwise post the same counts
+/// twice within seconds; a snapshot that actually changed still flushes.
+pub async fn flush_snapshot_if_changed(snapshot: UsageSnapshot) {
+    if !snapshot_is_new(&snapshot) {
+        tracing::debug!(target: "telemetry", "exit snapshot unchanged since last emit; skipping duplicate");
+        return;
+    }
     let _ = tokio::time::timeout(SEND_TIMEOUT, post(&snapshot)).await;
 }
 
@@ -322,5 +380,72 @@ mod tests {
         unsafe { std::env::set_var("AOE_TELEMETRY_ENDPOINT", " https://x/y ") };
         assert_eq!(endpoint(), "https://x/y");
         unsafe { std::env::remove_var("AOE_TELEMETRY_ENDPOINT") };
+    }
+
+    fn sample_snapshot() -> UsageSnapshot {
+        UsageSnapshot {
+            schema: SCHEMA_VERSION,
+            event: "usage_snapshot",
+            install_id: "00000000-0000-0000-0000-000000000000".to_string(),
+            sent_at: "2026-06-02T19:00:45Z".to_string(),
+            surface: Surface::Tui,
+            aoe_version: "0.0.0".to_string(),
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            session_total: 7,
+            session_running: 1,
+            session_idle: 6,
+            session_error: 0,
+            session_cockpit: 0,
+            session_sandboxed: 2,
+            session_yolo: 0,
+            sessions_by_agent: BTreeMap::new(),
+            sessions_by_model_bucket: BTreeMap::new(),
+            features: BTreeMap::new(),
+            web_seen: false,
+            cockpit_seen: false,
+            session_creates_since_last_snapshot: 0,
+        }
+    }
+
+    // Regression for the duplicate `usage_snapshot` seen in dogfooding: the TUI
+    // (and serve) emit a snapshot at boot and another on graceful exit, so a
+    // launch-then-quit with unchanged sessions posted the identical payload
+    // twice within seconds. The exit path now dedups against the last emit.
+    #[test]
+    #[serial]
+    fn exit_snapshot_dedups_against_boot_but_resends_on_change() {
+        *LAST_SNAPSHOT_FP.lock().unwrap() = None;
+
+        // Boot emit records the fingerprint (this is what spawn_snapshot does).
+        let boot = sample_snapshot();
+        record_snapshot_fp(&boot);
+
+        // Quit right after, sessions unchanged: same content, newer stamp.
+        // The only difference is `sent_at`, which the fingerprint excludes, so
+        // the exit snapshot is recognised as a duplicate and not re-sent.
+        let mut exit = sample_snapshot();
+        exit.sent_at = "2026-06-02T19:00:47Z".to_string();
+        assert!(
+            !snapshot_is_new(&exit),
+            "an unchanged exit snapshot must dedupe against the boot snapshot"
+        );
+
+        // A snapshot whose counts actually changed is new and would be sent,
+        // and then becomes the new baseline.
+        let mut changed = sample_snapshot();
+        changed.session_total = 8;
+        assert!(
+            snapshot_is_new(&changed),
+            "a changed snapshot must still be emitted"
+        );
+        let mut changed_again = changed.clone();
+        changed_again.sent_at = "2026-06-02T19:05:00Z".to_string();
+        assert!(
+            !snapshot_is_new(&changed_again),
+            "repeating the latest snapshot dedups against it"
+        );
+
+        *LAST_SNAPSHOT_FP.lock().unwrap() = None;
     }
 }

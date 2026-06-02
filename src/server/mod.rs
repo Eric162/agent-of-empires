@@ -1638,8 +1638,11 @@ fn spawn_telemetry_loop(state: Arc<AppState>) {
         loop {
             tokio::select! {
                 _ = state.shutdown.cancelled() => {
+                    // Deduped: a serve process that starts and stops between
+                    // 12h ticks would otherwise emit the initial first-tick
+                    // snapshot and an identical shutdown snapshot seconds apart.
                     if let Some(snapshot) = build_serve_snapshot(&state).await {
-                        crate::telemetry::flush_snapshot(snapshot).await;
+                        crate::telemetry::flush_snapshot_if_changed(snapshot).await;
                     }
                     break;
                 }
