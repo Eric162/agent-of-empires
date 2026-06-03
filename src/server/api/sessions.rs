@@ -3162,36 +3162,8 @@ pub struct RichDiffFilesResponse {
     pub warning: Option<String>,
 }
 
-#[derive(Serialize)]
-pub struct RichDiffLine {
-    #[serde(rename = "type")]
-    pub change_type: String,
-    pub old_line_num: Option<usize>,
-    pub new_line_num: Option<usize>,
-    pub content: String,
-}
-
-#[derive(Serialize)]
-pub struct RichDiffHunk {
-    pub old_start: usize,
-    pub old_lines: usize,
-    pub new_start: usize,
-    pub new_lines: usize,
-    pub lines: Vec<RichDiffLine>,
-}
-
-#[derive(Serialize)]
-pub struct RichFileDiffResponse {
-    pub file: RichDiffFileInfo,
-    pub hunks: Vec<RichDiffHunk>,
-    pub is_binary: bool,
-    /// True if the file was too large to diff and hunks were omitted.
-    pub truncated: bool,
-}
-
-/// Contents-based diff response (`?mode=contents`): raw old/new text that the
-/// web client parses and renders itself via `@pierre/diffs`, instead of
-/// consuming server-computed `hunks`. See [`MAX_CONTENTS_BYTES`].
+/// Contents-based diff response: raw old/new text that the web client parses
+/// and renders itself via `@pierre/diffs`. See [`MAX_CONTENTS_BYTES`].
 #[derive(Serialize)]
 pub struct RichFileContentsResponse {
     pub file: RichDiffFileInfo,
@@ -3202,18 +3174,12 @@ pub struct RichFileContentsResponse {
     pub truncated: bool,
 }
 
-/// Max combined bytes of old+new content before we bail on diffing.
-const MAX_DIFF_BYTES: usize = 2_000_000;
-/// Max combined line count of old+new before we bail on diffing.
-const MAX_DIFF_LINES: usize = 40_000;
-
-/// Caps for the contents-based diff path (`?mode=contents`). The client
-/// renders these with a virtualized, off-main-thread highlighter
-/// (`@pierre/diffs`), so the DOM and main thread are no longer the
-/// bottleneck; the only real cost is JSON payload size and the client-side
-/// parse. We therefore allow far more lines than the legacy hunk path, and
-/// keep a (raised) byte cap as the real guard against pathological payloads
-/// (minified bundles, generated code, data blobs).
+/// Caps for the contents-based diff endpoint. The client renders with a
+/// virtualized, off-main-thread highlighter (`@pierre/diffs`), so the DOM and
+/// main thread are no longer the bottleneck; the only real cost is JSON
+/// payload size and the client-side parse. The byte cap is the real guard
+/// against pathological payloads (minified bundles, generated code, data
+/// blobs); the line cap is a secondary backstop.
 const MAX_CONTENTS_BYTES: usize = 5_000_000;
 const MAX_CONTENTS_LINES: usize = 200_000;
 
@@ -3453,11 +3419,6 @@ pub struct FileDiffQuery {
     /// single-repo URL keeps working for the primary repo. See #1047.
     #[serde(default)]
     pub repo: Option<String>,
-    /// `contents` returns raw old/new file text for the client-side
-    /// (`@pierre/diffs`) renderer; omitted/anything else returns the legacy
-    /// server-computed hunks.
-    #[serde(default)]
-    pub mode: Option<String>,
 }
 
 /// Response for a rejected diff request (bad path, file not changed, etc.).
@@ -3510,7 +3471,6 @@ pub async fn session_diff_file(
     let result =
         tokio::task::spawn_blocking(move || -> Result<serde_json::Value, DiffFileError> {
             use crate::git::diff;
-            use similar::ChangeTag;
 
             let repo_path = std::path::Path::new(&project_path);
             let file_path = std::path::Path::new(&query.path);
@@ -3542,116 +3502,50 @@ pub async fn session_diff_file(
                 }
             }
 
-            // Contents path: hand the client raw old/new text and let
-            // `@pierre/diffs` parse + render it (virtualized, off-thread).
-            if query.mode.as_deref() == Some("contents") {
-                let contents = diff::compute_file_contents(repo_path, file_path, &base_branch)
-                    .map_err(|e| DiffFileError::Internal(e.into()))?;
-                // additions/deletions aren't computed on this path; reuse the
-                // counts the changed-files scan already produced for the sidebar.
-                let (additions, deletions) = changed_files
-                    .iter()
-                    .find(|f| f.path == *file_path)
-                    .map(|f| (f.additions, f.deletions))
-                    .unwrap_or((0, 0));
-                let file = RichDiffFileInfo {
-                    path: contents.path.to_string_lossy().to_string(),
-                    old_path: contents.old_path.map(|p| p.to_string_lossy().to_string()),
-                    status: contents.status.label().to_string(),
-                    additions,
-                    deletions,
-                    repo_name: selected_repo_name.clone(),
-                };
-                let total_bytes = contents.old_content.len() + contents.new_content.len();
-                let total_lines =
-                    contents.old_content.lines().count() + contents.new_content.lines().count();
-                let resp = if total_bytes > MAX_CONTENTS_BYTES || total_lines > MAX_CONTENTS_LINES {
-                    RichFileContentsResponse {
-                        file,
-                        old_content: String::new(),
-                        new_content: String::new(),
-                        is_binary: contents.is_binary,
-                        truncated: true,
-                    }
-                } else {
-                    RichFileContentsResponse {
-                        file,
-                        old_content: contents.old_content,
-                        new_content: contents.new_content,
-                        is_binary: contents.is_binary,
-                        truncated: false,
-                    }
-                };
-                return Ok(serde_json::to_value(resp)
-                    .expect("RichFileContentsResponse is always serializable"));
-            }
-
-            let file_diff = diff::compute_file_diff(repo_path, file_path, &base_branch, 3)
+            // Hand the client raw old/new text and let `@pierre/diffs` parse +
+            // render it (virtualized, off-main-thread highlighting). The diff
+            // itself is computed client-side.
+            let contents = diff::compute_file_contents(repo_path, file_path, &base_branch)
                 .map_err(|e| DiffFileError::Internal(e.into()))?;
-
+            // additions/deletions aren't computed on this path; reuse the counts
+            // the changed-files scan already produced for the sidebar.
+            let (additions, deletions) = changed_files
+                .iter()
+                .find(|f| f.path == *file_path)
+                .map(|f| (f.additions, f.deletions))
+                .unwrap_or((0, 0));
             let file = RichDiffFileInfo {
-                path: file_diff.file.path.to_string_lossy().to_string(),
-                old_path: file_diff
-                    .file
-                    .old_path
-                    .map(|p| p.to_string_lossy().to_string()),
-                status: file_diff.file.status.label().to_string(),
-                additions: file_diff.file.additions,
-                deletions: file_diff.file.deletions,
+                path: contents.path.to_string_lossy().to_string(),
+                old_path: contents.old_path.map(|p| p.to_string_lossy().to_string()),
+                status: contents.status.label().to_string(),
+                additions,
+                deletions,
                 repo_name: selected_repo_name.clone(),
             };
-
-            // Size cap: avoid OOM'ing the browser on huge files (minified bundles,
-            // generated code, data blobs that slipped past .gitignore).
-            let total_line_count: usize = file_diff.hunks.iter().map(|h| h.lines.len()).sum();
-            let total_bytes: usize = file_diff
-                .hunks
-                .iter()
-                .flat_map(|h| h.lines.iter())
-                .map(|l| l.content.len())
-                .sum();
-            if total_line_count > MAX_DIFF_LINES || total_bytes > MAX_DIFF_BYTES {
-                return Ok(serde_json::to_value(RichFileDiffResponse {
+            let total_bytes = contents.old_content.len() + contents.new_content.len();
+            let total_lines =
+                contents.old_content.lines().count() + contents.new_content.lines().count();
+            let resp = if total_bytes > MAX_CONTENTS_BYTES || total_lines > MAX_CONTENTS_LINES {
+                RichFileContentsResponse {
                     file,
-                    hunks: Vec::new(),
-                    is_binary: file_diff.is_binary,
+                    old_content: String::new(),
+                    new_content: String::new(),
+                    is_binary: contents.is_binary,
                     truncated: true,
-                })
-                .expect("RichFileDiffResponse is always serializable"));
-            }
-
-            let hunks: Vec<RichDiffHunk> = file_diff
-                .hunks
-                .into_iter()
-                .map(|h| RichDiffHunk {
-                    old_start: h.old_start,
-                    old_lines: h.old_lines,
-                    new_start: h.new_start,
-                    new_lines: h.new_lines,
-                    lines: h
-                        .lines
-                        .into_iter()
-                        .map(|l| RichDiffLine {
-                            change_type: match l.tag {
-                                ChangeTag::Insert => "add".to_string(),
-                                ChangeTag::Delete => "delete".to_string(),
-                                ChangeTag::Equal => "equal".to_string(),
-                            },
-                            old_line_num: l.old_line_num,
-                            new_line_num: l.new_line_num,
-                            content: l.content,
-                        })
-                        .collect(),
-                })
-                .collect();
-
-            Ok(serde_json::to_value(RichFileDiffResponse {
-                file,
-                hunks,
-                is_binary: file_diff.is_binary,
-                truncated: false,
-            })
-            .expect("RichFileDiffResponse is always serializable"))
+                }
+            } else {
+                RichFileContentsResponse {
+                    file,
+                    old_content: contents.old_content,
+                    new_content: contents.new_content,
+                    is_binary: contents.is_binary,
+                    truncated: false,
+                }
+            };
+            Ok(
+                serde_json::to_value(resp)
+                    .expect("RichFileContentsResponse is always serializable"),
+            )
         })
         .await;
 

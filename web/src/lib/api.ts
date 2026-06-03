@@ -2,7 +2,6 @@ import { clientFormFactor } from "./formFactor";
 import type {
   SessionResponse,
   RichDiffFilesResponse,
-  RichFileDiffResponse,
   RichFileContentsResponse,
   AgentInfo,
   ProfileInfo,
@@ -117,18 +116,6 @@ export function getSessionDiffFiles(
   return fetchJson<RichDiffFilesResponse>(`/api/sessions/${id}/diff/files`);
 }
 
-export function getSessionFileDiff(
-  id: string,
-  filePath: string,
-  repoName?: string,
-): Promise<RichFileDiffResponse | null> {
-  const params = new URLSearchParams({ path: filePath });
-  if (repoName) params.set("repo", repoName);
-  return fetchJson<RichFileDiffResponse>(
-    `/api/sessions/${id}/diff/file?${params.toString()}`,
-  );
-}
-
 /**
  * Fetch raw old/new contents for a file so the client can render the diff
  * itself via `@pierre/diffs`. Backed by `?mode=contents`. See
@@ -139,7 +126,7 @@ export function getSessionFileContents(
   filePath: string,
   repoName?: string,
 ): Promise<RichFileContentsResponse | null> {
-  const params = new URLSearchParams({ path: filePath, mode: "contents" });
+  const params = new URLSearchParams({ path: filePath });
   if (repoName) params.set("repo", repoName);
   return fetchJson<RichFileContentsResponse>(
     `/api/sessions/${id}/diff/file?${params.toString()}`,

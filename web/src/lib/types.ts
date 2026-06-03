@@ -251,20 +251,10 @@ export interface RichDiffHunk {
   lines: RichDiffLine[];
 }
 
-/** Response from /api/sessions/{id}/diff/file?path=... */
-export interface RichFileDiffResponse {
-  file: RichDiffFile;
-  hunks: RichDiffHunk[];
-  is_binary: boolean;
-  /** True if the file was too large to diff inline. */
-  truncated: boolean;
-}
-
 /**
- * Response from /api/sessions/{id}/diff/file?path=...&mode=contents.
+ * Response from /api/sessions/{id}/diff/file?path=...
  * Raw old/new file text that the client parses and renders itself via
- * `@pierre/diffs` (virtualized, off-main-thread highlighting) instead of
- * consuming server-computed hunks.
+ * `@pierre/diffs` (virtualized, off-main-thread highlighting).
  */
 export interface RichFileContentsResponse {
   file: RichDiffFile;

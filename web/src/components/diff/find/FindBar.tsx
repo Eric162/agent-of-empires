@@ -120,6 +120,7 @@ function ToggleButton({
       type="button"
       onClick={onClick}
       aria-pressed={active}
+      aria-label={title}
       title={title}
       className={`px-1.5 py-0.5 rounded text-[11px] font-mono cursor-pointer transition-colors ${
         active
