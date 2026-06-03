@@ -111,6 +111,9 @@ export function DiffFileViewer({
   const [draft, setDraft] = useState<DraftRange | null>(null);
   const [selected, setSelected] = useState<SelectedLineRange | null>(null);
   const [findOpen, setFindOpen] = useState(false);
+  const scrollResetRef = useRef<HTMLDivElement | null>(null);
+  const scrollerRef = useRef<HTMLElement | null>(null);
+  const userScrolledRef = useRef(false);
 
   // Reset transient state when the viewer switches files / repos / sessions.
   // Synced at render time (not in an effect) to avoid set-state-in-effect.
@@ -264,7 +267,6 @@ export function DiffFileViewer({
     () => ({
       diffStyle: splitActive ? "split" : "unified",
       theme,
-      expandUnchanged: true,
       disableFileHeader: true,
       enableLineSelection: commentsActive,
       controlledSelection: true,
@@ -274,15 +276,32 @@ export function DiffFileViewer({
     [splitActive, theme, commentsActive, handleLineSelected],
   );
 
-  const handleFindJump = useCallback((match: FindMatch | null) => {
-    if (!match) return;
-    setSelected({
-      start: match.lineNumber,
-      end: match.lineNumber,
-      side: match.side === "old" ? "deletions" : "additions",
-      endSide: match.side === "old" ? "deletions" : "additions",
-    });
-  }, []);
+  const handleFindJump = useCallback(
+    (match: FindMatch | null) => {
+      if (!match) return;
+      const side = match.side === "old" ? "deletions" : "additions";
+      setSelected({
+        start: match.lineNumber,
+        end: match.lineNumber,
+        side,
+        endSide: side,
+      });
+      // The Virtualizer has no scroll-to-line API and the target row is likely
+      // unmounted, so approximate its position (line fraction of the file) and
+      // scroll there; the renderer then mounts the row and `selectedLines`
+      // highlights it. Mark this as a user scroll so the keep-at-top reset
+      // observer backs off.
+      const scroller = scrollerRef.current;
+      if (scroller) {
+        const text = match.side === "old" ? oldContent : newContent;
+        const lineCount = text.split("\n").length;
+        const frac = Math.min(1, Math.max(0, (match.lineNumber - 1) / lineCount));
+        userScrolledRef.current = true;
+        scroller.scrollTop = frac * (scroller.scrollHeight - scroller.clientHeight);
+      }
+    },
+    [oldContent, newContent],
+  );
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -293,6 +312,39 @@ export function DiffFileViewer({
     },
     [],
   );
+
+  // Keep the diff scrolled to the top when a file first opens. The
+  // virtualized renderer reconciles row heights asynchronously (and again
+  // when off-thread highlighting lands), which otherwise settles the scroll
+  // position at the bottom of large diffs. We force the top across those
+  // reflows until the user scrolls, then get out of the way.
+  useEffect(() => {
+    const wrap = scrollResetRef.current;
+    if (!wrap) return;
+    const scroller = wrap.querySelector<HTMLElement>(".overflow-auto");
+    const content = scroller?.firstElementChild;
+    if (!scroller || !content) return;
+    scrollerRef.current = scroller;
+    userScrolledRef.current = false;
+    const markUser = () => {
+      userScrolledRef.current = true;
+    };
+    scroller.addEventListener("wheel", markUser, { passive: true });
+    scroller.addEventListener("pointerdown", markUser, { passive: true });
+    scroller.addEventListener("keydown", markUser);
+    scroller.scrollTop = 0;
+    const ro = new ResizeObserver(() => {
+      if (!userScrolledRef.current) scroller.scrollTop = 0;
+    });
+    ro.observe(content);
+    return () => {
+      ro.disconnect();
+      scroller.removeEventListener("wheel", markUser);
+      scroller.removeEventListener("pointerdown", markUser);
+      scroller.removeEventListener("keydown", markUser);
+      if (scrollerRef.current === scroller) scrollerRef.current = null;
+    };
+  }, [resolvedPath, repoName, splitActive, oldContent, newContent]);
 
   if (loading && !contents) {
     return (
@@ -456,18 +508,20 @@ export function DiffFileViewer({
                 ))}
               </div>
             )}
-            <DiffWorkerPoolProvider>
-              <Virtualizer className="flex-1 overflow-auto">
-                <MultiFileDiff<AnnotationMeta>
-                  oldFile={oldFile}
-                  newFile={newFile}
-                  options={options}
-                  lineAnnotations={lineAnnotations}
-                  selectedLines={selected}
-                  renderAnnotation={renderAnnotation}
-                />
-              </Virtualizer>
-            </DiffWorkerPoolProvider>
+            <div ref={scrollResetRef} className="flex-1 min-h-0 flex flex-col">
+              <DiffWorkerPoolProvider>
+                <Virtualizer className="flex-1 overflow-auto">
+                  <MultiFileDiff<AnnotationMeta>
+                    oldFile={oldFile}
+                    newFile={newFile}
+                    options={options}
+                    lineAnnotations={lineAnnotations}
+                    selectedLines={selected}
+                    renderAnnotation={renderAnnotation}
+                  />
+                </Virtualizer>
+              </DiffWorkerPoolProvider>
+            </div>
           </>
         )}
       </div>
