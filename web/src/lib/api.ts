@@ -3,6 +3,7 @@ import type {
   SessionResponse,
   RichDiffFilesResponse,
   RichFileDiffResponse,
+  RichFileContentsResponse,
   AgentInfo,
   ProfileInfo,
   ProfileSettingsResponse,
@@ -124,6 +125,23 @@ export function getSessionFileDiff(
   const params = new URLSearchParams({ path: filePath });
   if (repoName) params.set("repo", repoName);
   return fetchJson<RichFileDiffResponse>(
+    `/api/sessions/${id}/diff/file?${params.toString()}`,
+  );
+}
+
+/**
+ * Fetch raw old/new contents for a file so the client can render the diff
+ * itself via `@pierre/diffs`. Backed by `?mode=contents`. See
+ * {@link RichFileContentsResponse}.
+ */
+export function getSessionFileContents(
+  id: string,
+  filePath: string,
+  repoName?: string,
+): Promise<RichFileContentsResponse | null> {
+  const params = new URLSearchParams({ path: filePath, mode: "contents" });
+  if (repoName) params.set("repo", repoName);
+  return fetchJson<RichFileContentsResponse>(
     `/api/sessions/${id}/diff/file?${params.toString()}`,
   );
 }

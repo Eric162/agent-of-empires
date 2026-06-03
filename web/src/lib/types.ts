@@ -260,6 +260,21 @@ export interface RichFileDiffResponse {
   truncated: boolean;
 }
 
+/**
+ * Response from /api/sessions/{id}/diff/file?path=...&mode=contents.
+ * Raw old/new file text that the client parses and renders itself via
+ * `@pierre/diffs` (virtualized, off-main-thread highlighting) instead of
+ * consuming server-computed hunks.
+ */
+export interface RichFileContentsResponse {
+  file: RichDiffFile;
+  old_content: string;
+  new_content: string;
+  is_binary: boolean;
+  /** True if the file was too large to send inline; contents are empty. */
+  truncated: boolean;
+}
+
 /** Workspace status derived from session states */
 export type WorkspaceStatus = "active" | "idle";
 
