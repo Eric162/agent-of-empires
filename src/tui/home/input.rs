@@ -2124,6 +2124,7 @@ impl HomeView {
             if let Some(group) = prefill_group {
                 dialog.set_group(group);
             }
+            dialog.focus_title();
             self.new_dialog = Some(dialog);
         }
     }
