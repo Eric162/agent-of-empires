@@ -1152,12 +1152,27 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": [
-        "src/components/diff/__tests__/DiffFileViewer.split.test.tsx",
-        "src/components/diff/__tests__/SplitHunkView.test.tsx"
+        "src/components/diff/__tests__/DiffFileViewer.split.test.tsx"
       ],
       "components": [
-        "web/src/components/diff/DiffFileViewer.tsx",
-        "web/src/components/diff/SplitHunkView.tsx"
+        "web/src/components/diff/DiffFileViewer.tsx"
+      ]
+    },
+    {
+      "id": "right-panel.diff-render-and-find",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/diff-syntax-highlight.spec.ts",
+        "tests/diff-virtualization.spec.ts",
+        "src/components/diff/find/findMatches.test.ts",
+        "src/components/diff/find/FindBar.test.tsx",
+        "src/components/diff/comments/extractSnippetFromContents.test.ts",
+        "src/components/diff/comments/anchorToContents.test.ts"
+      ],
+      "components": [
+        "web/src/components/diff/find/FindBar.tsx",
+        "web/src/components/diff/pierre/DiffWorkerPoolProvider.tsx"
       ]
     },
     {
