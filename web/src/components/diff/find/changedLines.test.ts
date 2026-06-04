@@ -2,12 +2,14 @@ import { describe, it, expect } from "vitest";
 import { processFile } from "@pierre/diffs";
 import { changedLines } from "./changedLines";
 
-// The exact unified-diff format the Rust backend emits (`similar` crate,
-// `unified_diff().context_radius(3).header("a/<path>", "b/<path>")`). This is
-// the contract the client-side patch parsing depends on.
+// The exact patch format the Rust backend emits (libgit2
+// `Patch::from_buffers(...).to_buf()`: git-style `diff --git` + `index`
+// headers). This is the contract the client-side patch parsing depends on.
 const OLD = "line 1\nline 2\nline 3\n";
 const NEW = "line 1 modified\nline 2\nline 3\nnew line 4\n";
-const PATCH = `--- a/test.txt
+const PATCH = `diff --git a/test.txt b/test.txt
+index 83db48f..f7c6dd6 100644
+--- a/test.txt
 +++ b/test.txt
 @@ -1,3 +1,4 @@
 -line 1

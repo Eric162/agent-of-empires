@@ -458,15 +458,23 @@ pub fn compute_file_contents(
     let repo = super::open_repo_at(repo_path)?;
     let workdir = repo.workdir().ok_or(GitError::NotAGitRepo)?.to_path_buf();
     let state = read_file_state(&repo, &workdir, file_path, base_branch)?;
+    // libgit2's xdiff, not the `similar` crate: xdiff is C compiled optimized
+    // regardless of cargo profile and carries git's pathological-input
+    // heuristics. `similar`'s Myers took ~20s on a +10k/-13k lockfile churn
+    // in a debug build; xdiff handles the same input in milliseconds.
     let patch = if state.is_binary {
         String::new()
     } else {
-        let display = file_path.display();
-        TextDiff::from_lines(&state.old_content, &state.new_content)
-            .unified_diff()
-            .context_radius(3)
-            .header(&format!("a/{display}"), &format!("b/{display}"))
-            .to_string()
+        let mut opts = git2::DiffOptions::new();
+        opts.context_lines(3);
+        let mut patch = git2::Patch::from_buffers(
+            state.old_content.as_bytes(),
+            Some(file_path),
+            state.new_content.as_bytes(),
+            Some(file_path),
+            Some(&mut opts),
+        )?;
+        String::from_utf8_lossy(&patch.to_buf()?).into_owned()
     };
     Ok(FileContents {
         path: file_path.to_path_buf(),
