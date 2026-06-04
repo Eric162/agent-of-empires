@@ -25,6 +25,8 @@ const contents: RichFileContentsResponse = {
   },
   old_content: "ctx\nold\n",
   new_content: "ctx\nnew\n",
+  // Server-computed unified diff (similar-crate format).
+  patch: "--- a/a.ts\n+++ b/a.ts\n@@ -1,2 +1,2 @@\n ctx\n-old\n+new\n",
   is_binary: false,
   truncated: false,
 };
@@ -46,15 +48,15 @@ vi.mock("../../../hooks/useFileContents", () => ({
 // Stand in for the Pierre renderer: surface the diffStyle on a data attribute
 // and render the file name so the header assertions still resolve.
 vi.mock("@pierre/diffs/react", () => ({
-  MultiFileDiff: ({
+  FileDiff: ({
     options,
-    newFile,
+    fileDiff,
   }: {
     options: { diffStyle: string };
-    newFile: { name: string };
+    fileDiff: { name: string };
   }) => (
     <div data-testid="pierre-diff" data-diff-style={options.diffStyle}>
-      {newFile.name}
+      {fileDiff.name}
     </div>
   ),
   Virtualizer: ({ children }: { children: React.ReactNode }) => (

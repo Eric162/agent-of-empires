@@ -1,5 +1,6 @@
-import { useCallback, useMemo, useRef, useState } from "react";
-import { MultiFileDiff, Virtualizer } from "@pierre/diffs/react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FileDiff, Virtualizer } from "@pierre/diffs/react";
+import { processFile } from "@pierre/diffs";
 import type {
   DiffLineAnnotation,
   FileContents,
@@ -134,19 +135,9 @@ export function DiffFileViewer({
 
   const oldContent = contents?.old_content ?? "";
   const newContent = contents?.new_content ?? "";
+  const patch = contents?.patch ?? "";
   const resolvedPath = contents?.file.path ?? filePath;
   const oldPath = contents?.file.old_path ?? resolvedPath;
-
-  // Virtualization bounds the DOM, but Pierre still computes the diff,
-  // inline per-line word-diffs, and tokenizes the whole file in memory, all
-  // O(change size). A big lockfile churn (+10k/-13k) can hang or OOM the tab.
-  // Degrade large diffs (drop inline word-diff, cap per-line tokenization) and
-  // refuse to inline-render pathological ones (generated files, giant locks).
-  const changeCount =
-    (contents?.file.additions ?? 0) + (contents?.file.deletions ?? 0);
-  const contentBytes = oldContent.length + newContent.length;
-  const largeDiff = changeCount > 2000 || contentBytes > 1_000_000;
-  const hugeDiff = changeCount > 20000 || contentBytes > 3_000_000;
 
   const commentsActive = commentsEnabled && !!commentsStore;
   const comments = useMemo(
@@ -178,6 +169,19 @@ export function DiffFileViewer({
     () => ({ name: resolvedPath, contents: newContent }),
     [resolvedPath, newContent],
   );
+
+  // Parse the server-computed patch into Pierre's diff metadata. Plain text
+  // parsing — no diff algorithm runs in the browser, so even huge generated
+  // files don't block the main thread. The raw old/new contents are grafted
+  // on so hunk expansion still works; highlighting happens in the worker pool.
+  const fileDiff = useMemo(() => {
+    if (!patch) return undefined;
+    return processFile(patch, {
+      oldFile,
+      newFile,
+      cacheKey: `${repoName ?? ""}:${resolvedPath}:${revision ?? 0}`,
+    });
+  }, [patch, oldFile, newFile, repoName, resolvedPath, revision]);
 
   const lineAnnotations = useMemo<DiffLineAnnotation<AnnotationMeta>[]>(() => {
     const out: DiffLineAnnotation<AnnotationMeta>[] = [];
@@ -286,21 +290,15 @@ export function DiffFileViewer({
       controlledSelection: true,
       onLineSelectionChange: setSelected,
       onLineSelected: handleLineSelected,
-      // Big diffs: skip the expensive inline word-diff and cap per-line
-      // tokenization so a large lockfile churn doesn't hang the tab.
-      ...(largeDiff
-        ? { lineDiffType: "none" as const, tokenizeMaxLineLength: 2000 }
-        : {}),
     }),
-    [splitActive, theme, commentsActive, findOpen, handleLineSelected, largeDiff],
+    [splitActive, theme, commentsActive, findOpen, handleLineSelected],
   );
 
-  // Searchable line set for find: the diff's changed lines, computed only
-  // while the find bar is open (parsing the diff again is wasted work
-  // otherwise). hugeDiff already disables find, so this stays bounded.
+  // Searchable line set for find: the diff's changed lines, read straight off
+  // the already-parsed patch metadata (no extra work beyond walking hunks).
   const findLines = useMemo(
-    () => (findOpen ? changedLines(oldContent, newContent, resolvedPath) : []),
-    [findOpen, oldContent, newContent, resolvedPath],
+    () => (findOpen && fileDiff ? changedLines(fileDiff) : []),
+    [findOpen, fileDiff],
   );
 
   const handleFindJump = useCallback(
@@ -487,7 +485,7 @@ export function DiffFileViewer({
         </div>
       </div>
 
-      {findOpen && !contents.is_binary && !contents.truncated && !hugeDiff && (
+      {findOpen && !contents.is_binary && !contents.truncated && (
         <FindBar
           lines={findLines}
           onJump={handleFindJump}
@@ -507,19 +505,6 @@ export function DiffFileViewer({
               <p className="text-sm mb-1">File too large to diff inline</p>
               <p className="text-xs">
                 Open it in your editor to review the changes.
-              </p>
-            </div>
-          </div>
-        ) : hugeDiff ? (
-          <div className="flex-1 flex items-center justify-center text-text-dim">
-            <div className="text-center px-4">
-              <p className="text-sm mb-1">
-                Large diff not rendered inline (+{contents.file.additions} / -
-                {contents.file.deletions})
-              </p>
-              <p className="text-xs">
-                Files this size (generated code, lockfiles) are best reviewed in
-                your editor.
               </p>
             </div>
           </div>
@@ -549,14 +534,15 @@ export function DiffFileViewer({
             <div ref={scrollResetRef} className="flex-1 min-h-0 flex flex-col">
               <DiffWorkerPoolProvider>
                 <Virtualizer className="flex-1 overflow-auto">
-                  <MultiFileDiff<AnnotationMeta>
-                    oldFile={oldFile}
-                    newFile={newFile}
-                    options={options}
-                    lineAnnotations={lineAnnotations}
-                    selectedLines={selected}
-                    renderAnnotation={renderAnnotation}
-                  />
+                  {fileDiff && (
+                    <FileDiff<AnnotationMeta>
+                      fileDiff={fileDiff}
+                      options={options}
+                      lineAnnotations={lineAnnotations}
+                      selectedLines={selected}
+                      renderAnnotation={renderAnnotation}
+                    />
+                  )}
                 </Virtualizer>
               </DiffWorkerPoolProvider>
             </div>

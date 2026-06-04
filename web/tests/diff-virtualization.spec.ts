@@ -1,5 +1,6 @@
 import { test, expect } from "./helpers/mockedTest";
 import { clickSidebarSession } from "./helpers/sidebar";
+import { makePatch } from "./helpers/patch";
 import { mockTerminalApis } from "./helpers/terminal-mocks";
 import type { Page } from "@playwright/test";
 
@@ -33,6 +34,7 @@ const DIFF_FILE_RESPONSE = {
   file: { path: "big.txt", old_path: null, status: "modified", additions: LINES, deletions: LINES },
   old_content: bigContent("base"),
   new_content: bigContent("edit"),
+  patch: makePatch("big.txt", bigContent("base"), bigContent("edit")),
   is_binary: false,
   truncated: false,
 };

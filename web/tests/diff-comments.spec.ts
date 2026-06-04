@@ -1,6 +1,7 @@
 import { test, expect } from "./helpers/mockedTest";
 import { Page } from "@playwright/test";
 import { clickSidebarSession } from "./helpers/sidebar";
+import { makePatch } from "./helpers/patch";
 
 // In-diff comments end-to-end (#928), against the @pierre/diffs renderer.
 // - Structured-view-only feature: a session without the structured view
@@ -49,6 +50,12 @@ const DIFF_FILE_RESPONSE = {
   is_binary: false,
   truncated: false,
 };
+// Server-computed patch, generated from the same contents.
+(DIFF_FILE_RESPONSE as { patch?: string }).patch = makePatch(
+  FILE_PATH,
+  DIFF_FILE_RESPONSE.old_content,
+  DIFF_FILE_RESPONSE.new_content,
+);
 
 interface SetupOpts {
   structuredView?: boolean;

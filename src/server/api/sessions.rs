@@ -3169,6 +3169,10 @@ pub struct RichFileContentsResponse {
     pub file: RichDiffFileInfo,
     pub old_content: String,
     pub new_content: String,
+    /// Server-computed unified diff of old → new. The client parses this as
+    /// text (`parsePatchFiles`) instead of re-diffing the contents, which
+    /// would block the main thread on large files. Empty for binary files.
+    pub patch: String,
     pub is_binary: bool,
     /// True if the file was too large to send inline; contents are omitted.
     pub truncated: bool,
@@ -3530,6 +3534,7 @@ pub async fn session_diff_file(
                     file,
                     old_content: String::new(),
                     new_content: String::new(),
+                    patch: String::new(),
                     is_binary: contents.is_binary,
                     truncated: true,
                 }
@@ -3538,6 +3543,7 @@ pub async fn session_diff_file(
                     file,
                     old_content: contents.old_content,
                     new_content: contents.new_content,
+                    patch: contents.patch,
                     is_binary: contents.is_binary,
                     truncated: false,
                 }

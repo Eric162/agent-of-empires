@@ -1,10 +1,11 @@
-// Large-diff handling. Pierre computes the diff, inline word-diffs, and
-// tokenizes the whole file in memory regardless of virtualization, so a big
-// lockfile churn can hang or crash the tab. The viewer refuses to inline-render
-// pathological diffs (placeholder) and degrades merely-large ones.
+// Large-diff handling. The diff is computed server-side and shipped as a
+// unified patch; the client parses it as text (no diff algorithm on the main
+// thread) and offloads highlighting to the worker pool, so even a big
+// lockfile churn (+10k/-13k) renders without hanging the tab.
 import { test, expect } from "./helpers/mockedTest";
 import type { Page } from "@playwright/test";
 import { clickSidebarSession } from "./helpers/sidebar";
+import { makeAllDifferentPatch } from "./helpers/patch";
 import { mockTerminalApis } from "./helpers/terminal-mocks";
 
 // Realistic lockfile-ish lines (long, distinct), entirely different old vs new.
@@ -20,6 +21,10 @@ function lockLines(n: number, salt: string): string {
 }
 
 async function mount(page: Page, adds: number, dels: number) {
+  // Precompute fixture data so none of this lands inside timed sections.
+  const oldContent = lockLines(dels, "old");
+  const newContent = lockLines(adds, "new");
+  const patch = makeAllDifferentPatch("pnpm-lock.yaml", oldContent, newContent);
   await mockTerminalApis(page);
   await page.route("**/api/sessions/*/diff/files", (r) =>
     r.fulfill({
@@ -48,8 +53,9 @@ async function mount(page: Page, adds: number, dels: number) {
           additions: adds,
           deletions: dels,
         },
-        old_content: lockLines(dels, "old"),
-        new_content: lockLines(adds, "new"),
+        old_content: oldContent,
+        new_content: newContent,
+        patch,
         is_binary: false,
         truncated: false,
       },
@@ -60,17 +66,27 @@ async function mount(page: Page, adds: number, dels: number) {
 }
 
 test.describe("Large diff handling", () => {
-  test("huge diff shows a placeholder instead of crashing", async ({ page }) => {
+  test("a +10k/-13k lockfile churn renders without crashing", async ({
+    page,
+  }) => {
     await mount(page, 10000, 13000); // ~23k changed lines
+    const t0 = Date.now();
     await page.getByText("pnpm-lock.yaml").first().click();
-    await expect(
-      page.getByText(/Large diff not rendered inline/).first(),
-    ).toBeVisible({ timeout: 10000 });
-    // Pierre is never mounted for the huge case.
-    await expect(page.locator("diffs-container")).toHaveCount(0);
+    await expect(page.locator("diffs-container").first()).toBeVisible({
+      timeout: 30000,
+    });
+    // Content from the top of the diff is on screen.
+    await expect(page.getByText("pkg-old-0@", { exact: false }).first()).toBeVisible(
+      { timeout: 15000 },
+    );
+    const elapsed = Date.now() - t0;
+    console.log(`large lockfile render: ${elapsed}ms`);
+    // Text-parse + virtualized render; the old contents-diffing path took ~8s
+    // and could OOM the tab. Generous bound to avoid CI flake.
+    expect(elapsed).toBeLessThan(10_000);
   });
 
-  test("merely-large diff still renders (degraded)", async ({ page }) => {
+  test("mid-size diff renders", async ({ page }) => {
     await mount(page, 4000, 4000);
     await page.getByText("pnpm-lock.yaml").first().click();
     await expect(page.locator("diffs-container").first()).toBeVisible({

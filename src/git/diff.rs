@@ -437,13 +437,19 @@ pub struct FileContents {
     pub status: FileStatus,
     pub old_content: String,
     pub new_content: String,
+    /// Unified diff of old → new, computed server-side so the web client can
+    /// parse it as text instead of re-running a (slow, main-thread) diff
+    /// algorithm on the raw contents. Empty for binary files.
+    pub patch: String,
     pub is_binary: bool,
 }
 
-/// Read the old (base-tree) and new (working-dir) contents of a single file.
+/// Read the old (base-tree) and new (working-dir) contents of a single file
+/// plus a server-computed unified diff of the two.
 ///
-/// This is the contents-only counterpart to [`compute_file_diff`]: it stops
-/// before the `similar` line diff, so it stays cheap on large files.
+/// The diff is computed here, natively, precisely so the web client never
+/// has to: `@pierre/diffs` parses the patch text and only offloads
+/// highlighting to its worker pool.
 pub fn compute_file_contents(
     repo_path: &Path,
     file_path: &Path,
@@ -452,12 +458,23 @@ pub fn compute_file_contents(
     let repo = super::open_repo_at(repo_path)?;
     let workdir = repo.workdir().ok_or(GitError::NotAGitRepo)?.to_path_buf();
     let state = read_file_state(&repo, &workdir, file_path, base_branch)?;
+    let patch = if state.is_binary {
+        String::new()
+    } else {
+        let display = file_path.display();
+        TextDiff::from_lines(&state.old_content, &state.new_content)
+            .unified_diff()
+            .context_radius(3)
+            .header(&format!("a/{display}"), &format!("b/{display}"))
+            .to_string()
+    };
     Ok(FileContents {
         path: file_path.to_path_buf(),
         old_path: None,
         status: state.status,
         old_content: state.old_content,
         new_content: state.new_content,
+        patch,
         is_binary: state.is_binary,
     })
 }
@@ -1060,6 +1077,12 @@ mod tests {
             c.new_content,
             "line 1 modified\nline 2\nline 3\nnew line 4\n"
         );
+        // Server-computed unified diff with git-style headers.
+        assert!(c.patch.contains("--- a/test.txt"));
+        assert!(c.patch.contains("+++ b/test.txt"));
+        assert!(c.patch.contains("@@"));
+        assert!(c.patch.contains("-line 1\n"));
+        assert!(c.patch.contains("+line 1 modified\n"));
     }
 
     #[test]

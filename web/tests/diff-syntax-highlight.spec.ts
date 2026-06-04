@@ -1,5 +1,6 @@
 import { test, expect } from "./helpers/mockedTest";
 import { clickSidebarSession } from "./helpers/sidebar";
+import { makePatch } from "./helpers/patch";
 import { mockTerminalApis } from "./helpers/terminal-mocks";
 import type { Page } from "@playwright/test";
 
@@ -42,6 +43,11 @@ const DIFF_FILE_RESPONSE = {
   is_binary: false,
   truncated: false,
 };
+(DIFF_FILE_RESPONSE as { patch?: string }).patch = makePatch(
+  "src/example.ts",
+  DIFF_FILE_RESPONSE.old_content,
+  DIFF_FILE_RESPONSE.new_content,
+);
 
 async function setupDiffMocks(page: Page) {
   await mockTerminalApis(page);
@@ -109,6 +115,7 @@ test.describe("Diff rendering (@pierre/diffs)", () => {
           },
           old_content: "",
           new_content: "some unknown format content\n",
+          patch: makePatch("data.xyz", "", "some unknown format content\n"),
           is_binary: false,
           truncated: false,
         },
