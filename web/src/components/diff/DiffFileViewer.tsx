@@ -18,6 +18,7 @@ import { CommentForm } from "./comments/CommentForm";
 import type { AnchoredComment, DiffSide } from "./comments/types";
 import { DiffWorkerPoolProvider } from "./pierre/DiffWorkerPoolProvider";
 import { FindBar } from "./find/FindBar";
+import { changedLines } from "./find/changedLines";
 import type { FindMatch } from "./find/findMatches";
 
 interface Props {
@@ -135,6 +136,17 @@ export function DiffFileViewer({
   const newContent = contents?.new_content ?? "";
   const resolvedPath = contents?.file.path ?? filePath;
   const oldPath = contents?.file.old_path ?? resolvedPath;
+
+  // Virtualization bounds the DOM, but Pierre still computes the diff,
+  // inline per-line word-diffs, and tokenizes the whole file in memory, all
+  // O(change size). A big lockfile churn (+10k/-13k) can hang or OOM the tab.
+  // Degrade large diffs (drop inline word-diff, cap per-line tokenization) and
+  // refuse to inline-render pathological ones (generated files, giant locks).
+  const changeCount =
+    (contents?.file.additions ?? 0) + (contents?.file.deletions ?? 0);
+  const contentBytes = oldContent.length + newContent.length;
+  const largeDiff = changeCount > 2000 || contentBytes > 1_000_000;
+  const hugeDiff = changeCount > 20000 || contentBytes > 3_000_000;
 
   const commentsActive = commentsEnabled && !!commentsStore;
   const comments = useMemo(
@@ -268,12 +280,27 @@ export function DiffFileViewer({
       diffStyle: splitActive ? "split" : "unified",
       theme,
       disableFileHeader: true,
-      enableLineSelection: commentsActive,
+      // Enable selection for commenting, and also while find is open so the
+      // jumped-to match line renders its selection highlight.
+      enableLineSelection: commentsActive || findOpen,
       controlledSelection: true,
       onLineSelectionChange: setSelected,
       onLineSelected: handleLineSelected,
+      // Big diffs: skip the expensive inline word-diff and cap per-line
+      // tokenization so a large lockfile churn doesn't hang the tab.
+      ...(largeDiff
+        ? { lineDiffType: "none" as const, tokenizeMaxLineLength: 2000 }
+        : {}),
     }),
-    [splitActive, theme, commentsActive, handleLineSelected],
+    [splitActive, theme, commentsActive, findOpen, handleLineSelected, largeDiff],
+  );
+
+  // Searchable line set for find: the diff's changed lines, computed only
+  // while the find bar is open (parsing the diff again is wasted work
+  // otherwise). hugeDiff already disables find, so this stays bounded.
+  const findLines = useMemo(
+    () => (findOpen ? changedLines(oldContent, newContent, resolvedPath) : []),
+    [findOpen, oldContent, newContent, resolvedPath],
   );
 
   const handleFindJump = useCallback(
@@ -460,11 +487,9 @@ export function DiffFileViewer({
         </div>
       </div>
 
-      {findOpen && !contents.is_binary && !contents.truncated && (
+      {findOpen && !contents.is_binary && !contents.truncated && !hugeDiff && (
         <FindBar
-          oldContent={oldContent}
-          newContent={newContent}
-          sides={["old", "new"]}
+          lines={findLines}
           onJump={handleFindJump}
           onClose={() => setFindOpen(false)}
         />
@@ -482,6 +507,19 @@ export function DiffFileViewer({
               <p className="text-sm mb-1">File too large to diff inline</p>
               <p className="text-xs">
                 Open it in your editor to review the changes.
+              </p>
+            </div>
+          </div>
+        ) : hugeDiff ? (
+          <div className="flex-1 flex items-center justify-center text-text-dim">
+            <div className="text-center px-4">
+              <p className="text-sm mb-1">
+                Large diff not rendered inline (+{contents.file.additions} / -
+                {contents.file.deletions})
+              </p>
+              <p className="text-xs">
+                Files this size (generated code, lockfiles) are best reviewed in
+                your editor.
               </p>
             </div>
           </div>

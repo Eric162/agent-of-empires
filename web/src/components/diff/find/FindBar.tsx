@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { findMatches, type FindMatch, type FindSide } from "./findMatches";
+import {
+  findMatches,
+  type FindMatch,
+  type SearchableLine,
+} from "./findMatches";
 
 interface Props {
-  oldContent: string;
-  newContent: string;
-  /** Sides to search; unified view passes both, split also both. */
-  sides: FindSide[];
+  /** Lines that find may match against — the diff's changed lines. */
+  lines: SearchableLine[];
   /** Called with the active match (or null when none) so the host can
    *  scroll/select it in the virtualized renderer. */
   onJump: (match: FindMatch | null) => void;
@@ -17,7 +19,7 @@ interface Props {
  * DOM), so it reaches lines the virtualized renderer hasn't mounted. Enter /
  * Shift+Enter step through matches; Esc closes.
  */
-export function FindBar({ oldContent, newContent, sides, onJump, onClose }: Props) {
+export function FindBar({ lines, onJump, onClose }: Props) {
   const [query, setQuery] = useState("");
   const [caseSensitive, setCaseSensitive] = useState(false);
   const [regex, setRegex] = useState(false);
@@ -31,17 +33,13 @@ export function FindBar({ oldContent, newContent, sides, onJump, onClose }: Prop
   const { matches, error } = useMemo(() => {
     try {
       return {
-        matches: findMatches(oldContent, newContent, query, {
-          caseSensitive,
-          regex,
-          sides,
-        }),
+        matches: findMatches(lines, query, { caseSensitive, regex }),
         error: null as string | null,
       };
     } catch {
       return { matches: [] as FindMatch[], error: "Invalid pattern" };
     }
-  }, [oldContent, newContent, query, caseSensitive, regex, sides]);
+  }, [lines, query, caseSensitive, regex]);
 
   // Clamp the active index and notify the host whenever the match set changes.
   useEffect(() => {

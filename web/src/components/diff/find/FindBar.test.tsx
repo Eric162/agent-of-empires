@@ -2,24 +2,21 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { FindBar } from "./FindBar";
-import type { FindMatch } from "./findMatches";
+import type { FindMatch, SearchableLine } from "./findMatches";
 
-const OLD = "alpha\nbeta\n";
-const NEW = "alpha beta\ngamma beta\n";
+const LINES: SearchableLine[] = [
+  { side: "old", lineNumber: 2, text: "beta" },
+  { side: "new", lineNumber: 1, text: "alpha beta" },
+  { side: "new", lineNumber: 2, text: "gamma beta" },
+];
 
 function setup() {
   const onJump = vi.fn<(m: FindMatch | null) => void>();
   const onClose = vi.fn();
-  render(
-    <FindBar
-      oldContent={OLD}
-      newContent={NEW}
-      sides={["old", "new"]}
-      onJump={onJump}
-      onClose={onClose}
-    />,
-  );
-  const input = screen.getByLabelText("Find in diff") as HTMLInputElement;
+  render(<FindBar lines={LINES} onJump={onJump} onClose={onClose} />);
+  const input = screen.getByRole("textbox", {
+    name: "Find in diff",
+  }) as HTMLInputElement;
   return { onJump, onClose, input };
 }
 

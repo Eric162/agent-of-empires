@@ -1,17 +1,28 @@
 /**
- * In-diff find that searches the diff *model* (the raw old/new file text),
- * not the rendered DOM.
+ * In-diff find that searches a supplied set of lines (the diff *model*), not
+ * the rendered DOM.
  *
  * The diff is rendered with a virtualized renderer (`@pierre/diffs`), so
  * off-screen lines are not in the DOM and the browser's native Cmd+F can't
- * reach them. Searching the contents directly lets find/next/prev jump to a
- * match anywhere in the file; the caller then scrolls the renderer to it.
+ * reach them. Searching the model lets find/next/prev jump to a match anywhere
+ * in the diff; the caller then scrolls the renderer to it.
+ *
+ * Callers pass exactly the lines that should be searchable — for the MVP, the
+ * changed (added/deleted) lines of the diff (see `changedLines`), so find only
+ * matches content that's actually part of the change, not the whole file.
  */
 
 export type FindSide = "old" | "new";
 
+/** A line that find is allowed to match against. */
+export interface SearchableLine {
+  side: FindSide;
+  /** 1-based line number within that side. */
+  lineNumber: number;
+  text: string;
+}
+
 export interface FindMatch {
-  /** Which file side (old = deletions/base, new = additions/working). */
   side: FindSide;
   /** 1-based line number within that side. */
   lineNumber: number;
@@ -26,60 +37,42 @@ export interface FindMatch {
 export interface FindOptions {
   caseSensitive?: boolean;
   regex?: boolean;
-  /**
-   * Which sides to search and in what order. Defaults to `["old", "new"]`,
-   * so matches are grouped old-side-first, then by line, then by column.
-   */
-  sides?: FindSide[];
 }
 
 /**
- * Find every non-overlapping occurrence of `query` in the old/new contents.
+ * Find every non-overlapping occurrence of `query` across `lines`, preserving
+ * the order of `lines` (callers pass them in rendered/diff order so next/prev
+ * steps top-to-bottom).
  *
- * Returns an empty array for an empty query. Throws `SyntaxError` when
- * `regex` is set and `query` is not a valid regular expression, so the caller
- * can surface an "invalid pattern" state.
+ * Returns an empty array for an empty query. Throws `SyntaxError` when `regex`
+ * is set and `query` is not a valid regular expression, so the caller can
+ * surface an "invalid pattern" state.
  */
 export function findMatches(
-  oldContent: string,
-  newContent: string,
+  lines: SearchableLine[],
   query: string,
   opts: FindOptions = {},
 ): FindMatch[] {
   if (query.length === 0) return [];
 
-  const sides = opts.sides ?? ["old", "new"];
   const matcher = opts.regex
     ? regexMatcher(query, opts.caseSensitive ?? false)
     : literalMatcher(query, opts.caseSensitive ?? false);
 
   const matches: FindMatch[] = [];
   let index = 0;
-  for (const side of sides) {
-    const content = side === "old" ? oldContent : newContent;
-    // Don't synthesize a trailing empty line for content ending in "\n".
-    const lines = splitLines(content);
-    for (const [i, line] of lines.entries()) {
-      for (const [startCol, endCol] of matcher(line)) {
-        matches.push({
-          side,
-          lineNumber: i + 1,
-          startCol,
-          endCol,
-          index: index++,
-        });
-      }
+  for (const line of lines) {
+    for (const [startCol, endCol] of matcher(line.text)) {
+      matches.push({
+        side: line.side,
+        lineNumber: line.lineNumber,
+        startCol,
+        endCol,
+        index: index++,
+      });
     }
   }
   return matches;
-}
-
-function splitLines(content: string): string[] {
-  if (content.length === 0) return [];
-  const lines = content.split("\n");
-  // A trailing newline produces a spurious final "" entry; drop it.
-  if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
-  return lines;
 }
 
 type LineMatcher = (line: string) => Array<[number, number]>;
@@ -94,7 +87,6 @@ function literalMatcher(query: string, caseSensitive: boolean): LineMatcher {
       const at = hay.indexOf(needle, from);
       if (at === -1) break;
       out.push([at, at + needle.length]);
-      // Non-overlapping: advance past this match (needle is non-empty here).
       from = at + needle.length;
     }
     return out;
@@ -102,8 +94,6 @@ function literalMatcher(query: string, caseSensitive: boolean): LineMatcher {
 }
 
 function regexMatcher(query: string, caseSensitive: boolean): LineMatcher {
-  // Constructed once; reused per line by resetting lastIndex. Throws
-  // SyntaxError on an invalid pattern, which callers catch.
   const flags = caseSensitive ? "g" : "gi";
   const re = new RegExp(query, flags);
   return (line) => {

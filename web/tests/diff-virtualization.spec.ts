@@ -84,19 +84,32 @@ test.describe("Diff virtualization", () => {
     });
   });
 
-  test("find jumps to an off-screen match", async ({ page }) => {
+  test("find searches only changed lines, jumps off-screen, and highlights", async ({
+    page,
+  }) => {
     await setup(page);
     await openBigFile(page);
 
-    // Open find and search for a token only present deep in the file.
     await page.getByRole("button", { name: "Find in diff" }).click();
     const input = page.getByRole("textbox", { name: "Find in diff" });
+
+    // Context (unchanged) lines are not searchable in the MVP: "shared line"
+    // appears throughout the file but only on context rows, so it matches
+    // nothing.
+    await input.fill("shared line 50");
+    await expect(page.getByText("0/0")).toBeVisible();
+
+    // A changed line deep in the file is found via the model (not the DOM) and
+    // scrolled into view.
     await input.fill("edit 971:");
-    // Match count surfaces (found via model search, not the DOM).
-    await expect(page.getByText(/\/\d+$/).first()).toBeVisible();
-    // The match scrolls into view.
-    await expect(page.getByText("edit 971:", { exact: false }).first()).toBeVisible({
-      timeout: 15000,
-    });
+    await expect(page.getByText(/^1\/\d+$/).first()).toBeVisible();
+    await expect(
+      page.getByText("edit 971:", { exact: false }).first(),
+    ).toBeVisible({ timeout: 15000 });
+
+    // The matched line is highlighted (Pierre marks the selected line).
+    await expect(
+      page.locator("[data-selected-line]").first(),
+    ).toBeVisible({ timeout: 5000 });
   });
 });
