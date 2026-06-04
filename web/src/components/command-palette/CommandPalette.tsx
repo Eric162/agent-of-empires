@@ -14,15 +14,19 @@ export function CommandPalette({ open, onClose, actions }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
 
+  // Capture the launcher before moving focus into the palette, then restore
+  // it on close so Esc / backdrop-close return keyboard users to where they
+  // were instead of dropping focus on <body>. autoFocus cannot restore focus,
+  // and capturing in a post-commit effect would already see the input.
   useEffect(() => {
-    if (open) {
-      previousFocusRef.current = document.activeElement as HTMLElement | null;
-      const t = setTimeout(() => inputRef.current?.focus(), 0);
-      return () => {
-        clearTimeout(t);
-        previousFocusRef.current?.focus?.();
-      };
-    }
+    if (!open) return;
+    previousFocusRef.current = document.activeElement as HTMLElement | null;
+    const t = setTimeout(() => inputRef.current?.focus(), 0);
+    return () => {
+      clearTimeout(t);
+      const prev = previousFocusRef.current;
+      if (prev?.isConnected) prev.focus();
+    };
   }, [open]);
 
   const grouped = useMemo(() => {

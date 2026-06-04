@@ -196,19 +196,24 @@ function AdvancedWorktreeOptions({
 }) {
   const [open, setOpen] = useState(false);
   const [branches, setBranches] = useState<BranchInfo[] | null>(null);
-  const [loading, setLoading] = useState(false);
   const [highlightIdx, setHighlightIdx] = useState(0);
   const [hasFocus, setHasFocus] = useState(false);
   const blurTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const branchLoadKey = open ? data.path : null;
+  const [trackedBranchLoadKey, setTrackedBranchLoadKey] = useState(branchLoadKey);
+  if (branchLoadKey !== trackedBranchLoadKey) {
+    setTrackedBranchLoadKey(branchLoadKey);
+    setBranches(null);
+    setHighlightIdx(0);
+  }
+  const loading = open && branches === null;
 
   useEffect(() => {
     if (!open || !data.path) return;
     let cancelled = false;
-    setLoading(true);
     fetchBranches(data.path, true).then((rows) => {
       if (!cancelled) {
         setBranches(rows ?? []);
-        setLoading(false);
       }
     });
     return () => {

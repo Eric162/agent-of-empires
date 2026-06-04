@@ -1,5 +1,5 @@
 // Inline passphrase prompt that pops when a sensitive request returns
-// `403 elevation_required` (terminal attach, cockpit command exec,
+// `403 elevation_required` (terminal attach, structured view command exec,
 // approval resolution, file writes). Calls `POST /api/login/elevate`
 // to open a fresh 15-minute window; the original action can be
 // retried by the user once the modal closes. See #1131.
@@ -17,7 +17,12 @@ export function ElevationPrompt() {
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    const onElevationRequired = () => setOpen(true);
+    const onElevationRequired = () => {
+      setOpen(true);
+      setPassphrase("");
+      setError(null);
+      setLoading(false);
+    };
     window.addEventListener(ELEVATION_REQUIRED_EVENT, onElevationRequired);
     return () =>
       window.removeEventListener(
@@ -25,15 +30,6 @@ export function ElevationPrompt() {
         onElevationRequired,
       );
   }, []);
-
-  useEffect(() => {
-    if (open) {
-      setPassphrase("");
-      setError(null);
-      setLoading(false);
-      requestAnimationFrame(() => inputRef.current?.focus());
-    }
-  }, [open]);
 
   const close = () => setOpen(false);
 
@@ -80,6 +76,7 @@ export function ElevationPrompt() {
         </div>
         <input
           ref={inputRef}
+          autoFocus
           type="password"
           autoComplete="current-password"
           value={passphrase}
