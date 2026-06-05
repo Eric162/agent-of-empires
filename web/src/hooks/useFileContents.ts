@@ -63,7 +63,10 @@ export function useFileContents(
   }, [sessionId, filePath, repoName]);
 
   useEffect(() => {
-    void fetchContents();
+    const timer = setTimeout(() => {
+      void fetchContents();
+    }, 0);
+    return () => clearTimeout(timer);
   }, [fetchContents, externalRevision]);
 
   return { contents, loading, error, refresh: fetchContents };

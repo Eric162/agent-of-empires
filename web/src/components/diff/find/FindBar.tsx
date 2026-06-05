@@ -30,33 +30,47 @@ export function FindBar({ lines, onJump, onClose }: Props) {
     inputRef.current?.focus();
   }, []);
 
-  const { matches, error } = useMemo(() => {
+  const safeFind = (q: string, cs: boolean, rx: boolean) => {
     try {
       return {
-        matches: findMatches(lines, query, { caseSensitive, regex }),
+        matches: findMatches(lines, q, { caseSensitive: cs, regex: rx }),
         error: null as string | null,
       };
     } catch {
       return { matches: [] as FindMatch[], error: "Invalid pattern" };
     }
-  }, [lines, query, caseSensitive, regex]);
+  };
 
-  // Clamp the active index and notify the host whenever the match set changes.
-  useEffect(() => {
-    if (matches.length === 0) {
-      onJump(null);
-      return;
-    }
-    const idx = ((active % matches.length) + matches.length) % matches.length;
-    if (idx !== active) setActive(idx);
-    onJump(matches[idx] ?? null);
-    // onJump is stable from the host (useCallback); intentionally excluded.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [matches, active]);
+  const { matches, error } = useMemo(
+    () => {
+      try {
+        return {
+          matches: findMatches(lines, query, { caseSensitive, regex }),
+          error: null as string | null,
+        };
+      } catch {
+        return { matches: [] as FindMatch[], error: "Invalid pattern" };
+      }
+    },
+    [lines, query, caseSensitive, regex],
+  );
+
+  // Displayed index is derived at render; jumps fire from the event handlers
+  // below (not an effect), per the no-set-state-in-effect lint posture.
+  const activeIdx =
+    matches.length === 0 ? 0 : Math.min(active, matches.length - 1);
+
+  /** Re-run the search with new inputs and jump to its first match. */
+  const retarget = (q: string, cs: boolean, rx: boolean) => {
+    setActive(0);
+    onJump(safeFind(q, cs, rx).matches[0] ?? null);
+  };
 
   const step = (delta: number) => {
     if (matches.length === 0) return;
-    setActive((a) => (a + delta + matches.length) % matches.length);
+    const next = (activeIdx + delta + matches.length) % matches.length;
+    setActive(next);
+    onJump(matches[next] ?? null);
   };
 
   return (
@@ -67,7 +81,7 @@ export function FindBar({ lines, onJump, onClose }: Props) {
         value={query}
         onChange={(e) => {
           setQuery(e.target.value);
-          setActive(0);
+          retarget(e.target.value, caseSensitive, regex);
         }}
         onKeyDown={(e) => {
           if (e.key === "Enter") {
@@ -91,10 +105,26 @@ export function FindBar({ lines, onJump, onClose }: Props) {
             ? query
               ? "0/0"
               : ""
-            : `${active + 1}/${matches.length}`}
+            : `${activeIdx + 1}/${matches.length}`}
       </span>
-      <ToggleButton active={caseSensitive} onClick={() => setCaseSensitive((v) => !v)} title="Match case" label="Aa" />
-      <ToggleButton active={regex} onClick={() => setRegex((v) => !v)} title="Regular expression" label=".*" />
+      <ToggleButton
+        active={caseSensitive}
+        onClick={() => {
+          setCaseSensitive(!caseSensitive);
+          retarget(query, !caseSensitive, regex);
+        }}
+        title="Match case"
+        label="Aa"
+      />
+      <ToggleButton
+        active={regex}
+        onClick={() => {
+          setRegex(!regex);
+          retarget(query, caseSensitive, !regex);
+        }}
+        title="Regular expression"
+        label=".*"
+      />
       <IconButton onClick={() => step(-1)} title="Previous match (Shift+Enter)" disabled={matches.length === 0} label="↑" />
       <IconButton onClick={() => step(1)} title="Next match (Enter)" disabled={matches.length === 0} label="↓" />
       <IconButton onClick={onClose} title="Close (Esc)" label="✕" />
