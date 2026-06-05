@@ -57,7 +57,7 @@ export function useFileContents(
     if (resp) {
       setContents(resp);
     } else {
-      setError("Failed to load diff");
+      setError("Failed to load file contents");
     }
     setLoading(false);
   }, [sessionId, filePath, repoName]);
