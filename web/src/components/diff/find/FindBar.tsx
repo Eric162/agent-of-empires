@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   findMatches,
   type FindMatch,
@@ -30,29 +30,23 @@ export function FindBar({ lines, onJump, onClose }: Props) {
     inputRef.current?.focus();
   }, []);
 
-  const safeFind = (q: string, cs: boolean, rx: boolean) => {
-    try {
-      return {
-        matches: findMatches(lines, q, { caseSensitive: cs, regex: rx }),
-        error: null as string | null,
-      };
-    } catch {
-      return { matches: [] as FindMatch[], error: "Invalid pattern" };
-    }
-  };
-
-  const { matches, error } = useMemo(
-    () => {
+  const safeFind = useCallback(
+    (q: string, cs: boolean, rx: boolean) => {
       try {
         return {
-          matches: findMatches(lines, query, { caseSensitive, regex }),
+          matches: findMatches(lines, q, { caseSensitive: cs, regex: rx }),
           error: null as string | null,
         };
       } catch {
         return { matches: [] as FindMatch[], error: "Invalid pattern" };
       }
     },
-    [lines, query, caseSensitive, regex],
+    [lines],
+  );
+
+  const { matches, error } = useMemo(
+    () => safeFind(query, caseSensitive, regex),
+    [safeFind, query, caseSensitive, regex],
   );
 
   // Displayed index is derived at render; jumps fire from the event handlers

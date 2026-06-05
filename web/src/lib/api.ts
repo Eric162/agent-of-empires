@@ -117,9 +117,9 @@ export function getSessionDiffFiles(
 }
 
 /**
- * Fetch raw old/new contents for a file so the client can render the diff
- * itself via `@pierre/diffs`. Backed by `?mode=contents`. See
- * {@link RichFileContentsResponse}.
+ * Fetch raw old/new contents plus a server-computed unified patch for a
+ * file; the client renders the patch via `@pierre/diffs` without re-diffing.
+ * See {@link RichFileContentsResponse}.
  */
 export function getSessionFileContents(
   id: string,

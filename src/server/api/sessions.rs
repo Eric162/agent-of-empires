@@ -3506,9 +3506,10 @@ pub async fn session_diff_file(
                 }
             }
 
-            // Hand the client raw old/new text and let `@pierre/diffs` parse +
-            // render it (virtualized, off-main-thread highlighting). The diff
-            // itself is computed client-side.
+            // Hand the client raw old/new text plus a server-computed unified
+            // patch. `@pierre/diffs` parses and renders that patch client-side
+            // (virtualized, off-main-thread highlighting) without re-running
+            // the diff algorithm in the browser.
             let contents = diff::compute_file_contents(repo_path, file_path, &base_branch)
                 .map_err(|e| DiffFileError::Internal(e.into()))?;
             // additions/deletions aren't computed on this path; reuse the counts
@@ -3526,7 +3527,8 @@ pub async fn session_diff_file(
                 deletions,
                 repo_name: selected_repo_name.clone(),
             };
-            let total_bytes = contents.old_content.len() + contents.new_content.len();
+            let total_bytes =
+                contents.old_content.len() + contents.new_content.len() + contents.patch.len();
             let total_lines =
                 contents.old_content.lines().count() + contents.new_content.lines().count();
             let resp = if total_bytes > MAX_CONTENTS_BYTES || total_lines > MAX_CONTENTS_LINES {
