@@ -6,7 +6,7 @@ import {
 } from "./findMatches";
 
 interface Props {
-  /** Lines that find may match against — the diff's changed lines. */
+  /** Lines that find may match against: the diff's changed lines. */
   lines: SearchableLine[];
   /** Called with the active match (or null when none) so the host can
    *  scroll/select it in the virtualized renderer. */
@@ -119,8 +119,18 @@ export function FindBar({ lines, onJump, onClose }: Props) {
         title="Regular expression"
         label=".*"
       />
-      <IconButton onClick={() => step(-1)} title="Previous match (Shift+Enter)" disabled={matches.length === 0} label="↑" />
-      <IconButton onClick={() => step(1)} title="Next match (Enter)" disabled={matches.length === 0} label="↓" />
+      <IconButton
+        onClick={() => step(-1)}
+        title="Previous match (Shift+Enter)"
+        disabled={matches.length === 0}
+        label="↑"
+      />
+      <IconButton
+        onClick={() => step(1)}
+        title="Next match (Enter)"
+        disabled={matches.length === 0}
+        label="↓"
+      />
       <IconButton onClick={onClose} title="Close (Esc)" label="✕" />
     </div>
   );

@@ -7,7 +7,7 @@
  * reach them. Searching the model lets find/next/prev jump to a match anywhere
  * in the diff; the caller then scrolls the renderer to it.
  *
- * Callers pass exactly the lines that should be searchable — for the MVP, the
+ * Callers pass exactly the lines that should be searchable; for the MVP, the
  * changed (added/deleted) lines of the diff (see `changedLines`), so find only
  * matches content that's actually part of the change, not the whole file.
  */

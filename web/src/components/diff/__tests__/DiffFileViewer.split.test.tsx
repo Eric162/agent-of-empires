@@ -99,7 +99,9 @@ describe("DiffFileViewer split layout", () => {
     render(<DiffFileViewer sessionId="s1" filePath="a.ts" />);
     await screen.findByText(/Modified/i);
     expect(
-      screen.getByRole("button", { name: "Split" }).getAttribute("aria-pressed"),
+      screen
+        .getByRole("button", { name: "Split" })
+        .getAttribute("aria-pressed"),
     ).toBe("false");
     expect(
       screen.getByTestId("pierre-diff").getAttribute("data-diff-style"),
@@ -114,20 +116,25 @@ describe("DiffFileViewer split layout", () => {
 
     await waitFor(() => {
       expect(
-        screen.getByRole("button", { name: "Split" }).getAttribute("aria-pressed"),
+        screen
+          .getByRole("button", { name: "Split" })
+          .getAttribute("aria-pressed"),
       ).toBe("true");
     });
     expect(
       screen.getByTestId("pierre-diff").getAttribute("data-diff-style"),
     ).toBe("split");
     expect(
-      JSON.parse(window.localStorage.getItem("aoe-web-settings") ?? "{}").diffViewLayout,
+      JSON.parse(window.localStorage.getItem("aoe-web-settings") ?? "{}")
+        .diffViewLayout,
     ).toBe("split");
   });
 
   it("attaches the width observer when the diff container mounts after loading", async () => {
     mock.contents = undefined;
-    const { rerender } = render(<DiffFileViewer sessionId="s1" filePath="a.ts" />);
+    const { rerender } = render(
+      <DiffFileViewer sessionId="s1" filePath="a.ts" />,
+    );
     expect(mock.observe).not.toHaveBeenCalled();
 
     mock.contents = contents;

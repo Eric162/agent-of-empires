@@ -910,12 +910,8 @@
       "id": "right-panel.diff-split-toggle",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/components/diff/__tests__/DiffFileViewer.split.test.tsx"
-      ],
-      "components": [
-        "web/src/components/diff/DiffFileViewer.tsx"
-      ]
+      "specs": ["src/components/diff/__tests__/DiffFileViewer.split.test.tsx"],
+      "components": ["web/src/components/diff/DiffFileViewer.tsx"]
     },
     {
       "id": "right-panel.diff-render-and-find",

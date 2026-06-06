@@ -92,9 +92,9 @@ base(
 
       // Virtualization: a row near the end of this 1000-line replacement
       // ("edit 999: lorem ...") is not in the DOM on first paint.
-      await expect(
-        page.getByText("edit 999:", { exact: false }),
-      ).toHaveCount(0);
+      await expect(page.getByText("edit 999:", { exact: false })).toHaveCount(
+        0,
+      );
 
       // Scroll the diff viewer to the bottom; the virtualizer mounts rows as
       // they approach the viewport.

@@ -171,7 +171,7 @@ export function DiffFileViewer({
   );
 
   // Parse the server-computed patch into Pierre's diff metadata. Plain text
-  // parsing — no diff algorithm runs in the browser, so even huge generated
+  // parsing; no diff algorithm runs in the browser, so even huge generated
   // files don't block the main thread. The raw old/new contents are grafted
   // on so hunk expansion still works; highlighting happens in the worker pool.
   const fileDiff = useMemo(() => {
@@ -320,23 +320,24 @@ export function DiffFileViewer({
       if (scroller) {
         const text = match.side === "old" ? oldContent : newContent;
         const lineCount = text.split("\n").length;
-        const frac = Math.min(1, Math.max(0, (match.lineNumber - 1) / lineCount));
+        const frac = Math.min(
+          1,
+          Math.max(0, (match.lineNumber - 1) / lineCount),
+        );
         userScrolledRef.current = true;
-        scroller.scrollTop = frac * (scroller.scrollHeight - scroller.clientHeight);
+        scroller.scrollTop =
+          frac * (scroller.scrollHeight - scroller.clientHeight);
       }
     },
     [oldContent, newContent],
   );
 
-  const onKeyDown = useCallback(
-    (e: React.KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
-        e.preventDefault();
-        setFindOpen(true);
-      }
-    },
-    [],
-  );
+  const onKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
+      e.preventDefault();
+      setFindOpen(true);
+    }
+  }, []);
 
   // Keep the diff scrolled to the top when a file first opens. The
   // virtualized renderer reconciles row heights asynchronously (and again
@@ -394,7 +395,8 @@ export function DiffFileViewer({
   }
 
   const statusColor = STATUS_COLORS[contents.file.status] ?? "text-text-muted";
-  const statusLabel = STATUS_LABELS[contents.file.status] ?? contents.file.status;
+  const statusLabel =
+    STATUS_LABELS[contents.file.status] ?? contents.file.status;
   const noChanges = oldContent === newContent;
 
   return (
@@ -411,7 +413,16 @@ export function DiffFileViewer({
             title="Back to terminal"
             aria-label="Back to terminal"
           >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+            <svg
+              width="14"
+              height="14"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.75"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
               <path d="M15 18l-6-6 6-6" />
             </svg>
             <span className="hidden sm:inline">Terminal</span>
@@ -427,10 +438,14 @@ export function DiffFileViewer({
         </span>
         <span className="font-mono text-[11px] flex items-center gap-1">
           {contents.file.additions > 0 && (
-            <span className="text-status-running">+{contents.file.additions}</span>
+            <span className="text-status-running">
+              +{contents.file.additions}
+            </span>
           )}
           {contents.file.deletions > 0 && (
-            <span className="text-status-error">-{contents.file.deletions}</span>
+            <span className="text-status-error">
+              -{contents.file.deletions}
+            </span>
           )}
         </span>
         <div className="ml-auto flex items-center gap-2">

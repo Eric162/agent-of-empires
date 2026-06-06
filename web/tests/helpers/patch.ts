@@ -24,8 +24,12 @@ export function makeAllDifferentPatch(
   oldContent: string,
   newContent: string,
 ): string {
-  const oldLines = oldContent.split("\n").filter((_, i, a) => i < a.length - 1 || a[i] !== "");
-  const newLines = newContent.split("\n").filter((_, i, a) => i < a.length - 1 || a[i] !== "");
+  const oldLines = oldContent
+    .split("\n")
+    .filter((_, i, a) => i < a.length - 1 || a[i] !== "");
+  const newLines = newContent
+    .split("\n")
+    .filter((_, i, a) => i < a.length - 1 || a[i] !== "");
   return (
     `--- a/${path}\n+++ b/${path}\n` +
     `@@ -1,${oldLines.length} +1,${newLines.length} @@\n` +

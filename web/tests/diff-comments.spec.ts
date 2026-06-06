@@ -82,7 +82,10 @@ async function setup(page: Page, opts: SetupOpts = {}) {
     await page.route(`**/api/${path}`, (r) =>
       r.fulfill({
         json:
-          path === "docker/status" || path === "about" || path === "settings" || path === "system/update-status"
+          path === "docker/status" ||
+          path === "about" ||
+          path === "settings" ||
+          path === "system/update-status"
             ? {}
             : [],
       }),
@@ -132,9 +135,7 @@ async function setup(page: Page, opts: SetupOpts = {}) {
     r.fulfill({ json: DIFF_FILE_RESPONSE }),
   );
   // Structured view panel endpoints — content irrelevant for these tests.
-  await page.route("**/api/sessions/*/acp/**", (r) =>
-    r.fulfill({ json: {} }),
-  );
+  await page.route("**/api/sessions/*/acp/**", (r) => r.fulfill({ json: {} }));
   await page.routeWebSocket(/\/sessions\/.*\/(ws|acp-ws)$/, () => {
     // No-op: we don't need a working stream for diff comment tests.
   });
@@ -172,7 +173,9 @@ async function startSingleLineComment(page: Page, lineNum: number) {
 /** Select a multi-line range: click the first line, shift-click the last. */
 async function selectRange(page: Page, startLine: number, endLine: number) {
   await gutterLine(page, startLine).first().click();
-  await gutterLine(page, endLine).first().click({ modifiers: ["Shift"] });
+  await gutterLine(page, endLine)
+    .first()
+    .click({ modifiers: ["Shift"] });
 }
 
 test.use({ viewport: { width: 1280, height: 900 } });
@@ -246,13 +249,10 @@ test.describe("Diff comments (#928)", () => {
       assembledMarkdown?: string;
     }
     let captured: CapturedBody | null = null;
-    await page.route(
-      "**/api/sessions/*/acp/prompt/diff-comments",
-      (r) => {
-        captured = JSON.parse(r.request().postData() || "{}");
-        return r.fulfill({ json: {} });
-      },
-    );
+    await page.route("**/api/sessions/*/acp/prompt/diff-comments", (r) => {
+      captured = JSON.parse(r.request().postData() || "{}");
+      return r.fulfill({ json: {} });
+    });
     // Capture the usage-signal pings so we can assert `diff_comments` fires
     // on a confirmed send (#1881).
     const seenSignals: string[] = [];
@@ -272,12 +272,18 @@ test.describe("Diff comments (#928)", () => {
       .fill("**rename** this please");
     await page.getByRole("button", { name: "Save" }).click();
     // Open the send dialog via the banner's Send button.
-    await page.getByRole("button", { name: /^Send$/ }).first().click();
+    await page
+      .getByRole("button", { name: /^Send$/ })
+      .first()
+      .click();
     // Dialog open: heading "Send diff comments"
     await expect(page.getByText("Send diff comments")).toBeVisible();
     await page.getByPlaceholder(/Anything you want to say/).fill("Hey:");
     // Confirm send (dialog's own Send button is the last one in the DOM).
-    await page.getByRole("button", { name: /^Send$/ }).last().click();
+    await page
+      .getByRole("button", { name: /^Send$/ })
+      .last()
+      .click();
     await expect.poll(() => captured?.assembledMarkdown).toBeTruthy();
     // Structured fields the transcript card renders from.
     expect(captured?.intro).toBe("Hey:");
