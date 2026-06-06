@@ -170,6 +170,13 @@ export function DiffFileViewer({
     [resolvedPath, newContent],
   );
 
+  // Identity of the currently rendered file + revision. Drives the Pierre
+  // parse cache and (below) remounts the Virtualizer on a file switch: the
+  // virtualizer caches row measurements internally and does not reset them
+  // when its children change, so without a fresh mount it can keep painting
+  // the previously opened file's rows even after the contents update.
+  const viewKey = `${repoName ?? ""}:${resolvedPath}:${revision ?? 0}`;
+
   // Parse the server-computed patch into Pierre's diff metadata. Plain text
   // parsing; no diff algorithm runs in the browser, so even huge generated
   // files don't block the main thread. The raw old/new contents are grafted
@@ -179,9 +186,9 @@ export function DiffFileViewer({
     return processFile(patch, {
       oldFile,
       newFile,
-      cacheKey: `${repoName ?? ""}:${resolvedPath}:${revision ?? 0}`,
+      cacheKey: viewKey,
     });
-  }, [patch, oldFile, newFile, repoName, resolvedPath, revision]);
+  }, [patch, oldFile, newFile, viewKey]);
 
   const lineAnnotations = useMemo<DiffLineAnnotation<AnnotationMeta>[]>(() => {
     const out: DiffLineAnnotation<AnnotationMeta>[] = [];
@@ -548,7 +555,7 @@ export function DiffFileViewer({
             )}
             <div ref={scrollResetRef} className="flex-1 min-h-0 flex flex-col">
               <DiffWorkerPoolProvider>
-                <Virtualizer className="flex-1 overflow-auto">
+                <Virtualizer key={viewKey} className="flex-1 overflow-auto">
                   {fileDiff && (
                     <FileDiff<AnnotationMeta>
                       fileDiff={fileDiff}
