@@ -348,6 +348,13 @@
       "components": ["web/src/components/profiles/ProfilesPage.tsx"]
     },
     {
+      "id": "profiles.description-edit-race",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/profiles/__tests__/ProfilesPage.test.tsx"],
+      "components": ["web/src/components/profiles/ProfilesPage.tsx"]
+    },
+    {
       "id": "profiles.override",
       "kind": "live-playwright",
       "risk": "high",
