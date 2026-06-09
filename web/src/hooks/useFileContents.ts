@@ -69,7 +69,14 @@ function cachePut(key: string, value: RichFileContentsResponse) {
 }
 
 function cacheGet(key: string): RichFileContentsResponse | null {
-  return contentsCache.get(key)?.value ?? null;
+  const hit = contentsCache.get(key);
+  if (!hit) return null;
+  // Promote to most-recently-used so eviction is true LRU, not FIFO: a
+  // frequently revisited file shouldn't be evicted ahead of a stale one just
+  // because it was inserted earlier.
+  contentsCache.delete(key);
+  contentsCache.set(key, hit);
+  return hit.value;
 }
 
 /** Test-only: reset the module-level cache between cases. */
