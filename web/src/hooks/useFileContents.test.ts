@@ -5,7 +5,7 @@
 // or a re-fetch, a miss shows loading, a bumped revision invalidates, and the
 // byte-budget LRU evicts the oldest entry once the budget is exceeded.
 
-import { renderHook, waitFor } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useFileContents, __resetFileContentsCache } from "./useFileContents";
@@ -123,5 +123,78 @@ describe("useFileContents", () => {
     rerender({ path: "a.ts" });
     await waitFor(() => expect(result.current.contents?.new_content).toBe("alpha2"));
     expect(spy).toHaveBeenCalledTimes(3);
+  });
+
+  it("refresh() forces a re-fetch even when the file is cached", async () => {
+    const spy = vi.spyOn(api, "getSessionFileContents").mockResolvedValue(makeContents("a.ts", "alpha"));
+
+    const { result } = renderHook(() => useFileContents("s1", "a.ts", undefined));
+    await waitFor(() => expect(result.current.contents?.new_content).toBe("alpha"));
+    expect(spy).toHaveBeenCalledTimes(1);
+
+    // a.ts is cached, but refresh(force) bypasses the cache and re-fetches.
+    spy.mockResolvedValueOnce(makeContents("a.ts", "alpha-refreshed"));
+    await act(async () => {
+      result.current.refresh();
+    });
+    await waitFor(() => expect(result.current.contents?.new_content).toBe("alpha-refreshed"));
+    expect(spy).toHaveBeenCalledTimes(2);
+  });
+
+  it("surfaces an error when the fetch returns no contents", async () => {
+    vi.spyOn(api, "getSessionFileContents").mockResolvedValue(null);
+
+    const { result } = renderHook(() => useFileContents("s1", "a.ts", undefined));
+    await waitFor(() => expect(result.current.error).toBe("Failed to load file contents"));
+    expect(result.current.contents).toBeNull();
+    expect(result.current.loading).toBe(false);
+  });
+
+  it("does not fetch and clears state while filePath is null", async () => {
+    const spy = vi.spyOn(api, "getSessionFileContents").mockResolvedValue(makeContents("a.ts", "alpha"));
+
+    const { result, rerender } = renderHook(
+      ({ path }: { path: string | null }) => useFileContents("s1", path, undefined),
+      {
+        initialProps: { path: null as string | null },
+      },
+    );
+
+    // No file selected: no request, no loading, empty viewer.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 5));
+    });
+    expect(spy).not.toHaveBeenCalled();
+    expect(result.current.contents).toBeNull();
+    expect(result.current.loading).toBe(false);
+
+    // Selecting a file starts the fetch.
+    rerender({ path: "a.ts" });
+    await waitFor(() => expect(result.current.contents?.new_content).toBe("alpha"));
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it("drops a superseded in-flight response when switching files rapidly", async () => {
+    let resolveA: (v: RichFileContentsResponse | null) => void = () => {};
+    const spy = vi.spyOn(api, "getSessionFileContents");
+    // a.ts fetch hangs until we resolve it manually.
+    spy.mockImplementationOnce(() => new Promise((r) => (resolveA = r)));
+
+    const { result, rerender } = renderHook(({ path }) => useFileContents("s1", path, undefined), {
+      initialProps: { path: "a.ts" },
+    });
+    await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+
+    // Switch to b.ts before a.ts resolves; b.ts resolves normally and wins.
+    spy.mockResolvedValueOnce(makeContents("b.ts", "beta"));
+    rerender({ path: "b.ts" });
+    await waitFor(() => expect(result.current.contents?.new_content).toBe("beta"));
+
+    // a.ts's late response is stale (reqId superseded) and must be ignored.
+    await act(async () => {
+      resolveA(makeContents("a.ts", "alpha-late"));
+      await new Promise((r) => setTimeout(r, 5));
+    });
+    expect(result.current.contents?.new_content).toBe("beta");
   });
 });
