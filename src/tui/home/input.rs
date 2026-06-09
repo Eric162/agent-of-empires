@@ -1846,6 +1846,9 @@ impl HomeView {
                     ProfilePickerAction::Deleted(name) => {
                         match crate::session::delete_profile(&name) {
                             Ok(()) => {
+                                if let Some(entry) = self.disk_watch_handles.remove(&name) {
+                                    super::drop_disk_watch_entry(entry);
+                                }
                                 self.show_profile_picker();
                             }
                             Err(e) => {
@@ -2312,6 +2315,7 @@ impl HomeView {
             profile,
             base_override,
             worktree_base,
+            self.file_watch.clone(),
         ) {
             Ok(view) => self.diff_view = Some(view),
             Err(e) => {
