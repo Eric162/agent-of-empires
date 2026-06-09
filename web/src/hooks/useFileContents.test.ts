@@ -36,14 +36,11 @@ describe("useFileContents", () => {
   });
 
   it("fetches on first open, then serves a revisit from cache without re-fetching", async () => {
-    const spy = vi
-      .spyOn(api, "getSessionFileContents")
-      .mockResolvedValue(makeContents("a.ts", "alpha"));
+    const spy = vi.spyOn(api, "getSessionFileContents").mockResolvedValue(makeContents("a.ts", "alpha"));
 
-    const { result, rerender } = renderHook(
-      ({ path }) => useFileContents("s1", path, undefined),
-      { initialProps: { path: "a.ts" } },
-    );
+    const { result, rerender } = renderHook(({ path }) => useFileContents("s1", path, undefined), {
+      initialProps: { path: "a.ts" },
+    });
 
     await waitFor(() => expect(result.current.contents).not.toBeNull());
     expect(result.current.contents?.new_content).toBe("alpha");
@@ -67,10 +64,9 @@ describe("useFileContents", () => {
     const spy = vi.spyOn(api, "getSessionFileContents");
     spy.mockResolvedValueOnce(makeContents("a.ts", "alpha"));
 
-    const { result, rerender } = renderHook(
-      ({ path }) => useFileContents("s1", path, undefined),
-      { initialProps: { path: "a.ts" } },
-    );
+    const { result, rerender } = renderHook(({ path }) => useFileContents("s1", path, undefined), {
+      initialProps: { path: "a.ts" },
+    });
     await waitFor(() => expect(result.current.contents?.new_content).toBe("alpha"));
 
     // Switch to an uncached file whose fetch is still in flight.
@@ -93,10 +89,9 @@ describe("useFileContents", () => {
     const spy = vi.spyOn(api, "getSessionFileContents");
     spy.mockResolvedValueOnce(makeContents("a.ts", "v1"));
 
-    const { result, rerender } = renderHook(
-      ({ rev }) => useFileContents("s1", "a.ts", undefined, rev),
-      { initialProps: { rev: 1 } },
-    );
+    const { result, rerender } = renderHook(({ rev }) => useFileContents("s1", "a.ts", undefined, rev), {
+      initialProps: { rev: 1 },
+    });
     await waitFor(() => expect(result.current.contents?.new_content).toBe("v1"));
     expect(spy).toHaveBeenCalledTimes(1);
 
@@ -114,10 +109,9 @@ describe("useFileContents", () => {
     const spy = vi.spyOn(api, "getSessionFileContents");
     spy.mockResolvedValueOnce(makeContents("a.ts", "alpha"));
 
-    const { result, rerender } = renderHook(
-      ({ path }) => useFileContents("s1", path, undefined),
-      { initialProps: { path: "a.ts" } },
-    );
+    const { result, rerender } = renderHook(({ path }) => useFileContents("s1", path, undefined), {
+      initialProps: { path: "a.ts" },
+    });
     await waitFor(() => expect(result.current.contents?.new_content).toBe("alpha"));
 
     spy.mockResolvedValueOnce(makeContents("big.ts", big));

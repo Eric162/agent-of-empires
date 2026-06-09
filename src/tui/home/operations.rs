@@ -71,8 +71,10 @@ impl HomeView {
 
         // Ensure target profile storage exists
         if !self.storages.contains_key(&target_profile) {
-            self.storages
-                .insert(target_profile.clone(), Storage::new(&target_profile)?);
+            self.storages.insert(
+                target_profile.clone(),
+                Storage::new(&target_profile, self.file_watch.clone())?,
+            );
         }
 
         self.add_instance(instance.clone());
@@ -139,6 +141,8 @@ impl HomeView {
         &mut self,
         new_profile: Option<&str>,
         new_tool: Option<&str>,
+        new_extra_args: Option<&str>,
+        new_command_override: Option<&str>,
     ) -> anyhow::Result<()> {
         let id = match &self.selected_session {
             Some(id) => id.clone(),
@@ -199,6 +203,22 @@ impl HomeView {
             }
         }
 
+        // Apply command override + extra args swaps before restart so the
+        // adjusted launch command takes effect on the next spawn. Both come
+        // pre-resolved from the restart dialog (which re-seeds them from the
+        // selected tool's config when the engine is swapped), so we set the
+        // instance fields directly. `None` means "leave as-is".
+        if let Some(command) = new_command_override {
+            self.mutate_instance(&id, |inst| {
+                inst.command = command.to_string();
+            });
+        }
+        if let Some(extra) = new_extra_args {
+            self.mutate_instance(&id, |inst| {
+                inst.extra_args = extra.to_string();
+            });
+        }
+
         // Apply profile move. Validates the target exists, lazily creates
         // its Storage, and rebuilds group trees so the row renders under
         // the new profile immediately.
@@ -217,8 +237,10 @@ impl HomeView {
                     anyhow::bail!("Profile '{}' does not exist", target_profile);
                 }
                 if !self.storages.contains_key(target_profile) {
-                    self.storages
-                        .insert(target_profile.to_string(), Storage::new(target_profile)?);
+                    self.storages.insert(
+                        target_profile.to_string(),
+                        Storage::new(target_profile, self.file_watch.clone())?,
+                    );
                 }
                 if !self.group_trees.contains_key(target_profile) {
                     self.group_trees.insert(
@@ -587,7 +609,8 @@ impl HomeView {
         // Ensure target profile storage exists when moving across profiles
         if let Some(tp) = new_profile {
             if tp != ctx.old_profile && !self.storages.contains_key(tp) {
-                self.storages.insert(tp.to_string(), Storage::new(tp)?);
+                self.storages
+                    .insert(tp.to_string(), Storage::new(tp, self.file_watch.clone())?);
             }
         }
 
@@ -807,8 +830,10 @@ impl HomeView {
 
                     // Ensure target profile storage exists
                     if !self.storages.contains_key(target_profile) {
-                        self.storages
-                            .insert(target_profile.to_string(), Storage::new(target_profile)?);
+                        self.storages.insert(
+                            target_profile.to_string(),
+                            Storage::new(target_profile, self.file_watch.clone())?,
+                        );
                     }
 
                     // Update source_profile and save (handles moving between profiles)
@@ -998,7 +1023,9 @@ impl HomeView {
             // Re-seat the cursor on the just-unarchived session. After the
             // flat_items rebuild the row jumps from tier 99 to its real
             // tier, so without this the cursor stays at the old index and
-            // ends up on whatever row slid into that slot.
+            // ends up on whatever row slid into that slot. The session stays
+            // Stopped (archive killed its pane); the user restarts it with `e`
+            // when they want it back, same as any other stopped session.
             self.select_session_by_id(&id);
             return Ok(());
         }
@@ -1013,9 +1040,23 @@ impl HomeView {
         }
 
         self.apply_user_action(&id, |inst| inst.archive())?;
-        self.flat_items = self.build_flat_items();
         if self.sort_order == crate::session::config::SortOrder::Attention {
+            // Attention sort is a triage flow: archiving sinks the row and the
+            // cursor advances to the next item that needs attention. That path
+            // already lands selection on a live row, so it never showed the
+            // dead-pane/selection-swap jank the default sort did.
+            self.flat_items = self.build_flat_items();
             self.select_top_attention(None);
+        } else {
+            // Keep the just-archived session selected instead of letting the
+            // cursor snap to whatever neighbor slid into its slot. Reveal the
+            // Archived section so the row is visible, rebuild, then re-seat the
+            // cursor onto it. The preview then renders a calm "Archived"
+            // placeholder (render_archived_preview) instead of the killed
+            // pane's "No output available", and a second `z` unarchives it.
+            self.reveal_archived_section();
+            self.flat_items = self.build_flat_items();
+            self.select_session_by_id(&id);
         }
         Ok(())
     }

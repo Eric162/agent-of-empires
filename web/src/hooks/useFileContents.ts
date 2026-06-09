@@ -34,9 +34,7 @@ let cacheBytes = 0;
 function entrySize(value: RichFileContentsResponse): number {
   // Char length is a good-enough proxy for payload bytes here; exact UTF-8
   // sizing isn't worth the cost and the budget has generous headroom.
-  return (
-    value.old_content.length + value.new_content.length + value.patch.length
-  );
+  return value.old_content.length + value.new_content.length + value.patch.length;
 }
 
 function cacheKeyFor(
@@ -56,10 +54,7 @@ function cachePut(key: string, value: RichFileContentsResponse) {
   const bytes = entrySize(value);
   contentsCache.set(key, { value, bytes });
   cacheBytes += bytes;
-  while (
-    contentsCache.size > MAX_CACHE_ENTRIES ||
-    (cacheBytes > MAX_CACHE_BYTES && contentsCache.size > 1)
-  ) {
+  while (contentsCache.size > MAX_CACHE_ENTRIES || (cacheBytes > MAX_CACHE_BYTES && contentsCache.size > 1)) {
     const oldestKey = contentsCache.keys().next().value;
     if (oldestKey === undefined) break;
     const oldest = contentsCache.get(oldestKey);
@@ -101,14 +96,9 @@ export function useFileContents(
   /** Triggers a re-fetch when bumped (e.g. from useDiffFiles.revision). */
   externalRevision?: number,
 ): UseFileContentsResult {
-  const key =
-    sessionId && filePath
-      ? cacheKeyFor(sessionId, filePath, repoName, externalRevision)
-      : null;
+  const key = sessionId && filePath ? cacheKeyFor(sessionId, filePath, repoName, externalRevision) : null;
 
-  const [contents, setContents] = useState<RichFileContentsResponse | null>(
-    () => (key ? cacheGet(key) : null),
-  );
+  const [contents, setContents] = useState<RichFileContentsResponse | null>(() => (key ? cacheGet(key) : null));
   const [loading, setLoading] = useState(key != null && cacheGet(key) == null);
   const [error, setError] = useState<string | null>(null);
   const [handledKey, setHandledKey] = useState(key);
