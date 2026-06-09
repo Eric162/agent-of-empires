@@ -56,6 +56,9 @@ pub struct RestartDialog {
     tool_config_mode: bool,
     /// 0 = command override, 1 = extra args.
     tool_config_focused_field: usize,
+    /// Per-field hit rects for the tool-config overlay, so a click can focus
+    /// the Command/Extra-Args field directly (parity with the New dialog).
+    tool_config_rects: Vec<(usize, Rect)>,
     profile_selector_area: Rect,
     tool_selector_area: Rect,
     /// Which selector row the mouse is over, for the hover highlight.
@@ -97,6 +100,7 @@ impl RestartDialog {
             extra_args: Input::new(current_extra_args.to_string()),
             tool_config_mode: false,
             tool_config_focused_field: 0,
+            tool_config_rects: Vec::new(),
             profile_selector_area: Rect::default(),
             tool_selector_area: Rect::default(),
             hover: HoverState::default(),
@@ -104,12 +108,21 @@ impl RestartDialog {
     }
 
     pub fn handle_click(&mut self, col: u16, row: u16) -> Option<DialogResult<RestartData>> {
-        // While the tool-config overlay is up, swallow clicks so a stray
-        // click on the (now-hidden) selectors underneath can't cycle them.
+        let pos = ratatui::layout::Position::from((col, row));
+        // While the tool-config overlay is up, a click on a field focuses it;
+        // any other click is swallowed so a stray click on the (now-hidden)
+        // selectors underneath can't cycle them.
         if self.tool_config_mode {
+            if let Some(hit) = self
+                .tool_config_rects
+                .iter()
+                .find(|(_, rect)| rect.contains(pos))
+                .map(|(f, _)| *f)
+            {
+                self.tool_config_focused_field = hit;
+            }
             return Some(DialogResult::Continue);
         }
-        let pos = ratatui::layout::Position::from((col, row));
         if self.profile_selector_area.contains(pos) {
             self.focused_field = 0;
             if !self.available_profiles.is_empty() {
@@ -455,7 +468,7 @@ impl RestartDialog {
                 .or_else(|| self.available_tools.first())
                 .map(String::as_str)
                 .unwrap_or("claude");
-            let _ = render_tool_config_overlay(
+            self.tool_config_rects = render_tool_config_overlay(
                 frame,
                 area,
                 selected_tool,
@@ -775,6 +788,39 @@ mod tests {
         assert_eq!(d.focused_field, 0); // profile field
         d.handle_key(ctrl_key(KeyCode::Char('p')));
         assert!(!d.tool_config_mode);
+    }
+
+    #[test]
+    fn test_tool_config_click_focuses_field() {
+        // Clicking a field in the open overlay focuses it (mouse parity with
+        // the New dialog), while keyboard focus stays usable.
+        let mut d = dialog("default", "claude");
+        d.focused_field = 1;
+        d.handle_key(ctrl_key(KeyCode::Char('p')));
+        assert!(d.tool_config_mode);
+        assert_eq!(d.tool_config_focused_field, 0);
+        // Stage overlay field rects manually; the real ones come from render().
+        d.tool_config_rects = vec![(0, Rect::new(2, 4, 60, 1)), (1, Rect::new(2, 6, 60, 1))];
+        // Click within the extra-args field rect.
+        d.handle_click(4, 6);
+        assert_eq!(d.tool_config_focused_field, 1);
+        // Click within the command-override field rect.
+        d.handle_click(4, 4);
+        assert_eq!(d.tool_config_focused_field, 0);
+    }
+
+    #[test]
+    fn test_tool_config_click_outside_fields_keeps_focus() {
+        // A click that misses every field rect is swallowed and must not move
+        // focus or cycle the selectors hidden beneath the overlay.
+        let mut d = dialog("default", "claude");
+        d.focused_field = 1;
+        d.handle_key(ctrl_key(KeyCode::Char('p')));
+        d.tool_config_rects = vec![(0, Rect::new(2, 4, 60, 1)), (1, Rect::new(2, 6, 60, 1))];
+        let tool_index_before = d.tool_index;
+        d.handle_click(0, 0);
+        assert_eq!(d.tool_config_focused_field, 0);
+        assert_eq!(d.tool_index, tool_index_before);
     }
 
     #[test]
