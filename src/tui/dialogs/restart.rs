@@ -10,13 +10,15 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
-use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
 use super::DialogResult;
 use crate::session::profile_config::resolve_config_or_warn;
 use crate::tui::components::hover::{paint_hover_bg, HoverState};
-use crate::tui::components::{profile_cycler_spans, render_text_field, tool_cycler_spans};
+use crate::tui::components::{
+    handle_tool_config_key, profile_cycler_spans, render_tool_config_overlay,
+    tool_config_suffix_spans, tool_cycler_spans, ToolConfigOutcome,
+};
 use crate::tui::styles::Theme;
 
 /// Data returned when the restart dialog is submitted.
@@ -356,47 +358,20 @@ impl RestartDialog {
         }
     }
 
-    /// Handle key events while the tool-config overlay is open. Mirrors
-    /// `NewSessionDialog::handle_tool_config_key`: field 0 is the command
-    /// override, field 1 is extra args; Enter/Esc close the overlay (they
-    /// never submit or cancel the parent dialog).
+    /// Handle key events while the tool-config overlay is open, delegating to
+    /// the shared component. Enter/Esc close the overlay (they never submit or
+    /// cancel the parent dialog).
     fn handle_tool_config_key(&mut self, key: KeyEvent) -> DialogResult<RestartData> {
-        const TOOL_CMD: usize = 0;
-        const TOOL_ARGS: usize = 1;
-        const TOOL_MAX: usize = 2;
-
-        match key.code {
-            KeyCode::Esc | KeyCode::Enter => {
-                self.tool_config_mode = false;
-                DialogResult::Continue
-            }
-            KeyCode::Tab | KeyCode::Down => {
-                self.tool_config_focused_field = (self.tool_config_focused_field + 1) % TOOL_MAX;
-                DialogResult::Continue
-            }
-            KeyCode::BackTab | KeyCode::Up => {
-                self.tool_config_focused_field = if self.tool_config_focused_field == 0 {
-                    TOOL_MAX - 1
-                } else {
-                    self.tool_config_focused_field - 1
-                };
-                DialogResult::Continue
-            }
-            _ => {
-                match self.tool_config_focused_field {
-                    TOOL_CMD => {
-                        self.command_override
-                            .handle_event(&crossterm::event::Event::Key(key));
-                    }
-                    TOOL_ARGS => {
-                        self.extra_args
-                            .handle_event(&crossterm::event::Event::Key(key));
-                    }
-                    _ => {}
-                }
-                DialogResult::Continue
-            }
+        match handle_tool_config_key(
+            key,
+            &mut self.command_override,
+            &mut self.extra_args,
+            &mut self.tool_config_focused_field,
+        ) {
+            ToolConfigOutcome::Close => self.tool_config_mode = false,
+            ToolConfigOutcome::Continue => {}
         }
+        DialogResult::Continue
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -462,92 +437,22 @@ impl RestartDialog {
         }
 
         if self.tool_config_mode {
-            self.render_tool_config(frame, area, theme);
+            let selected_tool = self
+                .available_tools
+                .get(self.tool_index)
+                .or_else(|| self.available_tools.first())
+                .map(String::as_str)
+                .unwrap_or("claude");
+            let _ = render_tool_config_overlay(
+                frame,
+                area,
+                selected_tool,
+                &self.command_override,
+                &self.extra_args,
+                self.tool_config_focused_field,
+                theme,
+            );
         }
-    }
-
-    /// Tool-config overlay (command override + extra args), reusing the same
-    /// layout and `render_text_field` helper as the new-session dialog.
-    fn render_tool_config(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let dialog_width: u16 = 72;
-        let constraints = [
-            Constraint::Length(2), // Command override
-            Constraint::Length(2), // Extra args
-            Constraint::Min(1),    // Hints
-        ];
-        let fields_height: u16 = 2 + 2 + 1;
-        let dialog_height = fields_height + 4;
-
-        let selected_tool = self
-            .available_tools
-            .get(self.tool_index)
-            .or_else(|| self.available_tools.first())
-            .map(String::as_str)
-            .unwrap_or("claude");
-        let title = format!(" Tool Configuration: {} ", selected_tool);
-
-        let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.accent))
-            .title(title)
-            .title_style(Style::default().fg(theme.title).bold());
-
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .margin(1)
-            .constraints(constraints)
-            .split(inner);
-
-        let cmd_placeholder = if self.tool_config_focused_field == 0 {
-            Some("(replaces default binary)")
-        } else if self.command_override.value().is_empty() {
-            Some("(default)")
-        } else {
-            None
-        };
-        render_text_field(
-            frame,
-            chunks[0],
-            "Command:",
-            &self.command_override,
-            self.tool_config_focused_field == 0,
-            cmd_placeholder,
-            theme,
-        );
-
-        let args_placeholder = if self.tool_config_focused_field == 1 {
-            Some("(e.g. --port 8080)")
-        } else if self.extra_args.value().is_empty() {
-            Some("(none)")
-        } else {
-            None
-        };
-        render_text_field(
-            frame,
-            chunks[1],
-            "Extra Args:",
-            &self.extra_args,
-            self.tool_config_focused_field == 1,
-            args_placeholder,
-            theme,
-        );
-
-        let hint_spans = vec![
-            Span::styled("Tab", Style::default().fg(theme.hint)),
-            Span::raw(" next  "),
-            Span::styled("Enter", Style::default().fg(theme.hint)),
-            Span::raw(" done  "),
-            Span::styled("Esc", Style::default().fg(theme.hint)),
-            Span::raw(" back"),
-        ];
-        frame.render_widget(Paragraph::new(Line::from(hint_spans)), chunks[2]);
     }
 
     /// Profile picker, rendered via the shared `profile_cycler_spans` so the
@@ -588,22 +493,11 @@ impl RestartDialog {
         );
         let has_config =
             !self.extra_args.value().is_empty() || !self.command_override.value().is_empty();
-        if has_config {
-            spans.push(Span::styled(
-                "  (configured)",
-                Style::default().fg(theme.dimmed),
-            ));
-        }
-        if self.is_tool_field() {
-            spans.push(Span::styled(
-                if has_config {
-                    "  Ctrl+P: edit"
-                } else {
-                    "  (Ctrl+P to configure)"
-                },
-                Style::default().fg(theme.dimmed),
-            ));
-        }
+        spans.extend(tool_config_suffix_spans(
+            has_config,
+            self.is_tool_field(),
+            theme,
+        ));
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
