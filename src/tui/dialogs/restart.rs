@@ -207,12 +207,24 @@ impl RestartDialog {
         let Some(profile) = self.selected_profile().map(str::to_string) else {
             return;
         };
-        let config = resolve_config_or_warn(&profile);
         let tool = self
             .selected_tool()
             .or_else(|| self.available_tools.first().map(String::as_str))
             .unwrap_or("claude")
             .to_string();
+
+        // Round-trip guard: if the user cycled away and landed back on the
+        // session's original profile + tool, restore the instance's live
+        // command/args rather than the profile defaults. Otherwise an A->B->A
+        // bounce would silently replace the existing overrides with defaults
+        // and submit would treat that as a real edit (see #2041 review).
+        if profile == self.current_profile && tool == self.current_tool {
+            self.extra_args = Input::new(self.current_extra_args.clone());
+            self.command_override = Input::new(self.current_command_override.clone());
+            return;
+        }
+
+        let config = resolve_config_or_warn(&profile);
         self.extra_args = Input::new(
             config
                 .session
@@ -849,6 +861,37 @@ mod tests {
         match d.handle_key(key(KeyCode::Enter)) {
             DialogResult::Submit(data) => {
                 assert_eq!(data.command_override, Some("w".to_string()));
+                assert_eq!(data.extra_args, None);
+            }
+            _ => panic!("Expected Submit"),
+        }
+    }
+
+    #[test]
+    fn test_tool_round_trip_preserves_live_overrides() {
+        // Session has custom overrides on its original tool. Cycling the tool
+        // away and back must restore the live values (not config defaults),
+        // so a no-op round-trip submits None for both. Regression for the
+        // #2041 review: reload_tool_config used to clobber them.
+        let mut d = RestartDialog::new(
+            "S",
+            "default",
+            "claude",
+            "claude-wrapper",
+            "--foo",
+            profiles(),
+            tools(),
+        );
+        d.focused_field = 1; // tool field
+        d.handle_key(key(KeyCode::Right)); // claude -> codex (reseeds defaults)
+        d.handle_key(key(KeyCode::Left)); // codex -> claude (must restore live)
+        assert_eq!(d.tool_index, 0);
+        assert_eq!(d.command_override.value(), "claude-wrapper");
+        assert_eq!(d.extra_args.value(), "--foo");
+        match d.handle_key(key(KeyCode::Enter)) {
+            DialogResult::Submit(data) => {
+                assert_eq!(data.tool, None);
+                assert_eq!(data.command_override, None);
                 assert_eq!(data.extra_args, None);
             }
             _ => panic!("Expected Submit"),
