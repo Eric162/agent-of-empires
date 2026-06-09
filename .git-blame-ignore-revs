@@ -1,4 +1,4 @@
-# Bulk reformatting commits, ignored by git blame.
+# Revs ignored by git blame.
 # Enable with: git config blame.ignoreRevsFile .git-blame-ignore-revs
 
 # oxfmt
