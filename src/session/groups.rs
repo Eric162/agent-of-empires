@@ -517,6 +517,28 @@ fn attention_tier(inst: &Instance) -> u8 {
 /// archived first, since the archive block is a recency view, not an
 /// attention view. Urgent is suppressed for tier 99 so a sunk row can't
 /// claw back to the top.
+/// Attention bucket rank with the unread promoter folded in. Pure (no global
+/// flag read) so it can be unit-tested directly. Waiting (tier 0) stays top;
+/// when `unread` and the feature is on, a non-waiting row is promoted to rank
+/// 1, just below Waiting and above every other tier, with the remaining tiers
+/// shifted up by one (2..=7). When the feature is off it returns `tier`
+/// unchanged; the shift is monotonic so a feature-on run with no unread rows
+/// orders identically to before. Tier 99 (archived/snoozed) never reaches
+/// here, so sunk rows stay sunk regardless of an unread marker.
+fn attention_rank(tier: u8, unread: bool, unread_enabled: bool) -> u8 {
+    if unread_enabled {
+        if tier == 0 {
+            0
+        } else if unread {
+            1
+        } else {
+            tier.saturating_add(1)
+        }
+    } else {
+        tier
+    }
+}
+
 #[allow(clippy::type_complexity)]
 fn attention_session_key(
     inst: &Instance,
@@ -563,13 +585,14 @@ fn attention_session_key(
             None,
         );
     }
+    let rank = attention_rank(tier, inst.is_unread(), crate::session::unread_enabled());
     // Non-archived: "longest aging" = oldest last_accessed_at first (ASC).
     // The `Reverse` slot is forced to `Reverse(None)` (= sorts after all
     // Some() in the Reverse ordering) so it doesn't contribute; the real
     // tiebreak is the trailing ASC field.
     (
         !urgent_bias,
-        tier,
+        rank,
         !favorite_bias,
         inst.last_accessed_at.is_none(),
         Reverse(None),
@@ -1971,6 +1994,36 @@ mod tests {
             plain_key < fav_key,
             "plain+Waiting (tier 0) must sort above fav+Idle (tier 2): plain={plain_key:?} fav={fav_key:?}"
         );
+    }
+
+    #[test]
+    fn test_attention_rank_unread_promoter() {
+        // Tiers: Waiting=0, Error=1, Idle=2, Unknown=3, Running=4.
+        // Feature ON: an unread row ranks just below Waiting (0) and above
+        // every other tier, so an unread Idle beats a read Error/Running.
+        let waiting = attention_rank(0, false, true);
+        let unread_idle = attention_rank(2, true, true);
+        let read_error = attention_rank(1, false, true);
+        let read_running = attention_rank(4, false, true);
+        assert!(waiting < unread_idle, "Waiting must stay above unread");
+        assert!(
+            unread_idle < read_error,
+            "unread Idle must rank above a read Error"
+        );
+        assert!(
+            unread_idle < read_running,
+            "unread Idle must rank above a read Running"
+        );
+
+        // Feature OFF: rank is the raw tier, so ordering is unchanged and an
+        // (impossible-when-off, but defensive) unread flag does not promote.
+        assert_eq!(attention_rank(0, false, false), 0);
+        assert_eq!(attention_rank(2, true, false), 2);
+        assert_eq!(attention_rank(4, false, false), 4);
+
+        // OFF ordering matches the pre-feature tier order for read rows.
+        assert!(attention_rank(0, false, false) < attention_rank(1, false, false));
+        assert!(attention_rank(1, false, false) < attention_rank(2, false, false));
     }
 
     #[test]

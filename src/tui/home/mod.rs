@@ -2441,6 +2441,32 @@ impl HomeView {
                             &inst, old, new_status, play_sound, run_hooks,
                         );
                     }
+                    // Auto-mark unread when a turn finishes (Running ->
+                    // Idle), unless the user is currently viewing this
+                    // session in live-send. This runs in both the with-
+                    // and without-hooks apply paths, so a *different*
+                    // session finishing while the user is attached
+                    // elsewhere still gets marked. The attached session
+                    // itself is cleared on attach-return, so a turn that
+                    // finishes during an attach nets to read.
+                    if crate::session::unread_enabled()
+                        && old == Status::Running
+                        && new_status == Status::Idle
+                    {
+                        let is_live_target = self
+                            .live_send
+                            .as_ref()
+                            .is_some_and(|s| s.session_id == update.id);
+                        // Skip the disk write when already unread (the mark
+                        // is a no-op) so a re-finishing session doesn't churn
+                        // the flock once per turn.
+                        let already_unread =
+                            self.get_instance(&update.id).is_some_and(|i| i.is_unread());
+                        if !is_live_target && !already_unread {
+                            let _ =
+                                self.apply_user_action(&update.id, |inst| inst.mark_unread_auto());
+                        }
+                    }
                 }
             }
         } else if new_last_accessed.is_some() {
@@ -4345,6 +4371,9 @@ impl HomeView {
             exit_chords,
             leader,
         });
+        // Entering live-send means the user is now viewing this session, so
+        // clear any auto-unread marker.
+        self.clear_auto_unread(&inst.id);
         // Ensure the long-lived preview capture worker exists so we can hand
         // its waker to the send worker below. The worker isn't otherwise
         // spawned here (it follows the displayed pane for every view, not
@@ -4824,6 +4853,16 @@ impl HomeView {
                 self.instance_map.insert(id.to_string(), pre);
                 Err(e)
             }
+        }
+    }
+
+    /// Clear an auto-unread marker because the user viewed the session
+    /// (Tab into live-send, Enter to attach). No-op when the unread feature
+    /// is disabled; a manual flag is left in place (it clears only via the
+    /// manual toggle). Persists via `apply_user_action`.
+    pub(crate) fn clear_auto_unread(&mut self, id: &str) {
+        if crate::session::unread_enabled() {
+            let _ = self.apply_user_action(id, |i| i.mark_read_auto());
         }
     }
 

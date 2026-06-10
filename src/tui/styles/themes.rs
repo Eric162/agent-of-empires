@@ -86,6 +86,14 @@ pub struct Theme {
     pub fresh_idle: Color,
     #[serde(with = "hex_color")]
     pub idle: Color,
+    /// Color for a session carrying an unread marker (a finished turn the
+    /// user hasn't viewed, or a manual "flag for later"). Applied to resting
+    /// rows (Idle/Unknown) in place of the decaying idle color so unread work
+    /// stands out without being as loud as Waiting/Error. Gated behind the
+    /// `AOE_UNREAD` feature flag. Defaults to the theme's accent if a custom
+    /// TOML omits it.
+    #[serde(with = "hex_color")]
+    pub unread: Color,
     #[serde(with = "hex_color")]
     pub error: Color,
     #[serde(with = "hex_color")]
@@ -160,6 +168,8 @@ struct RawThemeDefaults {
     #[serde(with = "hex_color")]
     idle: Color,
     #[serde(with = "hex_color")]
+    unread: Color,
+    #[serde(with = "hex_color")]
     error: Color,
     #[serde(with = "hex_color")]
     terminal_active: Color,
@@ -201,6 +211,7 @@ impl From<RawThemeDefaults> for Theme {
             waiting: raw.waiting,
             fresh_idle: raw.fresh_idle,
             idle: raw.idle,
+            unread: raw.unread,
             error: raw.error,
             terminal_active: raw.terminal_active,
             group: raw.group,
@@ -258,7 +269,7 @@ impl Theme {
     /// single authoritative list shared by `downsample_to_palette` and the
     /// structural guard test. New `Color` fields added to `Theme` must be
     /// added here too; non-color metadata (appearance, syntax, etc.) must not.
-    pub fn color_fields_mut(&mut self) -> [&mut Color; 25] {
+    pub fn color_fields_mut(&mut self) -> [&mut Color; 26] {
         [
             &mut self.background,
             &mut self.border,
@@ -273,6 +284,7 @@ impl Theme {
             &mut self.waiting,
             &mut self.fresh_idle,
             &mut self.idle,
+            &mut self.unread,
             &mut self.error,
             &mut self.terminal_active,
             &mut self.group,
@@ -289,7 +301,7 @@ impl Theme {
     }
 
     /// Read-only counterpart to `color_fields_mut`.
-    pub fn color_fields(&self) -> [Color; 25] {
+    pub fn color_fields(&self) -> [Color; 26] {
         [
             self.background,
             self.border,
@@ -304,6 +316,7 @@ impl Theme {
             self.waiting,
             self.fresh_idle,
             self.idle,
+            self.unread,
             self.error,
             self.terminal_active,
             self.group,

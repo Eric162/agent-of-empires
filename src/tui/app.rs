@@ -2643,6 +2643,11 @@ impl App {
         self.home.reload()?;
         self.home
             .apply_status_updates_without_hooks(attached_status_updates);
+        // The user just viewed this session (and any turn that finished
+        // during the attach was applied above without the live-send
+        // exemption). Clear its auto-unread on return so the round-trip
+        // nets to read; a manual flag survives.
+        self.home.clear_auto_unread(session_id);
         self.home.stamp_last_accessed(session_id);
         // Persist so the attach-return bump survives aoe restart. Same
         // reasoning as the send-message path in home/input.rs: without a

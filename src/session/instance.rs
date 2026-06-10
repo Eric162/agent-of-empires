@@ -50,6 +50,22 @@ pub enum Status {
     Creating,
 }
 
+/// Unread marker kind. Distinguishes how a session became unread, because the
+/// two are cleared differently:
+/// - `Auto`: set when a turn finishes (`Running -> Idle`). Cleared by viewing
+///   the session (Tab into live-send, Enter to attach) or the manual toggle.
+/// - `Manual`: a deliberate "flag for later." Cleared ONLY by the manual
+///   toggle; it survives Tab/Enter.
+///
+/// Gated behind `crate::session::unread_enabled()` (env `AOE_UNREAD`) at every
+/// surface for the testing phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UnreadKind {
+    Auto,
+    Manual,
+}
+
 impl Status {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -409,6 +425,17 @@ pub struct Instance {
     /// but renders as archive since is_archived() is checked first).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snoozed_until: Option<DateTime<Utc>>,
+
+    /// Unread marker. `Auto` is set when a turn finishes (`Running -> Idle`)
+    /// and cleared by viewing the session (Tab/Enter) or the manual toggle;
+    /// `Manual` is a deliberate flag cleared only by the manual toggle (it
+    /// survives Tab/Enter). Surfaced as a non-intrusive `theme.unread` row
+    /// color and an Attention-sort promoter ranked just below Waiting. The
+    /// whole feature is gated behind `unread_enabled()` (env `AOE_UNREAD`);
+    /// when off, the field is never written and changes nothing. See
+    /// [`UnreadKind`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread: Option<UnreadKind>,
 
     /// Internal structured view idle-dormancy marker. Set by the reconciler's
     /// idle-reap pass when a structured view worker is shut down for inactivity
@@ -784,6 +811,7 @@ impl Instance {
             archived_at: None,
             favorited_at: None,
             snoozed_until: None,
+            unread: None,
             idle_dormant_since: None,
             pinned_at: None,
             scratch: false,
@@ -1042,6 +1070,9 @@ impl Instance {
         if pre.pinned_at != post.pinned_at {
             self.pinned_at = post.pinned_at;
         }
+        if pre.unread != post.unread {
+            self.unread = post.unread;
+        }
         if pre.base_branch_override != post.base_branch_override {
             self.base_branch_override = post.base_branch_override.clone();
         }
@@ -1194,6 +1225,38 @@ impl Instance {
 
     pub fn unsnooze(&mut self) {
         self.snoozed_until = None;
+    }
+
+    /// True if the session carries an unread marker of either kind.
+    pub fn is_unread(&self) -> bool {
+        self.unread.is_some()
+    }
+
+    /// Mark unread from a finished turn. Idempotent on `Auto` and never
+    /// downgrades a `Manual` flag (a deliberate flag outranks an automatic
+    /// one), so it only writes when currently read.
+    pub fn mark_unread_auto(&mut self) {
+        if self.unread.is_none() {
+            self.unread = Some(UnreadKind::Auto);
+        }
+    }
+
+    /// Clear an auto-unread marker because the user viewed the session
+    /// (Tab into live-send, Enter to attach). Leaves a `Manual` flag in
+    /// place; manual flags clear only via the manual toggle.
+    pub fn mark_read_auto(&mut self) {
+        if self.unread == Some(UnreadKind::Auto) {
+            self.unread = None;
+        }
+    }
+
+    /// Manual toggle (`v`): read -> manual-unread; unread (either kind) ->
+    /// read.
+    pub fn toggle_unread(&mut self) {
+        self.unread = match self.unread {
+            None => Some(UnreadKind::Manual),
+            Some(_) => None,
+        };
     }
 
     /// True if `snoozed_until` is set AND in the future. Expired snoozes
@@ -3902,6 +3965,95 @@ mod tests {
         assert!(inst.is_idle_dormant());
         inst.touch_last_accessed();
         assert!(!inst.is_idle_dormant());
+    }
+
+    #[test]
+    fn test_mark_unread_auto_does_not_clobber_manual() {
+        let mut inst = Instance::new("test", "/tmp/test");
+        assert!(!inst.is_unread());
+        // read -> auto
+        inst.mark_unread_auto();
+        assert_eq!(inst.unread, Some(UnreadKind::Auto));
+        // auto -> auto (idempotent)
+        inst.mark_unread_auto();
+        assert_eq!(inst.unread, Some(UnreadKind::Auto));
+        // a manual flag must not be downgraded by an auto mark
+        inst.unread = Some(UnreadKind::Manual);
+        inst.mark_unread_auto();
+        assert_eq!(inst.unread, Some(UnreadKind::Manual));
+    }
+
+    #[test]
+    fn test_mark_read_auto_clears_auto_only() {
+        let mut inst = Instance::new("test", "/tmp/test");
+        // clears an auto marker (viewing the session)
+        inst.unread = Some(UnreadKind::Auto);
+        inst.mark_read_auto();
+        assert!(!inst.is_unread());
+        // leaves a manual flag in place (manual clears only via the toggle)
+        inst.unread = Some(UnreadKind::Manual);
+        inst.mark_read_auto();
+        assert_eq!(inst.unread, Some(UnreadKind::Manual));
+    }
+
+    #[test]
+    fn test_toggle_unread_round_trips() {
+        let mut inst = Instance::new("test", "/tmp/test");
+        // read -> manual-unread
+        inst.toggle_unread();
+        assert_eq!(inst.unread, Some(UnreadKind::Manual));
+        // unread -> read
+        inst.toggle_unread();
+        assert!(!inst.is_unread());
+        // an auto marker also toggles to read
+        inst.unread = Some(UnreadKind::Auto);
+        inst.toggle_unread();
+        assert!(!inst.is_unread());
+    }
+
+    #[test]
+    fn test_unread_serde_round_trip() {
+        // Absent field deserializes to None (older sessions.json).
+        let inst: Instance = serde_json::from_value(serde_json::json!({
+            "id": "abc",
+            "title": "t",
+            "project_path": "/tmp",
+            "tool": "claude",
+            "status": "idle",
+            "created_at": "2026-01-01T00:00:00Z",
+        }))
+        .expect("deserialize without unread");
+        assert!(inst.unread.is_none());
+
+        // Round-trips when set, and is omitted when None.
+        let mut set = Instance::new("t", "/tmp");
+        set.unread = Some(UnreadKind::Manual);
+        let json = serde_json::to_value(&set).unwrap();
+        assert_eq!(json["unread"], serde_json::json!("manual"));
+        let back: Instance = serde_json::from_value(json).unwrap();
+        assert_eq!(back.unread, Some(UnreadKind::Manual));
+
+        let read = Instance::new("t", "/tmp");
+        let json = serde_json::to_value(&read).unwrap();
+        assert!(json.get("unread").is_none(), "None must skip serialization");
+    }
+
+    #[test]
+    fn test_merge_user_action_diff_propagates_unread() {
+        let pre = Instance::new("t", "/tmp");
+        let mut post = pre.clone();
+        post.unread = Some(UnreadKind::Auto);
+        let mut disk = pre.clone();
+        disk.merge_user_action_diff(&pre, &post);
+        assert_eq!(disk.unread, Some(UnreadKind::Auto));
+
+        // Clearing also propagates.
+        let pre2 = post.clone();
+        let mut post2 = pre2.clone();
+        post2.unread = None;
+        let mut disk2 = pre2.clone();
+        disk2.merge_user_action_diff(&pre2, &post2);
+        assert!(disk2.unread.is_none());
     }
 
     #[test]
