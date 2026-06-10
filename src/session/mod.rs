@@ -49,9 +49,24 @@ pub use groups::{
 pub(crate) use instance::{persist_session_to_storage, ResumeIntent, SidWrite};
 pub use instance::{
     EnsureReadyError, EnsureReadyOutcome, Instance, LaunchSidOutcome, SandboxInfo, StartOutcome,
-    Status, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
+    Status, TerminalInfo, UnreadKind, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
     TMUX_SESSION_GONE_ERROR,
 };
+
+/// Whether the unread-session feature is enabled. Gated behind the
+/// `AOE_UNREAD` env var for the testing phase (truthy `1` / `on` / `true`),
+/// read once at startup. When off, every unread code path is a no-op and
+/// behavior is identical to before the feature landed.
+pub fn unread_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("AOE_UNREAD").as_deref(),
+            Ok("1") | Ok("on") | Ok("true")
+        )
+    })
+}
 pub use profile_config::{
     load_profile_config, merge_configs, resolve_config, resolve_config_or_warn,
     save_profile_config, validate_check_interval, validate_env_format, validate_memory_limit,

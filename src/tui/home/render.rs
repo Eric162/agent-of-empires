@@ -1013,12 +1013,22 @@ impl HomeView {
                                 Status::Deleting => ICON_DELETING,
                                 Status::Creating => spinner_starting(&inst.created_at),
                             };
+                            // Unread overlays the resting (Idle/Unknown)
+                            // color with `theme.unread`. Auto-unread only
+                            // ever lands on Idle; a manual flag on a live
+                            // row keeps the live status color (more urgent
+                            // than "unread"). Archived/snoozed/urgent/
+                            // favorite below still override as usual.
+                            let unread_overlay =
+                                crate::session::unread_enabled() && inst.is_unread();
                             let color = match inst.status {
                                 Status::Running => theme.running,
                                 Status::Waiting => theme.waiting,
+                                Status::Idle if unread_overlay => theme.unread,
                                 Status::Idle => {
                                     theme.idle_color_at_age(idle_age, self.idle_decay_window)
                                 }
+                                Status::Unknown if unread_overlay => theme.unread,
                                 Status::Unknown => theme.waiting,
                                 Status::Stopped => theme.dimmed,
                                 Status::Error => theme.error,
@@ -1102,8 +1112,12 @@ impl HomeView {
                                     .map(|s| s.exists())
                                     .unwrap_or(false),
                             };
+                            let unread_overlay =
+                                crate::session::unread_enabled() && inst.is_unread();
                             let (mut icon, color) = if terminal_running {
                                 (spinner_running(&inst.created_at), theme.terminal_active)
+                            } else if unread_overlay {
+                                (ICON_IDLE, theme.unread)
                             } else {
                                 (ICON_IDLE, theme.dimmed)
                             };

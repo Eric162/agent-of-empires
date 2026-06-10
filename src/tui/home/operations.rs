@@ -1290,6 +1290,25 @@ impl HomeView {
         None
     }
 
+    /// Manual unread toggle (`v`). Symmetric: a read row becomes
+    /// manually-unread (a deliberate "flag for later"), an unread row of
+    /// either kind becomes read. The row's `theme.unread` color is the
+    /// feedback, so there is no toast. No-op when the feature is disabled.
+    pub(super) fn toggle_unread_at_cursor(&mut self) -> anyhow::Result<()> {
+        if !crate::session::unread_enabled() {
+            return Ok(());
+        }
+        let Some(id) = self.selected_session.clone() else {
+            return Ok(());
+        };
+        if !self.instances.iter().any(|i| i.id == id) {
+            return Ok(());
+        }
+        self.apply_user_action(&id, |inst| inst.toggle_unread())?;
+        self.flat_items = self.build_flat_items();
+        Ok(())
+    }
+
     /// Toggle the cursor's session: archive or unarchive. Archive tears down
     /// all tmux sessions (agent + ancillary); worktree, branch, container
     /// preserved. Unarchive does NOT respawn; press `e` to restart, or send

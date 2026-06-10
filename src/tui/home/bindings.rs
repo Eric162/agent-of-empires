@@ -56,6 +56,10 @@ pub enum ActionId {
     ToggleArchive,
     ToggleFavorite,
     ToggleSnooze,
+    /// Toggle the selected session's unread marker (read -> manual-unread;
+    /// unread -> read). Gated behind the `AOE_UNREAD` feature flag; a no-op
+    /// when disabled.
+    ToggleUnread,
     ToggleContainer,
     TogglePreviewInfo,
     SortPicker,
@@ -603,6 +607,22 @@ pub static BINDINGS: &[Binding] = &[
         palette: None,
     },
     Binding {
+        id: ActionId::ToggleUnread,
+        non_strict: &[k('v')],
+        strict: &[k('V')],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Actions,
+            desc: "Mark read/unread (toggle)",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Toggle read/unread",
+            keywords: &["read", "unread", "seen", "flag", "viewed"],
+            group: PaletteGroup::Actions,
+            serve_only: false,
+        }),
+    },
+    Binding {
         id: ActionId::ToggleArchive,
         non_strict: &[k('z')],
         strict: &[k('Z')],
@@ -708,6 +728,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::ToggleArchive => "archive",
         ActionId::ToggleFavorite => "favorite",
         ActionId::ToggleSnooze => "snooze",
+        ActionId::ToggleUnread => "toggle-unread",
         ActionId::TogglePreviewInfo => "toggle-preview-info",
         ActionId::SortPicker => "pick-sort",
         ActionId::GroupBy => "pick-group-by",
@@ -762,6 +783,7 @@ mod tests {
             ('o', ActionId::SortPicker),
             ('g', ActionId::GroupBy),
             ('q', ActionId::Quit),
+            ('v', ActionId::ToggleUnread),
         ];
         for (ch, want) in cases {
             assert_eq!(
@@ -770,6 +792,21 @@ mod tests {
                 "non-strict '{ch}'"
             );
         }
+    }
+
+    #[test]
+    fn toggle_unread_binds_v_in_both_modes() {
+        let c = ctx();
+        assert_eq!(
+            resolve(&key('v'), false, &c),
+            Some(ActionId::ToggleUnread),
+            "non-strict 'v' -> ToggleUnread"
+        );
+        assert_eq!(
+            resolve(&key('V'), true, &c),
+            Some(ActionId::ToggleUnread),
+            "strict 'V' -> ToggleUnread"
+        );
     }
 
     #[test]
