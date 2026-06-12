@@ -1018,6 +1018,20 @@ pub struct SessionConfig {
     #[setting(label = "Confirm Before Quit", widget = "toggle", global_only)]
     pub confirm_before_quit: bool,
 
+    /// Show an unread indicator on sessions. When on (default), a session
+    /// whose turn just finished is painted in the theme's unread color until
+    /// you view it (Tab into live-send or Enter to attach), and you can flag
+    /// a session unread for later with `v`; unread rows also sort just below
+    /// Waiting in the Attention sort. Turn this off to disable the indicator,
+    /// the auto-marking, and the `v` toggle entirely.
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Unread Session Indicator",
+        widget = "toggle",
+        category = "Interaction"
+    )]
+    pub unread_indicator: bool,
+
     /// Keep an aoe-managed worktree session's directory leaf in sync with its
     /// title. When enabled (default), renaming the session also moves its
     /// worktree directory, and new sessions derive the directory leaf from the
@@ -1141,6 +1155,7 @@ impl Default for SessionConfig {
             default_attach_mode: NewSessionAttachMode::default(),
             click_action: ClickAction::default(),
             confirm_before_quit: true,
+            unread_indicator: true,
             tie_workdir_to_name: true,
         }
     }

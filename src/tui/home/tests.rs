@@ -11847,11 +11847,13 @@ mod right_click_context_menu {
     fn down_then_enter_in_menu_opens_delete_dialog() {
         let mut env = create_test_env_with_sessions(2);
         setup_inner(&mut env);
-        // Attention sort surfaces the full session menu (New Session / Rename /
-        // Archive / Snooze / Delete), so Delete is four Downs away.
+        // Attention sort surfaces the full session menu (New Session / Rename
+        // / Archive / Snooze / Mark unread / Delete), so Delete is five Downs
+        // away. (Unread defaults on, so the "Mark unread" row is present.)
         env.view.sort_order = SortOrder::Attention;
         env.view.flat_items = env.view.build_flat_items();
         env.view.handle_right_click(5, 1);
+        env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Down), None);
@@ -11935,9 +11937,13 @@ mod right_click_context_menu {
             .iter()
             .map(|(_, l)| *l)
             .collect();
-        // Default sort here is Newest, where Snooze is gated out, so the
-        // archived-row menu is just New Session / Rename / Unarchive / Delete.
-        assert_eq!(labels, vec!["New Session", "Rename", "Unarchive", "Delete"]);
+        // Default sort here is Newest, where Snooze is gated out. The unread
+        // toggle is always-on (any sort) and defaults on, so the archived-row
+        // menu is New Session / Rename / Unarchive / Mark unread / Delete.
+        assert_eq!(
+            labels,
+            vec!["New Session", "Rename", "Unarchive", "Mark unread", "Delete"]
+        );
 
         env.view.handle_key(key(KeyCode::Down), None); // New Session -> Rename
         env.view.handle_key(key(KeyCode::Down), None); // Rename -> Unarchive

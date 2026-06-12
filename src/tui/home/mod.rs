@@ -1242,6 +1242,7 @@ impl HomeView {
         let confirm_before_quit = resolved.session.confirm_before_quit;
         let idle_decay_window =
             crate::tui::styles::idle_decay_window(resolved.theme.idle_decay_minutes);
+        crate::session::set_unread_enabled(resolved.session.unread_indicator);
         let user_config = load_config().ok().flatten();
         let sort_order = user_config
             .as_ref()
@@ -5577,6 +5578,7 @@ impl HomeView {
         self.profile_default_attach_mode = config.session.default_attach_mode;
         self.idle_decay_window =
             crate::tui::styles::idle_decay_window(config.theme.idle_decay_minutes);
+        crate::session::set_unread_enabled(config.session.unread_indicator);
         self.tool_configs = config.tools;
         self.tool_hotkey_cache = input::build_tool_hotkey_cache(&self.tool_configs);
         let hotkey_warnings = input::validate_tool_hotkeys(&self.tool_configs);

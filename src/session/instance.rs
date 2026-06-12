@@ -57,8 +57,8 @@ pub enum Status {
 /// - `Manual`: a deliberate "flag for later." Cleared ONLY by the manual
 ///   toggle; it survives Tab/Enter.
 ///
-/// Gated behind `crate::session::unread_enabled()` (env `AOE_UNREAD`) at every
-/// surface for the testing phase.
+/// Gated behind `crate::session::unread_enabled()` (the `session.unread_indicator`
+/// config toggle, on by default) at every surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UnreadKind {
@@ -437,9 +437,9 @@ pub struct Instance {
     /// `Manual` is a deliberate flag cleared only by the manual toggle (it
     /// survives Tab/Enter). Surfaced as a non-intrusive `theme.unread` row
     /// color and an Attention-sort promoter ranked just below Waiting. The
-    /// whole feature is gated behind `unread_enabled()` (env `AOE_UNREAD`);
-    /// when off, the field is never written and changes nothing. See
-    /// [`UnreadKind`].
+    /// whole feature is gated behind `unread_enabled()` (the
+    /// `session.unread_indicator` config toggle, on by default); when off, the
+    /// field is never written and changes nothing. See [`UnreadKind`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unread: Option<UnreadKind>,
 

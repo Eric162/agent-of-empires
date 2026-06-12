@@ -90,8 +90,8 @@ pub struct Theme {
     /// user hasn't viewed, or a manual "flag for later"). Applied to resting
     /// rows (Idle/Unknown) in place of the decaying idle color so unread work
     /// stands out without being as loud as Waiting/Error. Gated behind the
-    /// `AOE_UNREAD` feature flag. Defaults to the theme's accent if a custom
-    /// TOML omits it.
+    /// `session.unread_indicator` config toggle (on by default). Defaults to
+    /// the theme's accent if a custom TOML omits it.
     #[serde(with = "hex_color")]
     pub unread: Color,
     #[serde(with = "hex_color")]

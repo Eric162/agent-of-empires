@@ -57,8 +57,8 @@ pub enum ActionId {
     ToggleFavorite,
     ToggleSnooze,
     /// Toggle the selected session's unread marker (read -> manual-unread;
-    /// unread -> read). Gated behind the `AOE_UNREAD` feature flag; a no-op
-    /// when disabled.
+    /// unread -> read). Gated behind the `session.unread_indicator` config
+    /// toggle (on by default); a no-op when disabled.
     ToggleUnread,
     ToggleContainer,
     TogglePreviewInfo,
