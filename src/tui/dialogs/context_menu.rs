@@ -303,6 +303,7 @@ impl ContextMenuDialog {
                     'd' | 'D' => Some(ContextMenuAction::Delete),
                     'z' | 'Z' => Some(ContextMenuAction::ToggleArchive),
                     'h' | 'H' => Some(ContextMenuAction::ToggleSnooze),
+                    'v' | 'V' => Some(ContextMenuAction::ToggleUnread),
                     // `n` opens a new session from whichever new-session entry
                     // the current menu carries: the session/group/project menu
                     // prefills from the row (NewFromSelection), the empty-sidebar
@@ -569,6 +570,23 @@ mod tests {
         let off = ContextMenuDialog::for_session((0, 0), false, None, None);
         let labels: Vec<&str> = off.items_for_test().iter().map(|(_, l)| *l).collect();
         assert_eq!(labels, vec!["New Session", "Rename", "Archive", "Delete"]);
+    }
+
+    #[test]
+    fn v_hotkey_submits_toggle_unread() {
+        // The `v` quick-pick mirrors the home-view shortcut and only fires
+        // when the Unread row is present (feature enabled).
+        let mut menu = ContextMenuDialog::for_session((0, 0), false, None, Some(false));
+        assert!(matches!(
+            menu.handle_key(key(KeyCode::Char('v'))),
+            DialogResult::Submit(ContextMenuAction::ToggleUnread)
+        ));
+        // With no Unread row (feature off), `v` is inert.
+        let mut off = ContextMenuDialog::for_session((0, 0), false, None, None);
+        assert!(matches!(
+            off.handle_key(key(KeyCode::Char('v'))),
+            DialogResult::Continue
+        ));
     }
 
     #[test]

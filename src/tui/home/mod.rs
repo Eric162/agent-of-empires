@@ -5023,11 +5023,16 @@ impl HomeView {
     }
 
     /// Clear an auto-unread marker because the user viewed the session
-    /// (Tab into live-send, Enter to attach). No-op when the unread feature
-    /// is disabled; a manual flag is left in place (it clears only via the
-    /// manual toggle). Persists via `apply_user_action`.
+    /// (Tab into live-send, Enter to attach). A manual flag is left in place
+    /// (it clears only via the manual toggle). Runs regardless of the feature
+    /// flag so a stale `Auto` marker can't survive a disable/re-enable and
+    /// reappear later; only writes when there's actually an `Auto` flag to
+    /// clear, so a viewed read session doesn't churn the storage flock.
     pub(crate) fn clear_auto_unread(&mut self, id: &str) {
-        if crate::session::unread_enabled() {
+        let has_auto = self
+            .get_instance(id)
+            .is_some_and(|i| i.unread == Some(crate::session::UnreadKind::Auto));
+        if has_auto {
             let _ = self.apply_user_action(id, |i| i.mark_read_auto());
         }
     }

@@ -688,9 +688,15 @@ fn attention_group_key(
     // contribute; the real tiebreak is the trailing ASC field. Shape
     // mirrors `attention_session_key` so the intent is uniform.
     let max_last = members.iter().filter_map(|i| i.last_accessed_at).max();
+    // Fold the unread promoter in at the group level too, so a project
+    // containing an unread session floats up just like the flat Attention
+    // view does (a group with an unread Idle outranks a group whose best
+    // member is a read Error). Mirrors `attention_session_key`'s rank.
+    let unread = members.iter().any(|i| i.is_unread());
+    let rank = attention_rank(min_tier, unread, crate::session::unread_enabled());
     (
         !urgent_bias,
-        min_tier,
+        rank,
         !favorite_bias,
         max_last.is_none(),
         Reverse(None),
@@ -1926,9 +1932,11 @@ mod tests {
 
     #[test]
     fn test_attention_group_key_one_active_pulls_group_up() {
-        // Mixed group: 1 archived Waiting, 1 active Idle. Group should sort
-        // at tier 2 (Idle); the active member pulls it out of the archive
-        // tier. This is the auto-unarchive contract for cascade.
+        // Mixed group: 1 archived Waiting, 1 active Idle. The active member
+        // pulls the group out of the archive tier (99) into the Idle bucket.
+        // With the unread promoter enabled (default), a non-unread Idle group
+        // encodes to rank 3 (Waiting=0, unread=1, other tiers shifted +1, so
+        // Idle tier 2 -> 3); the point is it's well above the archive tier.
         let mut archived_waiting = Instance::new("aw", "/tmp/aw");
         archived_waiting.group_path = "work".to_string();
         archived_waiting.status = crate::session::Status::Waiting;
@@ -1940,8 +1948,31 @@ mod tests {
         let instances = vec![archived_waiting, active_idle];
         let key = attention_group_key("work", None, &instances);
         assert_eq!(
-            key.1, 2,
-            "group with one active Idle session should sort at tier 2"
+            key.1, 3,
+            "active Idle group should sort in the Idle bucket, far above archive tier 99"
+        );
+    }
+
+    #[test]
+    fn test_attention_group_key_promotes_unread_below_waiting() {
+        // Group A holds a read Error (tier 1); Group B holds an unread Idle
+        // (tier 2). With the unread promoter on (default), B's unread member
+        // floats it to rank 1, above A's Error (rank 2), matching how the flat
+        // Attention view promotes unread just below Waiting.
+        let mut err = Instance::new("err", "/tmp/err");
+        err.group_path = "a".to_string();
+        err.status = crate::session::Status::Error;
+
+        let mut unread_idle = Instance::new("ui", "/tmp/ui");
+        unread_idle.group_path = "b".to_string();
+        unread_idle.status = crate::session::Status::Idle;
+        unread_idle.mark_unread_auto();
+
+        let key_a = attention_group_key("a", None, std::slice::from_ref(&err));
+        let key_b = attention_group_key("b", None, std::slice::from_ref(&unread_idle));
+        assert!(
+            key_b < key_a,
+            "group with an unread Idle must outrank a group whose best member is a read Error: b={key_b:?} a={key_a:?}"
         );
     }
 

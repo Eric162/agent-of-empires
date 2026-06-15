@@ -111,6 +111,10 @@ pub enum Context {
     SearchActive,
     /// The cursor is on a real (non-synthetic) project header in project view.
     ProjectGroupSelected,
+    /// The unread-session feature is enabled (`session.unread_indicator`). When
+    /// off, the binding is removed from dispatch so the key isn't swallowed by
+    /// a dead action; help and the command palette skip it separately.
+    UnreadEnabled,
 }
 
 /// Help-overlay section. Ordering mirrors `components/help.rs`.
@@ -169,6 +173,7 @@ fn context_holds(context: Context, ctx: &Ctx) -> bool {
         Context::AttentionSort => ctx.sort_order == SortOrder::Attention,
         Context::SearchActive => ctx.has_search,
         Context::ProjectGroupSelected => ctx.project_group_selected,
+        Context::UnreadEnabled => crate::session::unread_enabled(),
     }
 }
 
@@ -610,7 +615,7 @@ pub static BINDINGS: &[Binding] = &[
         id: ActionId::ToggleUnread,
         non_strict: &[k('v')],
         strict: &[k('V')],
-        context: Context::Always,
+        context: Context::UnreadEnabled,
         help: Some(HelpMeta {
             section: HelpSection::Actions,
             desc: "Mark read/unread (toggle)",

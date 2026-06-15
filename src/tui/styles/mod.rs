@@ -131,7 +131,7 @@ fn load_custom_theme(path: &std::path::Path) -> Option<Theme> {
     };
 
     match toml::from_str::<Theme>(&content) {
-        Ok(theme) => Some(theme),
+        Ok(theme) => Some(fill_unread_from_accent(&content, theme)),
         Err(e) => {
             warn!("Failed to parse theme file {}: {}", path.display(), e);
             None
@@ -139,13 +139,33 @@ fn load_custom_theme(path: &std::path::Path) -> Option<Theme> {
     }
 }
 
+/// A theme TOML that omits `unread` should inherit that theme's own `accent`,
+/// not Empire's default blue. The container `#[serde(default)]` seeds every
+/// omitted field from `Theme::default()` (= Empire), and serde can't tell an
+/// omitted key from one explicitly set to Empire's value, so we detect the
+/// omission from the raw table and fall back to the parsed theme's accent.
+fn fill_unread_from_accent(content: &str, mut theme: Theme) -> Theme {
+    let omitted = content
+        .parse::<toml::Table>()
+        .map(|t| !t.contains_key("unread"))
+        .unwrap_or(false);
+    if omitted {
+        theme.unread = theme.accent;
+    }
+    theme
+}
+
 /// Parse a builtin's embedded TOML. Builtin TOMLs are committed to the repo
 /// and embedded at build time; a parse failure here is a developer bug, not
 /// user input. The `all_builtins_parse_with_expected_anchors` test guards
 /// against that landing in main.
 fn parse_builtin(builtin: &BuiltinTheme) -> Theme {
-    toml::from_str(builtin.source)
-        .unwrap_or_else(|e| panic!("builtin theme '{}' failed to parse: {}", builtin.name, e))
+    let theme = toml::from_str(builtin.source)
+        .unwrap_or_else(|e| panic!("builtin theme '{}' failed to parse: {}", builtin.name, e));
+    // All builtins define `unread`, so this is a no-op for them today, but
+    // keep the same fallback as custom themes so a future builtin that omits
+    // it inherits its own accent rather than Empire's.
+    fill_unread_from_accent(builtin.source, theme)
 }
 
 pub fn load_theme(name: &str) -> Theme {
