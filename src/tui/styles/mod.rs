@@ -229,6 +229,30 @@ mod tests {
     }
 
     #[test]
+    fn custom_theme_without_unread_inherits_accent() {
+        // A theme TOML that omits `unread` should fall back to that theme's
+        // own accent, not Empire's default blue.
+        let toml_str = "background = \"#1a1b26\"\naccent = \"#7aa2f7\"\n";
+        let theme: Theme = toml::from_str(toml_str).unwrap();
+        let theme = fill_unread_from_accent(toml_str, theme);
+        assert_eq!(theme.accent, Color::Rgb(0x7a, 0xa2, 0xf7));
+        assert_eq!(
+            theme.unread, theme.accent,
+            "omitted unread field should fall back to accent"
+        );
+    }
+
+    #[test]
+    fn custom_theme_with_explicit_unread_preserves_it() {
+        // An explicit `unread` must win over the accent fallback.
+        let toml_str = "background = \"#1a1b26\"\naccent = \"#7aa2f7\"\nunread = \"#ff0000\"\n";
+        let theme: Theme = toml::from_str(toml_str).unwrap();
+        let theme = fill_unread_from_accent(toml_str, theme);
+        assert_eq!(theme.unread, Color::Rgb(0xff, 0x00, 0x00));
+        assert_ne!(theme.unread, theme.accent);
+    }
+
+    #[test]
     fn load_theme_with_mode_truecolor_yields_rgb() {
         let theme = load_theme_with_mode("empire", false);
         assert!(matches!(theme.title, Color::Rgb(_, _, _)));
