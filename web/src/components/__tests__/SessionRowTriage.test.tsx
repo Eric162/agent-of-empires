@@ -567,7 +567,7 @@ describe("SessionRow unread", () => {
     expect(screen.queryByTestId("sidebar-unread-dot")).not.toBeNull();
   });
 
-  it("suppresses the unread dot on the active row (viewing reads it)", () => {
+  it("suppresses an auto-unread dot on the active row (viewing reads it)", () => {
     const ws = workspace("w-unread", [session({ id: "s-u", unread: "auto" })]);
     render(
       <Wrap>
@@ -575,6 +575,16 @@ describe("SessionRow unread", () => {
       </Wrap>,
     );
     expect(screen.queryByTestId("sidebar-unread-dot")).toBeNull();
+  });
+
+  it("keeps a manual-unread dot on the active row (deliberate flag persists)", () => {
+    const ws = workspace("w-unread", [session({ id: "s-m", unread: "manual" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} isActive />
+      </Wrap>,
+    );
+    expect(screen.queryByTestId("sidebar-unread-dot")).not.toBeNull();
   });
 
   it("menu offers 'Mark as unread' for a read row and 'Mark as read' for an unread row", () => {

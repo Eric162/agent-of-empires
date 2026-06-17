@@ -600,12 +600,14 @@ export const SessionRow = memo(function SessionRow({
   const isPinned = workspace.sessions.some((s) => s.pinned_at != null);
   const isArchived = workspace.sessions.some((s) => s.archived_at != null);
   const snoozedUntil = workspace.sessions.find((s) => s.snoozed_until)?.snoozed_until ?? null;
-  // Unread marker for the row, server value plus optimistic overlay. The
-  // indicator is suppressed on the active row (viewing it reads it; App clears
-  // the auto marker), so this only paints rows you're not currently looking at.
+  // Unread marker for the row, server value plus optimistic overlay. On the
+  // active (open) row, only an `auto` marker is suppressed: viewing reads it
+  // and the App clears it a beat later, so hiding it avoids a flash. A
+  // `manual` flag is a deliberate "look at this later" and must stay visible
+  // even while the session is selected.
   const serverUnread = workspace.sessions.find((s) => s.unread)?.unread ?? null;
   const effectiveUnread = effectiveUnreadOf(optimistic, serverUnread);
-  const isUnread = unreadIndicatorEnabled && !isActive && effectiveUnread != null;
+  const isUnread = unreadIndicatorEnabled && effectiveUnread != null && !(isActive && effectiveUnread === "auto");
   // Like the TUI, the unread marker *replaces* the resting status glyph with a
   // solid dot (rather than sitting beside the title). Only for resting states:
   // a live spinner (Running/Waiting/...) stays, since live status outranks it
@@ -965,7 +967,7 @@ export const SessionRow = memo(function SessionRow({
           </span>
           <div className="min-w-0 flex-1">
             <span
-              className={`flex items-center gap-1.5 text-[13px] md:text-[14px] ${isSessionActive({ status: sessionStatus, idle_entered_at: idleEnteredAt }, idleDecayWindowMs) ? textClass : isActive ? "text-text-primary" : "text-text-secondary"} ${isFavorited || effectivePinned ? "font-semibold" : ""} ${effectiveArchived || effectiveSnoozed ? "italic opacity-70" : ""}`}
+              className={`flex items-center gap-1.5 text-[13px] md:text-[14px] ${showUnreadGlyph ? "text-status-unread font-semibold" : isSessionActive({ status: sessionStatus, idle_entered_at: idleEnteredAt }, idleDecayWindowMs) ? textClass : isActive ? "text-text-primary" : "text-text-secondary"} ${isFavorited || effectivePinned ? "font-semibold" : ""} ${effectiveArchived || effectiveSnoozed ? "italic opacity-70" : ""}`}
             >
               {effectivePinned && (
                 <span title="Pinned" aria-label="Pinned" className="shrink-0 inline-flex text-brand-400">
@@ -977,7 +979,7 @@ export const SessionRow = memo(function SessionRow({
                   *
                 </span>
               )}
-              <span className={`truncate ${showUnreadGlyph ? "font-medium text-text-primary" : ""}`} title={label}>
+              <span className="truncate" title={label}>
                 {label}
               </span>
               {hasDraft && (
