@@ -1306,6 +1306,10 @@ impl HomeView {
         }
         self.apply_user_action(&id, |inst| inst.toggle_unread())?;
         self.flat_items = self.build_flat_items();
+        // In Attention sort, toggling unread changes the row's rank, so the
+        // rebuild can move it; reseat the cursor by id so the next action
+        // still targets this session.
+        self.select_session_by_id(&id);
         Ok(())
     }
 
