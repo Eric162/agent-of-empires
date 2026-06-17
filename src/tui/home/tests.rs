@@ -5431,7 +5431,7 @@ fn update_bar_renders_status_toast_without_update_info() {
     );
 }
 
-/// The sandbox-image update banner renders (with its `[u] pull` /
+/// The sandbox-image update banner renders (with its `[U] pull` /
 /// `[Ctrl+x] dismiss` hints) when an `ImageUpdate` is present and no
 /// higher-priority banner is up. Guards the lowest-priority slot in
 /// `render_update_bar`.
@@ -5475,15 +5475,15 @@ fn update_bar_renders_sandbox_image_banner() {
         "expected the sandbox image banner to render.\nFull buffer:\n{out}"
     );
     assert!(
-        out.contains("[u] pull") && out.contains("[Ctrl+x] dismiss"),
+        out.contains("[U] pull") && out.contains("[Ctrl+x] dismiss"),
         "expected the pull/dismiss hints alongside the image banner.\nFull buffer:\n{out}"
     );
 }
 
 /// The app-update banner wins the shared bottom row over a pending
 /// sandbox-image update: only one shows at a time, so the lower-priority
-/// image banner must stay hidden (and its `[u] pull` hint absent) while an
-/// app update is up. This is what keeps the `u` / Ctrl+x keys unambiguous.
+/// image banner must stay hidden (and its `[U] pull` hint absent) while an
+/// app update is up. This is what keeps the `U` / Ctrl+x keys unambiguous.
 #[test]
 #[serial]
 fn app_update_banner_takes_precedence_over_image_banner() {

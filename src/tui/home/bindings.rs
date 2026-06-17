@@ -115,11 +115,6 @@ pub enum Context {
     /// off, the binding is removed from dispatch so the key isn't swallowed by
     /// a dead action; help and the command palette skip it separately.
     UnreadEnabled,
-    /// An update is available (the update footer is showing). Gates the Update
-    /// binding so `u` routes to Update only while there's something to update;
-    /// otherwise `u` falls through to the unread toggle listed after it. See
-    /// the #2088 review.
-    UpdateAvailable,
 }
 
 /// Help-overlay section. Ordering mirrors `components/help.rs`.
@@ -161,9 +156,6 @@ pub struct Ctx {
     /// True when the cursor sits on a real project header in project view, so
     /// the pin toggle can claim its chord ahead of the projects-dialog binding.
     pub project_group_selected: bool,
-    /// True when an update is available (footer showing). Lets `u` resolve to
-    /// Update only then, falling through to the unread toggle otherwise.
-    pub update_available: bool,
 }
 
 fn chord_matches(c: &Chord, key: &KeyEvent) -> bool {
@@ -182,7 +174,6 @@ fn context_holds(context: Context, ctx: &Ctx) -> bool {
         Context::SearchActive => ctx.has_search,
         Context::ProjectGroupSelected => ctx.project_group_selected,
         Context::UnreadEnabled => crate::session::unread_enabled(),
-        Context::UpdateAvailable => ctx.update_available,
     }
 }
 
@@ -609,25 +600,13 @@ pub static BINDINGS: &[Binding] = &[
             serve_only: false,
         }),
     },
-    // `u` routes by context: Update wins while an update is available (this
-    // binding is listed first and guarded on UpdateAvailable), otherwise it
-    // falls through to ToggleUnread below. Both claim `u` in strict too,
-    // mirroring how Update already used bare `u` in strict.
-    Binding {
-        id: ActionId::Update,
-        non_strict: &[k('u')],
-        strict: &[k('u')],
-        context: Context::UpdateAvailable,
-        help: Some(HelpMeta {
-            section: HelpSection::Other,
-            desc: "Update aoe (when available)",
-        }),
-        palette: None,
-    },
+    // `u` toggles read/unread; `U` updates (when available). They're the
+    // primary/secondary pair on the `u` letter, so the standard relocation
+    // applies in strict mode: unread -> `U`, update -> `Ctrl+U`.
     Binding {
         id: ActionId::ToggleUnread,
         non_strict: &[k('u')],
-        strict: &[k('u')],
+        strict: &[k('U')],
         context: Context::UnreadEnabled,
         help: Some(HelpMeta {
             section: HelpSection::Actions,
@@ -639,6 +618,17 @@ pub static BINDINGS: &[Binding] = &[
             group: PaletteGroup::Actions,
             serve_only: false,
         }),
+    },
+    Binding {
+        id: ActionId::Update,
+        non_strict: &[k('U')],
+        strict: &[ctrl('u')],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Other,
+            desc: "Update aoe (when available)",
+        }),
+        palette: None,
     },
     Binding {
         id: ActionId::ToggleArchive,
@@ -773,7 +763,6 @@ mod tests {
             sort_order: SortOrder::Newest,
             has_search: false,
             project_group_selected: false,
-            update_available: false,
         }
     }
 
@@ -815,35 +804,30 @@ mod tests {
     }
 
     #[test]
-    fn u_routes_to_unread_when_no_update_and_update_when_available() {
-        // No update available: `u` is the unread toggle in both modes.
+    fn u_toggles_unread_and_shift_u_updates() {
         let c = ctx();
+        // Non-strict: u = unread, U = update.
         assert_eq!(
             resolve(&key('u'), false, &c),
             Some(ActionId::ToggleUnread),
             "non-strict u"
         );
         assert_eq!(
-            resolve(&key('u'), true, &c),
+            resolve(&key('U'), false, &c),
+            Some(ActionId::Update),
+            "non-strict U"
+        );
+        // Strict relocation: unread (primary) moves to U, update (secondary)
+        // to Ctrl+U.
+        assert_eq!(
+            resolve(&key('U'), true, &c),
             Some(ActionId::ToggleUnread),
-            "strict u"
-        );
-
-        // Update available: `u` routes to Update (listed first, guarded on
-        // UpdateAvailable), in both modes.
-        let with_update = Ctx {
-            update_available: true,
-            ..ctx()
-        };
-        assert_eq!(
-            resolve(&key('u'), false, &with_update),
-            Some(ActionId::Update),
-            "non-strict u with update"
+            "strict U"
         );
         assert_eq!(
-            resolve(&key('u'), true, &with_update),
+            resolve(&ctrl_key('u'), true, &c),
             Some(ActionId::Update),
-            "strict u with update"
+            "strict Ctrl+u"
         );
     }
 
@@ -859,6 +843,7 @@ mod tests {
             ('N', ActionId::NewSession),
             ('P', ActionId::Projects),
             ('O', ActionId::SortPicker),
+            ('U', ActionId::ToggleUnread),
         ];
         for (ch, want) in shifted {
             assert_eq!(resolve(&key(ch), true, &c), Some(want), "strict '{ch}'");
@@ -870,6 +855,7 @@ mod tests {
             ('n', ActionId::NewFromSelection),
             ('p', ActionId::Profiles),
             ('g', ActionId::GroupBy),
+            ('u', ActionId::Update),
         ];
         for (ch, want) in ctrled {
             assert_eq!(
@@ -885,7 +871,7 @@ mod tests {
         // They fall through to the dispatcher's typing-guard, not an action.
         let c = ctx();
         for ch in [
-            'd', 'r', 't', 'n', 'p', 's', 'x', 'm', 'e', 'i', 'z', 'g', 'o',
+            'd', 'r', 't', 'n', 'p', 's', 'x', 'm', 'e', 'i', 'z', 'g', 'o', 'u',
         ] {
             assert_eq!(resolve(&key(ch), true, &c), None, "strict bare '{ch}'");
         }

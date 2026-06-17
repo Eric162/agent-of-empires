@@ -600,12 +600,17 @@ export const SessionRow = memo(function SessionRow({
   const isPinned = workspace.sessions.some((s) => s.pinned_at != null);
   const isArchived = workspace.sessions.some((s) => s.archived_at != null);
   const snoozedUntil = workspace.sessions.find((s) => s.snoozed_until)?.snoozed_until ?? null;
-  // Unread marker for the row, server value plus optimistic overlay. The chip
-  // is suppressed on the active row (viewing it reads it; App clears the auto
-  // marker), so this only paints rows you're not currently looking at.
+  // Unread marker for the row, server value plus optimistic overlay. The
+  // indicator is suppressed on the active row (viewing it reads it; App clears
+  // the auto marker), so this only paints rows you're not currently looking at.
   const serverUnread = workspace.sessions.find((s) => s.unread)?.unread ?? null;
   const effectiveUnread = effectiveUnreadOf(optimistic, serverUnread);
   const isUnread = unreadIndicatorEnabled && !isActive && effectiveUnread != null;
+  // Like the TUI, the unread marker *replaces* the resting status glyph with a
+  // solid dot (rather than sitting beside the title). Only for resting states:
+  // a live spinner (Running/Waiting/...) stays, since live status outranks it
+  // and auto-unread only ever lands on Idle anyway.
+  const showUnreadGlyph = isUnread && (sessionStatus === "Idle" || sessionStatus === "Unknown");
   const sessionId = firstSession?.id;
   const navigationSessionId = runningSession?.id ?? firstSession?.id ?? null;
   const sessionPath = navigationSessionId ? `/session/${encodeURIComponent(navigationSessionId)}` : "/";
@@ -943,8 +948,20 @@ export const SessionRow = memo(function SessionRow({
       >
         {isSelected && <span className="sr-only">Selected</span>}
         <div className="flex items-center gap-2">
-          <span className={`text-sm shrink-0 leading-none font-mono ${textClass}`}>
-            <StatusGlyph status={sessionStatus} createdAt={createdAt} idleEnteredAt={idleEnteredAt} />
+          <span
+            className={`text-sm shrink-0 leading-none font-mono ${showUnreadGlyph ? "text-status-unread font-semibold" : textClass}`}
+          >
+            {showUnreadGlyph ? (
+              <span
+                title={effectiveUnread === "manual" ? "Flagged unread" : "Unread: turn finished"}
+                aria-label="Unread"
+                data-testid="sidebar-unread-dot"
+              >
+                ●
+              </span>
+            ) : (
+              <StatusGlyph status={sessionStatus} createdAt={createdAt} idleEnteredAt={idleEnteredAt} />
+            )}
           </span>
           <div className="min-w-0 flex-1">
             <span
@@ -960,15 +977,7 @@ export const SessionRow = memo(function SessionRow({
                   *
                 </span>
               )}
-              {isUnread && (
-                <span
-                  title={effectiveUnread === "manual" ? "Flagged unread" : "Unread: turn finished"}
-                  aria-label="Unread"
-                  data-testid="sidebar-unread-dot"
-                  className="shrink-0 inline-flex h-1.5 w-1.5 rounded-full bg-status-unread"
-                />
-              )}
-              <span className={`truncate ${isUnread ? "font-medium text-text-primary" : ""}`} title={label}>
+              <span className={`truncate ${showUnreadGlyph ? "font-medium text-text-primary" : ""}`} title={label}>
                 {label}
               </span>
               {hasDraft && (
