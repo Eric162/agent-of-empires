@@ -1023,7 +1023,7 @@ pub struct SessionConfig {
     /// you view it (Tab into live-send or Enter to attach), and you can flag
     /// a session unread for later with `v`; unread rows also sort just below
     /// Waiting in the Attention sort. Turn this off to disable the indicator,
-    /// the auto-marking, and the `v` toggle entirely.
+    /// the auto-marking, and the `u` toggle entirely.
     #[serde(default = "default_true")]
     #[setting(
         label = "Unread Session Indicator",

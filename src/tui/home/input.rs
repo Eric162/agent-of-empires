@@ -2139,6 +2139,9 @@ impl HomeView {
             sort_order: self.sort_order,
             has_search: !self.search_matches.is_empty(),
             project_group_selected: self.project_group_at_cursor().is_some(),
+            // Same condition the update footer renders on: while it's showing,
+            // `u` is Update; otherwise it falls through to the unread toggle.
+            update_available: update_info.is_some(),
         };
         if let Some(id) = bindings::resolve(&key, self.strict_hotkeys, &ctx) {
             return self.run_action(id, update_info);

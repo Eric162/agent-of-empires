@@ -1288,7 +1288,7 @@ impl Instance {
         }
     }
 
-    /// Manual toggle (`v`): read -> manual-unread; unread (either kind) ->
+    /// Manual toggle (`u`): read -> manual-unread; unread (either kind) ->
     /// read.
     pub fn toggle_unread(&mut self) {
         self.unread = match self.unread {

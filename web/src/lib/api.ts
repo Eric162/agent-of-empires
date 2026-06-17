@@ -1394,7 +1394,7 @@ export async function setSessionSnooze(id: string, minutes: number | null): Prom
 }
 
 /** Flag a session manually unread (`true`) or mark it read (`false`, clearing
- *  both auto and manual markers). Mirrors the TUI `v` toggle; the caller
+ *  both auto and manual markers). Mirrors the TUI `u` toggle; the caller
  *  computes the target from the current state so an optimistic update stays in
  *  sync with the server. */
 export async function setSessionUnread(id: string, unread: boolean): Promise<SessionResponse | null> {

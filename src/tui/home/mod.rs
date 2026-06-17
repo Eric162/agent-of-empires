@@ -373,6 +373,10 @@ pub(super) fn get_indent(depth: usize) -> &'static str {
 }
 
 pub(super) const ICON_IDLE: &str = "⠒";
+/// Unread rows swap the muted idle braille dot for a solid filled circle so
+/// the marker reads at a glance (and matches the web sidebar's unread dot).
+/// Paired with bold + `theme.unread` in the row formatter.
+pub(super) const ICON_UNREAD: &str = "●";
 pub(super) const ICON_ERROR: &str = "✕";
 pub(super) const ICON_UNKNOWN: &str = "⠤";
 pub(super) const ICON_STOPPED: &str = "⠒";

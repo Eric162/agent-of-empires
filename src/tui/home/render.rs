@@ -9,7 +9,7 @@ use rattles::presets::prelude as spinners;
 
 use super::{
     get_indent, live_send, HomeView, TerminalMode, ViewMode, ICON_COLLAPSED, ICON_DELETING,
-    ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_UNKNOWN,
+    ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_UNKNOWN, ICON_UNREAD,
 };
 use crate::containers::image_update::ImageUpdate;
 use crate::session::config::{GroupByMode, SortOrder};
@@ -1037,6 +1037,15 @@ impl HomeView {
                                 Status::Creating => theme.accent,
                             };
                             let mut style = Style::default().fg(color);
+                            if unread_overlay {
+                                // Make unread unmistakable: a solid dot glyph
+                                // plus bold, on top of the `theme.unread`
+                                // color set above. A plain color swap read as
+                                // too subtle (#2088 review). Sink/urgent
+                                // states below still override icon + style.
+                                icon = ICON_UNREAD;
+                                style = style.add_modifier(ratatui::style::Modifier::BOLD);
+                            }
                             if inst.is_archived() {
                                 // Archived rows render with one uniform
                                 // muted glyph regardless of underlying
@@ -1117,11 +1126,14 @@ impl HomeView {
                             let (mut icon, color) = if terminal_running {
                                 (spinner_running(&inst.created_at), theme.terminal_active)
                             } else if unread_overlay {
-                                (ICON_IDLE, theme.unread)
+                                (ICON_UNREAD, theme.unread)
                             } else {
                                 (ICON_IDLE, theme.dimmed)
                             };
                             let mut style = Style::default().fg(color);
+                            if unread_overlay && !terminal_running {
+                                style = style.add_modifier(ratatui::style::Modifier::BOLD);
+                            }
                             if inst.is_archived() {
                                 // Archive lifecycle override mirrors the
                                 // Agent-view path: dim color, stopped

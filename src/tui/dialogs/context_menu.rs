@@ -19,7 +19,7 @@ pub enum ContextMenuAction {
     /// flips to "Unsnooze" when the row is already snoozed. Snoozing an active
     /// row opens the duration picker; unsnoozing wakes it immediately.
     ToggleSnooze,
-    /// Mark the session read or unread (mirrors the `'v'` hotkey). The menu
+    /// Mark the session read or unread (mirrors the `'u'` hotkey). The menu
     /// label flips to "Mark read" when the row is already unread. Only shown
     /// when the unread feature is enabled.
     ToggleUnread,
@@ -303,7 +303,7 @@ impl ContextMenuDialog {
                     'd' | 'D' => Some(ContextMenuAction::Delete),
                     'z' | 'Z' => Some(ContextMenuAction::ToggleArchive),
                     'h' | 'H' => Some(ContextMenuAction::ToggleSnooze),
-                    'v' | 'V' => Some(ContextMenuAction::ToggleUnread),
+                    'u' | 'U' => Some(ContextMenuAction::ToggleUnread),
                     // `n` opens a new session from whichever new-session entry
                     // the current menu carries: the session/group/project menu
                     // prefills from the row (NewFromSelection), the empty-sidebar
@@ -573,18 +573,18 @@ mod tests {
     }
 
     #[test]
-    fn v_hotkey_submits_toggle_unread() {
-        // The `v` quick-pick mirrors the home-view shortcut and only fires
+    fn u_hotkey_submits_toggle_unread() {
+        // The `u` quick-pick mirrors the home-view shortcut and only fires
         // when the Unread row is present (feature enabled).
         let mut menu = ContextMenuDialog::for_session((0, 0), false, None, Some(false));
         assert!(matches!(
-            menu.handle_key(key(KeyCode::Char('v'))),
+            menu.handle_key(key(KeyCode::Char('u'))),
             DialogResult::Submit(ContextMenuAction::ToggleUnread)
         ));
-        // With no Unread row (feature off), `v` is inert.
+        // With no Unread row (feature off), `u` is inert.
         let mut off = ContextMenuDialog::for_session((0, 0), false, None, None);
         assert!(matches!(
-            off.handle_key(key(KeyCode::Char('v'))),
+            off.handle_key(key(KeyCode::Char('u'))),
             DialogResult::Continue
         ));
     }

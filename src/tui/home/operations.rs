@@ -1290,7 +1290,7 @@ impl HomeView {
         None
     }
 
-    /// Manual unread toggle (`v`). Symmetric: a read row becomes
+    /// Manual unread toggle (`u`). Symmetric: a read row becomes
     /// manually-unread (a deliberate "flag for later"), an unread row of
     /// either kind becomes read. The row's `theme.unread` color is the
     /// feedback, so there is no toast. No-op when the feature is disabled.

@@ -2611,7 +2611,7 @@ pub async fn update_session_snooze(
 }
 
 /// `PATCH /api/sessions/{id}/unread` — flag a session unread (`{"unread":true}`)
-/// or mark it read (`{"unread":false}`). Mirrors the TUI's `v` toggle, but the
+/// or mark it read (`{"unread":false}`). Mirrors the TUI's `u` toggle, but the
 /// client computes the target from the current state rather than toggling
 /// server-side, so an optimistic UI update can't desync. No-op when the
 /// `session.unread_indicator` feature is off (the client hides the control

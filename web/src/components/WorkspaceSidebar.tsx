@@ -679,7 +679,7 @@ export const SessionRow = memo(function SessionRow({
   const toggleUnread = () => {
     setContextMenu(null);
     // Mark unread when currently read, mark read when currently unread (either
-    // kind), mirroring the TUI `v` toggle.
+    // kind), mirroring the TUI `u` toggle.
     onUnreadToggle(workspace, effectiveUnread == null);
   };
 

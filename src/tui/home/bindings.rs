@@ -115,6 +115,11 @@ pub enum Context {
     /// off, the binding is removed from dispatch so the key isn't swallowed by
     /// a dead action; help and the command palette skip it separately.
     UnreadEnabled,
+    /// An update is available (the update footer is showing). Gates the Update
+    /// binding so `u` routes to Update only while there's something to update;
+    /// otherwise `u` falls through to the unread toggle listed after it. See
+    /// the #2088 review.
+    UpdateAvailable,
 }
 
 /// Help-overlay section. Ordering mirrors `components/help.rs`.
@@ -156,6 +161,9 @@ pub struct Ctx {
     /// True when the cursor sits on a real project header in project view, so
     /// the pin toggle can claim its chord ahead of the projects-dialog binding.
     pub project_group_selected: bool,
+    /// True when an update is available (footer showing). Lets `u` resolve to
+    /// Update only then, falling through to the unread toggle otherwise.
+    pub update_available: bool,
 }
 
 fn chord_matches(c: &Chord, key: &KeyEvent) -> bool {
@@ -174,6 +182,7 @@ fn context_holds(context: Context, ctx: &Ctx) -> bool {
         Context::SearchActive => ctx.has_search,
         Context::ProjectGroupSelected => ctx.project_group_selected,
         Context::UnreadEnabled => crate::session::unread_enabled(),
+        Context::UpdateAvailable => ctx.update_available,
     }
 }
 
@@ -600,11 +609,15 @@ pub static BINDINGS: &[Binding] = &[
             serve_only: false,
         }),
     },
+    // `u` routes by context: Update wins while an update is available (this
+    // binding is listed first and guarded on UpdateAvailable), otherwise it
+    // falls through to ToggleUnread below. Both claim `u` in strict too,
+    // mirroring how Update already used bare `u` in strict.
     Binding {
         id: ActionId::Update,
         non_strict: &[k('u')],
         strict: &[k('u')],
-        context: Context::Always,
+        context: Context::UpdateAvailable,
         help: Some(HelpMeta {
             section: HelpSection::Other,
             desc: "Update aoe (when available)",
@@ -613,8 +626,8 @@ pub static BINDINGS: &[Binding] = &[
     },
     Binding {
         id: ActionId::ToggleUnread,
-        non_strict: &[k('v')],
-        strict: &[k('V')],
+        non_strict: &[k('u')],
+        strict: &[k('u')],
         context: Context::UnreadEnabled,
         help: Some(HelpMeta {
             section: HelpSection::Actions,
@@ -760,6 +773,7 @@ mod tests {
             sort_order: SortOrder::Newest,
             has_search: false,
             project_group_selected: false,
+            update_available: false,
         }
     }
 
@@ -788,7 +802,8 @@ mod tests {
             ('o', ActionId::SortPicker),
             ('g', ActionId::GroupBy),
             ('q', ActionId::Quit),
-            ('v', ActionId::ToggleUnread),
+            // No update available in `ctx()`, so `u` falls through to unread.
+            ('u', ActionId::ToggleUnread),
         ];
         for (ch, want) in cases {
             assert_eq!(
@@ -800,17 +815,35 @@ mod tests {
     }
 
     #[test]
-    fn toggle_unread_binds_v_in_both_modes() {
+    fn u_routes_to_unread_when_no_update_and_update_when_available() {
+        // No update available: `u` is the unread toggle in both modes.
         let c = ctx();
         assert_eq!(
-            resolve(&key('v'), false, &c),
+            resolve(&key('u'), false, &c),
             Some(ActionId::ToggleUnread),
-            "non-strict 'v' -> ToggleUnread"
+            "non-strict u"
         );
         assert_eq!(
-            resolve(&key('V'), true, &c),
+            resolve(&key('u'), true, &c),
             Some(ActionId::ToggleUnread),
-            "strict 'V' -> ToggleUnread"
+            "strict u"
+        );
+
+        // Update available: `u` routes to Update (listed first, guarded on
+        // UpdateAvailable), in both modes.
+        let with_update = Ctx {
+            update_available: true,
+            ..ctx()
+        };
+        assert_eq!(
+            resolve(&key('u'), false, &with_update),
+            Some(ActionId::Update),
+            "non-strict u with update"
+        );
+        assert_eq!(
+            resolve(&key('u'), true, &with_update),
+            Some(ActionId::Update),
+            "strict u with update"
         );
     }
 
