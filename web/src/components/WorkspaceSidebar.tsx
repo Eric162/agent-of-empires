@@ -15,6 +15,7 @@ import { createPortal } from "react-dom";
 import {
   Archive,
   ArrowLeftRight,
+  CircleDot,
   CircleStop,
   Folder,
   Hourglass,
@@ -55,6 +56,7 @@ import { REPO_COLOR_OPTIONS, repoColorStyle, repoSwatchStyle, type RepoAppearanc
 import { STATUS_DOT_CLASS, getStatusTextClass, isSessionActive } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
 import { exceedsTouchSlop } from "../lib/longPress";
+import { useUnreadIndicatorEnabled } from "../lib/unreadIndicator";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import { renameSession, setSessionNotifications, setWorktreeName, updateSessionGroup } from "../lib/api";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
@@ -75,6 +77,7 @@ import {
   effectiveArchivedOf,
   effectivePinnedOf,
   effectiveSnoozedUntilOf,
+  effectiveUnreadOf,
   type OptimisticTriage,
 } from "../lib/sidebarOptimistic";
 import { useSidebarTriage } from "../hooks/useSidebarTriage";
@@ -407,6 +410,7 @@ function SortableSessionRow({
   onPinToggle: (ws: Workspace, pinned: boolean) => void;
   onArchiveToggle: (ws: Workspace, archived: boolean) => void;
   onSnooze: (ws: Workspace, minutes: number | null) => void;
+  onUnreadToggle: (ws: Workspace, markUnread: boolean) => void;
 }) {
   const dragSuppressRef = useDragSuppressRef();
   // `disabled` no-ops the sensor listeners. `readOnly` covers viewers
@@ -528,6 +532,7 @@ export const SessionRow = memo(function SessionRow({
   onPinToggle,
   onArchiveToggle,
   onSnooze,
+  onUnreadToggle,
 }: {
   workspace: Workspace;
   isActive: boolean;
@@ -553,8 +558,10 @@ export const SessionRow = memo(function SessionRow({
   onPinToggle: (ws: Workspace, pinned: boolean) => void;
   onArchiveToggle: (ws: Workspace, archived: boolean) => void;
   onSnooze: (ws: Workspace, minutes: number | null) => void;
+  onUnreadToggle: (ws: Workspace, markUnread: boolean) => void;
 }) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
+  const unreadIndicatorEnabled = useUnreadIndicatorEnabled();
   const { status: sessionStatus, createdAt, idleEnteredAt } = bestSession(workspace, idleDecayWindowMs);
   const textClass = getStatusTextClass(
     {
@@ -593,6 +600,12 @@ export const SessionRow = memo(function SessionRow({
   const isPinned = workspace.sessions.some((s) => s.pinned_at != null);
   const isArchived = workspace.sessions.some((s) => s.archived_at != null);
   const snoozedUntil = workspace.sessions.find((s) => s.snoozed_until)?.snoozed_until ?? null;
+  // Unread marker for the row, server value plus optimistic overlay. The chip
+  // is suppressed on the active row (viewing it reads it; App clears the auto
+  // marker), so this only paints rows you're not currently looking at.
+  const serverUnread = workspace.sessions.find((s) => s.unread)?.unread ?? null;
+  const effectiveUnread = effectiveUnreadOf(optimistic, serverUnread);
+  const isUnread = unreadIndicatorEnabled && !isActive && effectiveUnread != null;
   const sessionId = firstSession?.id;
   const navigationSessionId = runningSession?.id ?? firstSession?.id ?? null;
   const sessionPath = navigationSessionId ? `/session/${encodeURIComponent(navigationSessionId)}` : "/";
@@ -661,6 +674,13 @@ export const SessionRow = memo(function SessionRow({
     setContextMenu(null);
     setSnoozeModalOpen(false);
     onSnooze(workspace, minutes);
+  };
+
+  const toggleUnread = () => {
+    setContextMenu(null);
+    // Mark unread when currently read, mark read when currently unread (either
+    // kind), mirroring the TUI `v` toggle.
+    onUnreadToggle(workspace, effectiveUnread == null);
   };
 
   // Close the context menu first, then open the modal in the next
@@ -940,7 +960,15 @@ export const SessionRow = memo(function SessionRow({
                   *
                 </span>
               )}
-              <span className="truncate" title={label}>
+              {isUnread && (
+                <span
+                  title={effectiveUnread === "manual" ? "Flagged unread" : "Unread: turn finished"}
+                  aria-label="Unread"
+                  data-testid="sidebar-unread-dot"
+                  className="shrink-0 inline-flex h-1.5 w-1.5 rounded-full bg-status-unread"
+                />
+              )}
+              <span className={`truncate ${isUnread ? "font-medium text-text-primary" : ""}`} title={label}>
                 {label}
               </span>
               {hasDraft && (
@@ -1239,6 +1267,20 @@ export const SessionRow = memo(function SessionRow({
                         >
                           <Moon className="h-3.5 w-3.5 shrink-0" />
                           Unsnooze
+                        </button>
+                      )}
+                      {/* Unlike the others, the unread toggle is always
+                          offered (any sort), gated only on the feature
+                          flag; the label flips to "Mark as read" when the
+                          row already carries a marker. */}
+                      {unreadIndicatorEnabled && (
+                        <button
+                          onClick={() => void toggleUnread()}
+                          data-testid="sidebar-context-menu-unread"
+                          className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                        >
+                          <CircleDot className="h-3.5 w-3.5 shrink-0" />
+                          {effectiveUnread != null ? "Mark as read" : "Mark as unread"}
                         </button>
                       )}
                     </>
@@ -2660,6 +2702,7 @@ export function WorkspaceSidebar({
                                     onPinToggle={triage.pinToggle}
                                     onArchiveToggle={triage.archiveToggle}
                                     onSnooze={triage.snooze}
+                                    onUnreadToggle={triage.unreadToggle}
                                     // Drag is disabled when the tier
                                     // comparator already controls placement:
                                     // lastActivity mode has no manual
@@ -2765,6 +2808,7 @@ export function WorkspaceSidebar({
                                 onPinToggle={triage.pinToggle}
                                 onArchiveToggle={triage.archiveToggle}
                                 onSnooze={triage.snooze}
+                                onUnreadToggle={triage.unreadToggle}
                                 indented
                               />
                             ))}
@@ -2843,6 +2887,7 @@ export function WorkspaceSidebar({
                       onPinToggle={triage.pinToggle}
                       onArchiveToggle={triage.archiveToggle}
                       onSnooze={triage.snooze}
+                      onUnreadToggle={triage.unreadToggle}
                       indented
                     />
                   ))}

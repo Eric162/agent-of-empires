@@ -5,6 +5,7 @@ import {
   effectiveArchivedOf,
   effectivePinnedOf,
   effectiveSnoozedUntilOf,
+  effectiveUnreadOf,
   reconcileOptimistic,
   serverTriageOf,
   withOverride,
@@ -47,6 +48,12 @@ describe("effective resolvers", () => {
       "2099-01-01T00:00:00Z",
     );
   });
+
+  it("unread override: undefined falls through, null and kind win", () => {
+    expect(effectiveUnreadOf(EMPTY_OPTIMISTIC, "auto")).toBe("auto");
+    expect(effectiveUnreadOf(override({ unread: null }), "auto")).toBeNull();
+    expect(effectiveUnreadOf(override({ unread: "manual" }), null)).toBe("manual");
+  });
 });
 
 describe("serverTriageOf", () => {
@@ -63,7 +70,16 @@ describe("serverTriageOf", () => {
       isPinned: true,
       isArchived: false,
       snoozedUntil: "2099-01-01T00:00:00Z",
+      unread: null,
     });
+  });
+
+  it("reads the first session's unread marker", () => {
+    const w = ws("w", [
+      { pinned_at: null, archived_at: null, snoozed_until: null, unread: "manual" },
+      { pinned_at: null, archived_at: null, snoozed_until: null },
+    ]);
+    expect(serverTriageOf(w).unread).toBe("manual");
   });
 });
 
@@ -74,6 +90,7 @@ describe("withOverride", () => {
       pinned: true,
       archived: true,
       snoozedUntil: undefined,
+      unread: undefined,
     });
   });
 
@@ -136,6 +153,26 @@ describe("reconcileOptimistic", () => {
       pinned: true,
       archived: null,
       snoozedUntil: undefined,
+      unread: undefined,
     });
+  });
+
+  it("drops a mark-read override once the server reports no unread marker", () => {
+    const map = new Map([["w", override({ unread: null })]]);
+    const next = reconcileOptimistic(map, [ws("w", [{ unread: null }])]);
+    expect(next.has("w")).toBe(false);
+  });
+
+  it("keeps a manual-unread override while the server still reports auto", () => {
+    // A manual flag must not be dropped by a stale auto value from the server.
+    const map = new Map([["w", override({ unread: "manual" })]]);
+    const next = reconcileOptimistic(map, [ws("w", [{ unread: "auto" }])]);
+    expect(next.get("w")?.unread).toBe("manual");
+  });
+
+  it("drops a manual-unread override once the server reports manual", () => {
+    const map = new Map([["w", override({ unread: "manual" })]]);
+    const next = reconcileOptimistic(map, [ws("w", [{ unread: "manual" }])]);
+    expect(next.has("w")).toBe(false);
   });
 });

@@ -11942,7 +11942,13 @@ mod right_click_context_menu {
         // menu is New Session / Rename / Unarchive / Mark unread / Delete.
         assert_eq!(
             labels,
-            vec!["New Session", "Rename", "Unarchive", "Mark unread", "Delete"]
+            vec![
+                "New Session",
+                "Rename",
+                "Unarchive",
+                "Mark unread",
+                "Delete"
+            ]
         );
 
         env.view.handle_key(key(KeyCode::Down), None); // New Session -> Rename

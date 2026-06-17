@@ -25,6 +25,11 @@ export interface OptimisticTriage {
   pinned: boolean | null;
   archived: boolean | null;
   snoozedUntil: string | null | undefined;
+  /** Optimistic unread override: `undefined` means "no override, use the
+   *  server value", `null` means "pretend the server already marked read",
+   *  and `"auto"` / `"manual"` mean "pretend the server already flagged it".
+   *  Mirrors `snoozedUntil`'s three-state shape. */
+  unread: "auto" | "manual" | null | undefined;
 }
 
 /** A row with no optimistic override. Shared frozen singleton so rows that
@@ -34,6 +39,7 @@ export const EMPTY_OPTIMISTIC: OptimisticTriage = Object.freeze({
   pinned: null,
   archived: null,
   snoozedUntil: undefined,
+  unread: undefined,
 });
 
 /** Server-truth triage aggregates for a workspace, matching the exact
@@ -45,11 +51,13 @@ export function serverTriageOf(ws: Workspace): {
   isPinned: boolean;
   isArchived: boolean;
   snoozedUntil: string | null;
+  unread: "auto" | "manual" | null;
 } {
   return {
     isPinned: ws.sessions.some((s) => s.pinned_at != null),
     isArchived: ws.sessions.some((s) => s.archived_at != null),
     snoozedUntil: ws.sessions.find((s) => s.snoozed_until)?.snoozed_until ?? null,
+    unread: ws.sessions.find((s) => s.unread)?.unread ?? null,
   };
 }
 
@@ -68,6 +76,13 @@ export function effectiveSnoozedUntilOf(
   return resolveEffectiveSnoozedUntil(optimistic.snoozedUntil, serverSnoozedUntil);
 }
 
+export function effectiveUnreadOf(
+  optimistic: OptimisticTriage,
+  serverUnread: "auto" | "manual" | null | undefined,
+): "auto" | "manual" | null | undefined {
+  return optimistic.unread !== undefined ? optimistic.unread : serverUnread;
+}
+
 /** True when an override has been caught up to by the server and can be
  *  dropped. Mirrors the three per-field reconciliation effects that used to
  *  live in `SessionRow`: a boolean override clears once it equals the
@@ -81,6 +96,17 @@ function snoozeCaughtUp(override: string | null | undefined, server: string | nu
   if (override === undefined) return false;
   if (override === null) return server == null;
   return server != null && snoozeTimestampCloseEnough(override, server);
+}
+
+/** An unread override is caught up when the server agrees: `null` (marked
+ *  read) once the server reports no marker, or `"auto"`/`"manual"` once the
+ *  server reports the same kind. `"auto"` from the server while the override
+ *  is `"manual"` does NOT reconcile (different kinds), so the user's manual
+ *  flag isn't dropped by a stale auto value. */
+function unreadCaughtUp(override: "auto" | "manual" | null | undefined, server: "auto" | "manual" | null): boolean {
+  if (override === undefined) return false;
+  if (override === null) return server == null;
+  return server === override;
 }
 
 /** Given the current overlay map and the latest workspaces, return a new map
@@ -111,14 +137,20 @@ export function reconcileOptimistic(
     const pinned = fieldCaughtUp(override.pinned, server.isPinned) ? null : override.pinned;
     const archived = fieldCaughtUp(override.archived, server.isArchived) ? null : override.archived;
     const snoozedUntil = snoozeCaughtUp(override.snoozedUntil, server.snoozedUntil) ? undefined : override.snoozedUntil;
-    if (pinned !== override.pinned || archived !== override.archived || snoozedUntil !== override.snoozedUntil) {
+    const unread = unreadCaughtUp(override.unread, server.unread) ? undefined : override.unread;
+    if (
+      pinned !== override.pinned ||
+      archived !== override.archived ||
+      snoozedUntil !== override.snoozedUntil ||
+      unread !== override.unread
+    ) {
       changed = true;
     }
-    if (pinned === null && archived === null && snoozedUntil === undefined) {
+    if (pinned === null && archived === null && snoozedUntil === undefined && unread === undefined) {
       changed = true;
       continue;
     }
-    next.set(id, { pinned, archived, snoozedUntil });
+    next.set(id, { pinned, archived, snoozedUntil, unread });
   }
   return changed ? next : (map as Map<string, OptimisticTriage>);
 }
@@ -131,5 +163,6 @@ export function withOverride(prev: OptimisticTriage | undefined, patch: Partial<
     pinned: patch.pinned !== undefined ? patch.pinned : (prev?.pinned ?? null),
     archived: patch.archived !== undefined ? patch.archived : (prev?.archived ?? null),
     snoozedUntil: "snoozedUntil" in patch ? patch.snoozedUntil : (prev?.snoozedUntil ?? undefined),
+    unread: "unread" in patch ? patch.unread : (prev?.unread ?? undefined),
   };
 }

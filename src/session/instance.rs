@@ -1297,6 +1297,20 @@ impl Instance {
         };
     }
 
+    /// Flag the session manually unread (a deliberate "flag for later").
+    /// Used by the web "Mark as unread" action; the TUI reaches the same
+    /// state through `toggle_unread`.
+    pub fn mark_unread_manual(&mut self) {
+        self.unread = Some(UnreadKind::Manual);
+    }
+
+    /// Clear the unread marker entirely (both `Auto` and `Manual`). This is
+    /// the explicit "Mark as read" action; distinct from `mark_read_auto`,
+    /// which preserves a `Manual` flag.
+    pub fn mark_read(&mut self) {
+        self.unread = None;
+    }
+
     /// True if `snoozed_until` is set AND in the future. Expired snoozes
     /// return false so the row naturally rejoins the main sort on the next
     /// render; the stale timestamp stays on disk until the next mutation
@@ -4100,6 +4114,24 @@ mod tests {
         // an auto marker also toggles to read
         inst.unread = Some(UnreadKind::Auto);
         inst.toggle_unread();
+        assert!(!inst.is_unread());
+    }
+
+    #[test]
+    fn test_mark_unread_manual_and_mark_read() {
+        let mut inst = Instance::new("test", "/tmp/test");
+        // The web "Mark as unread" sets a manual flag from any state.
+        inst.mark_unread_manual();
+        assert_eq!(inst.unread, Some(UnreadKind::Manual));
+        inst.unread = Some(UnreadKind::Auto);
+        inst.mark_unread_manual();
+        assert_eq!(inst.unread, Some(UnreadKind::Manual));
+        // "Mark as read" clears both kinds (unlike mark_read_auto, which keeps
+        // a manual flag).
+        inst.mark_read();
+        assert!(!inst.is_unread());
+        inst.unread = Some(UnreadKind::Auto);
+        inst.mark_read();
         assert!(!inst.is_unread());
     }
 
