@@ -1013,22 +1013,24 @@ impl HomeView {
                                 Status::Deleting => ICON_DELETING,
                                 Status::Creating => spinner_starting(&inst.created_at),
                             };
-                            // Unread overlays the resting (Idle/Unknown)
-                            // color with `theme.unread`. Auto-unread only
-                            // ever lands on Idle; a manual flag on a live
-                            // row keeps the live status color (more urgent
-                            // than "unread"). Archived/snoozed/urgent/
-                            // favorite below still override as usual.
-                            let unread_overlay =
-                                crate::session::unread_enabled() && inst.is_unread();
+                            // Unread paints only on resting rows
+                            // (Idle/Unknown): a live status (Running/Waiting/
+                            // Starting/...) supersedes it and keeps its own
+                            // color AND spinner. Auto-unread only ever lands
+                            // on Idle; a manual flag on a live row defers to
+                            // the live state. Archived/snoozed/urgent below
+                            // still override on top.
+                            let unread_resting = crate::session::unread_enabled()
+                                && inst.is_unread()
+                                && matches!(inst.status, Status::Idle | Status::Unknown);
                             let color = match inst.status {
                                 Status::Running => theme.running,
                                 Status::Waiting => theme.waiting,
-                                Status::Idle if unread_overlay => theme.unread,
+                                Status::Idle if unread_resting => theme.unread,
                                 Status::Idle => {
                                     theme.idle_color_at_age(idle_age, self.idle_decay_window)
                                 }
-                                Status::Unknown if unread_overlay => theme.unread,
+                                Status::Unknown if unread_resting => theme.unread,
                                 Status::Unknown => theme.waiting,
                                 Status::Stopped => theme.dimmed,
                                 Status::Error => theme.error,
@@ -1037,7 +1039,7 @@ impl HomeView {
                                 Status::Creating => theme.accent,
                             };
                             let mut style = Style::default().fg(color);
-                            if unread_overlay {
+                            if unread_resting {
                                 // Make unread unmistakable: a solid dot glyph
                                 // plus bold, on top of the `theme.unread`
                                 // color set above. A plain color swap read as

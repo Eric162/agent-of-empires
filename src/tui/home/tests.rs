@@ -575,6 +575,58 @@ fn preview_visible_rows_equal_output_area_with_info_shown() {
     );
 }
 
+/// Precedence: unread paints only on resting (Idle/Unknown) rows. A live
+/// status supersedes it, keeping its own spinner — so a Running session that
+/// also carries an unread marker must NOT show the solid unread dot. See the
+/// #2088 review note about jumbled precedence.
+#[test]
+#[serial]
+fn unread_dot_yields_to_a_running_status() {
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances()[0].id.clone();
+    let theme = load_theme("empire");
+
+    let render = |env: &mut TestEnv| -> String {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| env.view.render(f, f.area(), &theme, None, None, None))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+        }
+        out
+    };
+
+    // Idle + unread: the row shows the solid unread dot.
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = crate::session::Status::Idle;
+        inst.mark_unread_manual();
+    });
+    env.view.flat_items = env.view.build_flat_items();
+    assert!(
+        render(&mut env).contains('●'),
+        "an idle unread row should paint the unread dot"
+    );
+
+    // Running + still unread: the live status wins; no unread dot.
+    env.view
+        .mutate_instance(&id, |inst| inst.status = crate::session::Status::Running);
+    env.view.flat_items = env.view.build_flat_items();
+    assert!(
+        !render(&mut env).contains('●'),
+        "a running row must keep its spinner, not the unread dot"
+    );
+}
+
 #[test]
 #[serial]
 fn test_q_returns_quit_action() {
