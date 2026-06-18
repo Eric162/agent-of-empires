@@ -377,6 +377,11 @@ pub(super) const ICON_IDLE: &str = "⠒";
 /// the marker reads at a glance (and matches the web sidebar's unread dot).
 /// Paired with bold + `theme.unread` in the row formatter.
 pub(super) const ICON_UNREAD: &str = "●";
+/// How long a session row must stay selected (with the list in the foreground)
+/// before its unread marker clears. Long enough that arrowing past a row to get
+/// somewhere doesn't read it, short enough that pausing to read the preview
+/// does. See `tick_unread_dwell`.
+pub(super) const UNREAD_DWELL: std::time::Duration = std::time::Duration::from_secs(2);
 pub(super) const ICON_ERROR: &str = "✕";
 pub(super) const ICON_UNKNOWN: &str = "⠤";
 pub(super) const ICON_STOPPED: &str = "⠒";
@@ -707,6 +712,14 @@ pub struct HomeView {
     /// `DOUBLE_CLICK_THRESHOLD` on the same row, which then activates the
     /// session (same as pressing Enter on the selected row).
     pub(super) last_click: Option<(std::time::Instant, u16, u16)>,
+
+    /// Dwell tracker for unread clear-on-read: the currently-selected session
+    /// id and the instant the selection landed on it (while the list is the
+    /// foreground, no dialog/live-send). When the same row stays selected for
+    /// `UNREAD_DWELL`, the marker is cleared, distinguishing "scrolled past"
+    /// from "actually read." Reset on selection change, on leaving the list,
+    /// and on a manual unread toggle so re-flagging isn't instantly undone.
+    pub(super) unread_dwell: Option<(String, std::time::Instant)>,
 
     // Terminal mode for sandboxed sessions (per-session, ephemeral)
     pub(super) terminal_modes: HashMap<String, TerminalMode>,
@@ -1380,6 +1393,7 @@ impl HomeView {
             list_inner_area: Rect::default(),
             mouse_pos: None,
             last_click: None,
+            unread_dwell: None,
             terminal_modes: HashMap::new(),
             default_terminal_mode,
             sound_config,
@@ -2481,8 +2495,7 @@ impl HomeView {
                         let already_unread =
                             self.get_instance(&update.id).is_some_and(|i| i.is_unread());
                         if !is_live_target && !already_unread {
-                            let _ =
-                                self.apply_user_action(&update.id, |inst| inst.mark_unread_auto());
+                            let _ = self.apply_user_action(&update.id, |inst| inst.mark_unread());
                         }
                     }
                 }
@@ -4532,8 +4545,8 @@ impl HomeView {
             leader,
         });
         // Entering live-send means the user is now viewing this session, so
-        // clear any auto-unread marker.
-        self.clear_auto_unread(&inst.id);
+        // clear any unread marker.
+        self.clear_unread_on_view(&inst.id);
         // Ensure the long-lived preview capture worker exists so we can hand
         // its waker to the send worker below. The worker isn't otherwise
         // spawned here (it follows the displayed pane for every view, not
@@ -5026,19 +5039,59 @@ impl HomeView {
         }
     }
 
-    /// Clear an auto-unread marker because the user viewed the session
-    /// (Tab into live-send, Enter to attach). A manual flag is left in place
-    /// (it clears only via the manual toggle). Runs regardless of the feature
-    /// flag so a stale `Auto` marker can't survive a disable/re-enable and
-    /// reappear later; only writes when there's actually an `Auto` flag to
-    /// clear, so a viewed read session doesn't churn the storage flock.
-    pub(crate) fn clear_auto_unread(&mut self, id: &str) {
-        let has_auto = self
-            .get_instance(id)
-            .is_some_and(|i| i.unread == Some(crate::session::UnreadKind::Auto));
-        if has_auto {
-            let _ = self.apply_user_action(id, |i| i.mark_read_auto());
+    /// Clear the unread marker because the user engaged with the session
+    /// (Tab into live-send, Enter to attach, or dwell on it in the list).
+    /// Runs regardless of the feature flag so a stale marker can't survive a
+    /// disable/re-enable and reappear later; only writes when the session is
+    /// actually unread, so an already-read session doesn't churn the storage
+    /// flock.
+    pub(crate) fn clear_unread_on_view(&mut self, id: &str) {
+        let is_unread = self.get_instance(id).is_some_and(|i| i.is_unread());
+        if is_unread {
+            let _ = self.apply_user_action(id, |i| i.mark_read());
         }
+    }
+
+    /// Dwell-to-read: clear the selected session's unread marker once it has
+    /// stayed selected, with the list in the foreground, for `UNREAD_DWELL`.
+    /// This is what separates "scrolled past it" from "stopped to read it."
+    /// Driven from the app tick loop; returns true when it cleared a marker
+    /// (so the caller can request a redraw).
+    ///
+    /// The clock is suspended (and reset) whenever the feature is off, a
+    /// dialog or live-send is up (the list isn't being read then), or nothing
+    /// is selected, and it restarts whenever the selection moves to a
+    /// different row. `toggle_unread_at_cursor` also restarts it, so manually
+    /// re-flagging the current row isn't undone by the dwell on the very next
+    /// tick.
+    pub fn tick_unread_dwell(&mut self, now: std::time::Instant) -> bool {
+        if !crate::session::unread_enabled() || self.has_dialog() {
+            self.unread_dwell = None;
+            return false;
+        }
+        let Some(id) = self.selected_session.clone() else {
+            self.unread_dwell = None;
+            return false;
+        };
+        let started = match &self.unread_dwell {
+            Some((prev, started)) if *prev == id => *started,
+            // First tick on this row (or selection moved): start the clock.
+            _ => {
+                self.unread_dwell = Some((id, now));
+                return false;
+            }
+        };
+        if now.duration_since(started) < UNREAD_DWELL {
+            return false;
+        }
+        // Dwell satisfied. Clear if the row is unread; leave the clock parked
+        // on this row either way so we don't re-evaluate every tick (a manual
+        // re-flag resets it via `toggle_unread_at_cursor`).
+        if self.get_instance(&id).is_some_and(|i| i.is_unread()) {
+            self.clear_unread_on_view(&id);
+            return true;
+        }
+        false
     }
 
     /// Bulk `apply_user_action`: one `Storage::update` per affected

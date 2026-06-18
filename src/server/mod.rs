@@ -2907,9 +2907,9 @@ async fn status_poll_loop(state: Arc<AppState>) {
                 for inst in &mut instances {
                     let finished_turn = prev.get(&inst.id) == Some(&Status::Running)
                         && inst.status == Status::Idle
-                        && inst.unread.is_none();
+                        && !inst.unread;
                     if finished_turn {
-                        inst.mark_unread_auto();
+                        inst.mark_unread();
                         newly_idle
                             .entry(inst.source_profile.clone())
                             .or_default()
@@ -2924,7 +2924,7 @@ async fn status_poll_loop(state: Arc<AppState>) {
                         move |insts| {
                             for inst in insts.iter_mut() {
                                 if ids.contains(&inst.id) {
-                                    inst.mark_unread_auto();
+                                    inst.mark_unread();
                                 }
                             }
                         },

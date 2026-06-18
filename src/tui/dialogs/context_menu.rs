@@ -574,7 +574,8 @@ mod tests {
 
     #[test]
     fn u_hotkey_submits_toggle_unread() {
-        // The `u` quick-pick mirrors the home-view shortcut and only fires
+        // The unread quick-pick is case-insensitive like the menu's other
+        // hotkeys (the home-view shortcut itself is Shift+U), and only fires
         // when the Unread row is present (feature enabled).
         let mut menu = ContextMenuDialog::for_session((0, 0), false, None, Some(false));
         assert!(matches!(

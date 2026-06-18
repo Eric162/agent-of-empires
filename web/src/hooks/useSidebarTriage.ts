@@ -96,11 +96,11 @@ export function useSidebarTriage(workspaces: readonly Workspace[]) {
     async (ws: Workspace, markUnread: boolean): Promise<TriageResult> => {
       const sessionId = ws.sessions[0]?.id;
       if (!sessionId) return { workspaceId: ws.id, ok: false, skipped: true };
-      // "Mark as unread" sets a manual flag; "Mark as read" clears it.
-      setOverride(ws.id, { unread: markUnread ? "manual" : null });
+      // "Mark as unread" flags it; "Mark as read" clears it.
+      setOverride(ws.id, { unread: markUnread });
       const result = await setSessionUnread(sessionId, markUnread);
       if (!result) {
-        setOverride(ws.id, { unread: undefined });
+        setOverride(ws.id, { unread: null });
         return { workspaceId: ws.id, ok: false };
       }
       return { workspaceId: ws.id, ok: true };

@@ -195,7 +195,7 @@ describe("setSessionSnooze", () => {
 
 describe("setSessionUnread", () => {
   it("PATCHes /api/sessions/{id}/unread with unread=true to flag unread", async () => {
-    fetchSpy.mockResolvedValueOnce(jsonResponse({ id: "sess-1", unread: "manual" }));
+    fetchSpy.mockResolvedValueOnce(jsonResponse({ id: "sess-1", unread: true }));
     await setSessionUnread("sess-1", true);
     const [url, init] = fetchSpy.mock.calls[0]!;
     expect(url).toBe("/api/sessions/sess-1/unread");

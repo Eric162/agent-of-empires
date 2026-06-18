@@ -88,13 +88,14 @@ pub struct SessionResponse {
     /// and the response simply omits the field. See #1581.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snoozed_until: Option<String>,
-    /// Unread marker, mirroring `Instance::unread`: `"auto"` (a finished turn
-    /// the user hasn't viewed), `"manual"` (a deliberate flag), or omitted
-    /// when read. The web sidebar paints an unread accent and offers a
-    /// right-click "Mark as read/unread" toggle; gated client-side on the
-    /// `session.unread_indicator` setting. See the TUI's `theme.unread`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub unread: Option<crate::session::UnreadKind>,
+    /// Unread marker, mirroring `Instance::unread`: `true` when the session
+    /// needs attention (a finished turn the user hasn't engaged with, or a
+    /// manual flag), omitted when read. The web sidebar paints an unread
+    /// accent and offers a right-click "Mark as read/unread" toggle; gated
+    /// client-side on the `session.unread_indicator` setting. See the TUI's
+    /// `theme.unread`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unread: bool,
     pub has_managed_worktree: bool,
     /// Whether renaming this session also moves its worktree directory (the
     /// resolved `session.tie_workdir_to_name` for an aoe-managed worktree).
@@ -293,8 +294,8 @@ impl SessionResponse {
             } else {
                 None
             },
-            // Surface the raw marker; the web gates the visual on the
-            // `session.unread_indicator` setting, so the field is always sent.
+            // Surface the marker (omitted when read); the web gates the
+            // visual on the `session.unread_indicator` setting.
             unread: inst.unread,
             has_managed_worktree: inst
                 .worktree_info
@@ -2663,7 +2664,7 @@ pub async fn update_session_unread(
             move |instances| {
                 if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
                     if mark_unread {
-                        inst.mark_unread_manual();
+                        inst.mark_unread();
                     } else {
                         inst.mark_read();
                     }
@@ -2686,7 +2687,7 @@ pub async fn update_session_unread(
             return persist_failed_response();
         };
         if mark_unread {
-            inst.mark_unread_manual();
+            inst.mark_unread();
         } else {
             inst.mark_read();
         }
@@ -6019,18 +6020,15 @@ mod tests {
 
     #[test]
     fn session_response_serializes_unread_marker() {
-        use crate::session::{Instance, UnreadKind};
+        use crate::session::Instance;
         let mut inst = Instance::new("t", "/tmp");
-        // Read: the field is omitted from the wire (skip_serializing_if None).
+        // Read: the field is omitted from the wire (skip_serializing_if false).
         let json = serde_json::to_value(SessionResponse::from_instance(&inst, false)).unwrap();
         assert!(json.get("unread").is_none());
-        // Manual / Auto serialize as lowercase strings the web maps directly.
-        inst.unread = Some(UnreadKind::Manual);
+        // Unread serializes as a bare boolean the web reads directly.
+        inst.unread = true;
         let json = serde_json::to_value(SessionResponse::from_instance(&inst, false)).unwrap();
-        assert_eq!(json["unread"], serde_json::json!("manual"));
-        inst.unread = Some(UnreadKind::Auto);
-        let json = serde_json::to_value(SessionResponse::from_instance(&inst, false)).unwrap();
-        assert_eq!(json["unread"], serde_json::json!("auto"));
+        assert_eq!(json["unread"], serde_json::json!(true));
     }
 
     fn step(
@@ -6933,7 +6931,7 @@ mod workspace_ordering_tests {
             pinned_at: None,
             archived_at: None,
             snoozed_until: None,
-            unread: None,
+            unread: false,
         }
     }
 

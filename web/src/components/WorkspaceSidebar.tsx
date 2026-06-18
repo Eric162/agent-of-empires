@@ -600,18 +600,16 @@ export const SessionRow = memo(function SessionRow({
   const isPinned = workspace.sessions.some((s) => s.pinned_at != null);
   const isArchived = workspace.sessions.some((s) => s.archived_at != null);
   const snoozedUntil = workspace.sessions.find((s) => s.snoozed_until)?.snoozed_until ?? null;
-  // Unread marker for the row, server value plus optimistic overlay. On the
-  // active (open) row, only an `auto` marker is suppressed: viewing reads it
-  // and the App clears it a beat later, so hiding it avoids a flash. A
-  // `manual` flag is a deliberate "look at this later" and must stay visible
-  // even while the session is selected.
-  const serverUnread = workspace.sessions.find((s) => s.unread)?.unread ?? null;
+  // Unread marker for the row, server value plus optimistic overlay. The
+  // active (open) row is always suppressed: opening reads it and the App
+  // clears it a beat later, so hiding it avoids a flash in the poll window.
+  const serverUnread = workspace.sessions.some((s) => s.unread === true);
   const effectiveUnread = effectiveUnreadOf(optimistic, serverUnread);
-  const isUnread = unreadIndicatorEnabled && effectiveUnread != null && !(isActive && effectiveUnread === "auto");
+  const isUnread = unreadIndicatorEnabled && effectiveUnread && !isActive;
   // Like the TUI, the unread marker *replaces* the resting status glyph with a
   // solid dot (rather than sitting beside the title). Only for resting states:
   // a live spinner (Running/Waiting/...) stays, since live status outranks it
-  // and auto-unread only ever lands on Idle anyway.
+  // and the auto-mark only ever lands on Idle anyway.
   const showUnreadGlyph = isUnread && (sessionStatus === "Idle" || sessionStatus === "Unknown");
   const sessionId = firstSession?.id;
   const navigationSessionId = runningSession?.id ?? firstSession?.id ?? null;
@@ -685,9 +683,9 @@ export const SessionRow = memo(function SessionRow({
 
   const toggleUnread = () => {
     setContextMenu(null);
-    // Mark unread when currently read, mark read when currently unread (either
-    // kind), mirroring the TUI `u` toggle.
-    onUnreadToggle(workspace, effectiveUnread == null);
+    // Mark unread when currently read, mark read when currently unread,
+    // mirroring the TUI `u` toggle.
+    onUnreadToggle(workspace, !effectiveUnread);
   };
 
   // Close the context menu first, then open the modal in the next
@@ -954,11 +952,7 @@ export const SessionRow = memo(function SessionRow({
             className={`text-sm shrink-0 leading-none font-mono ${showUnreadGlyph ? "text-status-unread font-semibold" : textClass}`}
           >
             {showUnreadGlyph ? (
-              <span
-                title={effectiveUnread === "manual" ? "Flagged unread" : "Unread: turn finished"}
-                aria-label="Unread"
-                data-testid="sidebar-unread-dot"
-              >
+              <span title="Unread" aria-label="Unread" data-testid="sidebar-unread-dot">
                 ●
               </span>
             ) : (
@@ -1291,7 +1285,7 @@ export const SessionRow = memo(function SessionRow({
                           className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
                         >
                           <CircleDot className="h-3.5 w-3.5 shrink-0" />
-                          {effectiveUnread != null ? "Mark as read" : "Mark as unread"}
+                          {effectiveUnread ? "Mark as read" : "Mark as unread"}
                         </button>
                       )}
                     </>

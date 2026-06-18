@@ -609,7 +609,7 @@ fn unread_dot_yields_to_a_running_status() {
     // Idle + unread: the row shows the solid unread dot.
     env.view.mutate_instance(&id, |inst| {
         inst.status = crate::session::Status::Idle;
-        inst.mark_unread_manual();
+        inst.mark_unread();
     });
     env.view.flat_items = env.view.build_flat_items();
     assert!(
@@ -624,6 +624,78 @@ fn unread_dot_yields_to_a_running_status() {
     assert!(
         !render(&mut env).contains('●'),
         "a running row must keep its spinner, not the unread dot"
+    );
+}
+
+/// Dwell-to-read: an unread row that stays selected past `UNREAD_DWELL`
+/// (with the list in the foreground) is cleared, distinguishing "stopped to
+/// read it" from "scrolled past."
+#[test]
+#[serial]
+fn unread_dwell_clears_after_threshold() {
+    use std::time::{Duration, Instant};
+    crate::session::set_unread_enabled(true);
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances()[0].id.clone();
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = crate::session::Status::Idle;
+        inst.mark_unread();
+    });
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.select_session_by_id(&id);
+    assert!(env.view.get_instance(&id).unwrap().is_unread());
+
+    let t0 = Instant::now();
+    // First tick arms the dwell clock; nothing cleared yet.
+    assert!(!env.view.tick_unread_dwell(t0));
+    assert!(env.view.get_instance(&id).unwrap().is_unread());
+    // Below the threshold: still unread (this is the "scrolled past" guard).
+    assert!(!env.view.tick_unread_dwell(t0 + Duration::from_millis(500)));
+    assert!(env.view.get_instance(&id).unwrap().is_unread());
+    // Past the threshold: cleared.
+    assert!(env
+        .view
+        .tick_unread_dwell(t0 + super::UNREAD_DWELL + Duration::from_millis(1)));
+    assert!(!env.view.get_instance(&id).unwrap().is_unread());
+}
+
+/// Moving the selection to a different row before the dwell completes spares
+/// the first row: arrowing through a list doesn't read everything you pass.
+#[test]
+#[serial]
+fn unread_dwell_resets_on_selection_change() {
+    use std::time::{Duration, Instant};
+    crate::session::set_unread_enabled(true);
+    let mut env = create_test_env_with_sessions(2);
+    let a = env.view.instances()[0].id.clone();
+    let b = env.view.instances()[1].id.clone();
+    for id in [&a, &b] {
+        env.view.mutate_instance(id, |inst| {
+            inst.status = crate::session::Status::Idle;
+            inst.mark_unread();
+        });
+    }
+    env.view.flat_items = env.view.build_flat_items();
+
+    let t0 = Instant::now();
+    // Arm the dwell clock on A.
+    env.view.select_session_by_id(&a);
+    assert!(!env.view.tick_unread_dwell(t0));
+    // Move to B well before A's threshold; A's clock is dropped, B's arms.
+    env.view.select_session_by_id(&b);
+    assert!(!env.view.tick_unread_dwell(t0 + Duration::from_millis(500)));
+    // Long after, B has now dwelled past the threshold and clears; A, which we
+    // left early, is untouched.
+    assert!(env
+        .view
+        .tick_unread_dwell(t0 + super::UNREAD_DWELL + Duration::from_secs(2)));
+    assert!(
+        env.view.get_instance(&a).unwrap().is_unread(),
+        "row left before the threshold must stay unread"
+    );
+    assert!(
+        !env.view.get_instance(&b).unwrap().is_unread(),
+        "row dwelled past the threshold must be cleared"
     );
 }
 
@@ -5483,7 +5555,7 @@ fn update_bar_renders_status_toast_without_update_info() {
     );
 }
 
-/// The sandbox-image update banner renders (with its `[U] pull` /
+/// The sandbox-image update banner renders (with its `[u] pull` /
 /// `[Ctrl+x] dismiss` hints) when an `ImageUpdate` is present and no
 /// higher-priority banner is up. Guards the lowest-priority slot in
 /// `render_update_bar`.
@@ -5527,15 +5599,15 @@ fn update_bar_renders_sandbox_image_banner() {
         "expected the sandbox image banner to render.\nFull buffer:\n{out}"
     );
     assert!(
-        out.contains("[U] pull") && out.contains("[Ctrl+x] dismiss"),
+        out.contains("[u] pull") && out.contains("[Ctrl+x] dismiss"),
         "expected the pull/dismiss hints alongside the image banner.\nFull buffer:\n{out}"
     );
 }
 
 /// The app-update banner wins the shared bottom row over a pending
 /// sandbox-image update: only one shows at a time, so the lower-priority
-/// image banner must stay hidden (and its `[U] pull` hint absent) while an
-/// app update is up. This is what keeps the `U` / Ctrl+x keys unambiguous.
+/// image banner must stay hidden (and its `[u] pull` hint absent) while an
+/// app update is up. This is what keeps the `u` / Ctrl+x keys unambiguous.
 #[test]
 #[serial]
 fn app_update_banner_takes_precedence_over_image_banner() {

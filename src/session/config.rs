@@ -1021,9 +1021,9 @@ pub struct SessionConfig {
     /// Show an unread indicator on sessions. When on (default), a session
     /// whose turn just finished is painted in the theme's unread color until
     /// you view it (Tab into live-send or Enter to attach), and you can flag
-    /// a session unread for later with `u`; unread rows also sort just below
+    /// a session unread for later with `U`; unread rows also sort just below
     /// Waiting in the Attention sort. Turn this off to disable the indicator,
-    /// the auto-marking, and the `u` toggle entirely.
+    /// the auto-marking, and the `U` toggle entirely.
     ///
     /// `global_only`: the gate is a single process-wide flag
     /// (`crate::session::unread_enabled`), refreshed from the active profile's

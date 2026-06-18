@@ -408,13 +408,13 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   }, [commentSendEnabled, diffComments.count]);
 
   // Clear-on-view: opening a session (or having it open when its turn
-  // finishes) reads it. Fire only for an `auto` marker, so a deliberate
-  // `manual` flag survives being viewed, matching the TUI's `mark_read_auto`.
-  // The sidebar separately hides the chip for the active row, so there's no
-  // flash in the ~poll window before this lands.
+  // finishes) reads it, clearing the unread marker. Mirrors the TUI, where
+  // engaging with a session (open / live-send / dwell) clears it. The sidebar
+  // separately hides the chip for the active row, so there's no flash in the
+  // ~poll window before this lands.
   const unreadIndicatorEnabled = useUnreadIndicatorEnabled();
   useEffect(() => {
-    if (unreadIndicatorEnabled && activeSessionId && activeSession?.unread === "auto") {
+    if (unreadIndicatorEnabled && activeSessionId && activeSession?.unread) {
       void setSessionUnread(activeSessionId, false);
     }
   }, [unreadIndicatorEnabled, activeSessionId, activeSession?.unread]);

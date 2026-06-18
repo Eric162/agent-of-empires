@@ -600,12 +600,15 @@ pub static BINDINGS: &[Binding] = &[
             serve_only: false,
         }),
     },
-    // `u` toggles read/unread; `U` updates (when available). They're the
-    // primary/secondary pair on the `u` letter, so the standard relocation
-    // applies in strict mode: unread -> `U`, update -> `Ctrl+U`.
+    // `U` toggles read/unread, pinned to Shift+u in BOTH modes (matches the
+    // macOS Mail "mark unread" muscle memory and keeps the key stable). It does
+    // NOT participate in the strict relocation: `U` is already a modified key,
+    // so it satisfies strict mode's "no bare action letters" rule as-is.
+    // `u` updates (when available) and relocates the usual way: bare `u` in
+    // non-strict, `Ctrl+u` in strict.
     Binding {
         id: ActionId::ToggleUnread,
-        non_strict: &[k('u')],
+        non_strict: &[k('U')],
         strict: &[k('U')],
         context: Context::UnreadEnabled,
         help: Some(HelpMeta {
@@ -621,7 +624,7 @@ pub static BINDINGS: &[Binding] = &[
     },
     Binding {
         id: ActionId::Update,
-        non_strict: &[k('U')],
+        non_strict: &[k('u')],
         strict: &[ctrl('u')],
         context: Context::Always,
         help: Some(HelpMeta {
@@ -791,8 +794,9 @@ mod tests {
             ('o', ActionId::SortPicker),
             ('g', ActionId::GroupBy),
             ('q', ActionId::Quit),
-            // No update available in `ctx()`, so `u` falls through to unread.
-            ('u', ActionId::ToggleUnread),
+            // `u` is Update (unread lives on Shift+U); resolves regardless of
+            // whether an update is actually available.
+            ('u', ActionId::Update),
         ];
         for (ch, want) in cases {
             assert_eq!(
@@ -804,30 +808,30 @@ mod tests {
     }
 
     #[test]
-    fn u_toggles_unread_and_shift_u_updates() {
+    fn shift_u_toggles_unread_in_both_modes_and_u_updates() {
         let c = ctx();
-        // Non-strict: u = unread, U = update.
-        assert_eq!(
-            resolve(&key('u'), false, &c),
-            Some(ActionId::ToggleUnread),
-            "non-strict u"
-        );
+        // Unread is pinned to Shift+U regardless of strict mode.
         assert_eq!(
             resolve(&key('U'), false, &c),
-            Some(ActionId::Update),
-            "non-strict U"
+            Some(ActionId::ToggleUnread),
+            "non-strict U = unread"
         );
-        // Strict relocation: unread (primary) moves to U, update (secondary)
-        // to Ctrl+U.
         assert_eq!(
             resolve(&key('U'), true, &c),
             Some(ActionId::ToggleUnread),
-            "strict U"
+            "strict U = unread"
+        );
+        // Update relocates the usual way: bare `u` in non-strict, `Ctrl+u`
+        // in strict (and never collides with unread on `U`).
+        assert_eq!(
+            resolve(&key('u'), false, &c),
+            Some(ActionId::Update),
+            "non-strict u = update"
         );
         assert_eq!(
             resolve(&ctrl_key('u'), true, &c),
             Some(ActionId::Update),
-            "strict Ctrl+u"
+            "strict Ctrl+u = update"
         );
     }
 

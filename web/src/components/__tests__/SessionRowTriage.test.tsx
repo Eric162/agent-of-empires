@@ -558,7 +558,7 @@ describe("SessionRow triage actions", () => {
 
 describe("SessionRow unread", () => {
   it("renders the unread dot for an unread row", () => {
-    const ws = workspace("w-unread", [session({ id: "s-u", unread: "auto" })]);
+    const ws = workspace("w-unread", [session({ id: "s-u", unread: true })]);
     render(
       <Wrap>
         <Row ws={ws} />
@@ -567,24 +567,14 @@ describe("SessionRow unread", () => {
     expect(screen.queryByTestId("sidebar-unread-dot")).not.toBeNull();
   });
 
-  it("suppresses an auto-unread dot on the active row (viewing reads it)", () => {
-    const ws = workspace("w-unread", [session({ id: "s-u", unread: "auto" })]);
+  it("suppresses the unread dot on the active row (opening reads it)", () => {
+    const ws = workspace("w-unread", [session({ id: "s-u", unread: true })]);
     render(
       <Wrap>
         <Row ws={ws} isActive />
       </Wrap>,
     );
     expect(screen.queryByTestId("sidebar-unread-dot")).toBeNull();
-  });
-
-  it("keeps a manual-unread dot on the active row (deliberate flag persists)", () => {
-    const ws = workspace("w-unread", [session({ id: "s-m", unread: "manual" })]);
-    render(
-      <Wrap>
-        <Row ws={ws} isActive />
-      </Wrap>,
-    );
-    expect(screen.queryByTestId("sidebar-unread-dot")).not.toBeNull();
   });
 
   it("menu offers 'Mark as unread' for a read row and 'Mark as read' for an unread row", () => {
@@ -598,7 +588,7 @@ describe("SessionRow unread", () => {
     expect(screen.getByTestId("sidebar-context-menu-unread").textContent).toContain("Mark as unread");
     unmount();
 
-    const unread = workspace("w-unread", [session({ id: "s-unread", unread: "manual" })]);
+    const unread = workspace("w-unread", [session({ id: "s-unread", unread: true })]);
     render(
       <Wrap>
         <Row ws={unread} />
@@ -627,7 +617,7 @@ describe("SessionRow unread", () => {
   });
 
   it("'Mark as read' on an unread row fires { unread: false }", async () => {
-    const ws = workspace("w-unread", [session({ id: "sess-read-it", unread: "manual" })]);
+    const ws = workspace("w-unread", [session({ id: "sess-read-it", unread: true })]);
     render(
       <Wrap>
         <Row ws={ws} />
@@ -642,7 +632,7 @@ describe("SessionRow unread", () => {
   });
 
   it("hides the unread dot and menu item when the feature is disabled", () => {
-    const ws = workspace("w-unread", [session({ id: "s-off", unread: "auto" })]);
+    const ws = workspace("w-unread", [session({ id: "s-off", unread: true })]);
     render(
       <Wrap>
         <UnreadIndicatorContext.Provider value={false}>

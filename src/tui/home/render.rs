@@ -2876,13 +2876,13 @@ impl HomeView {
         image_update: Option<&ImageUpdate>,
     ) {
         let update_style = Style::default().fg(theme.waiting).bold();
-        // The Update key is `U` (`Ctrl+U` in strict mode); pull the label from
+        // The Update key is `u` (`Ctrl+u` in strict mode); pull the label from
         // the binding registry so this hint can't drift from the dispatcher.
         let update_key =
             super::bindings::label(super::bindings::ActionId::Update, self.strict_hotkeys);
         // Precedence (highest first): transient status, app update, then the
         // sandbox-image update. Only one banner shows at a time, so its keys
-        // ([U]/[Ctrl+x]) are unambiguous; a lower-priority banner surfaces once
+        // ([u]/[Ctrl+x]) are unambiguous; a lower-priority banner surfaces once
         // the ones above it clear.
         let text = if let Some(s) = status {
             format!(" {s}  [Ctrl+x] dismiss")

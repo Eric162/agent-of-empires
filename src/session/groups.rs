@@ -1974,7 +1974,7 @@ mod tests {
         let mut unread_idle = Instance::new("ui", "/tmp/ui");
         unread_idle.group_path = "b".to_string();
         unread_idle.status = crate::session::Status::Idle;
-        unread_idle.mark_unread_auto();
+        unread_idle.mark_unread();
 
         let key_a = attention_group_key("a", None, std::slice::from_ref(&err));
         let key_b = attention_group_key("b", None, std::slice::from_ref(&unread_idle));
@@ -1998,7 +1998,7 @@ mod tests {
         let mut archived_unread = Instance::new("au", "/tmp/au");
         archived_unread.group_path = "g".to_string();
         archived_unread.status = crate::session::Status::Idle;
-        archived_unread.mark_unread_auto();
+        archived_unread.mark_unread();
         archived_unread.archive(); // archived_at set; unread intentionally kept
 
         let members = vec![active_read.clone(), archived_unread];
