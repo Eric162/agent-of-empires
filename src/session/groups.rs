@@ -692,7 +692,15 @@ fn attention_group_key(
     // containing an unread session floats up just like the flat Attention
     // view does (a group with an unread Idle outranks a group whose best
     // member is a read Error). Mirrors `attention_session_key`'s rank.
-    let unread = members.iter().any(|i| i.is_unread());
+    //
+    // Only non-sunk members count: archive/snooze don't clear `unread`, so an
+    // archived or snoozed (tier-99) member must not promote the group, or a
+    // dismissed session would drag its group back to the top. This matches the
+    // session key, which short-circuits tier-99 rows before the unread rank.
+    let unread = members
+        .iter()
+        .filter(|i| attention_tier(i) != 99)
+        .any(|i| i.is_unread());
     let rank = attention_rank(min_tier, unread, crate::session::unread_enabled());
     (
         !urgent_bias,
@@ -1973,6 +1981,43 @@ mod tests {
         assert!(
             key_b < key_a,
             "group with an unread Idle must outrank a group whose best member is a read Error: b={key_b:?} a={key_a:?}"
+        );
+    }
+
+    #[test]
+    fn test_attention_group_key_sunk_unread_member_does_not_promote() {
+        // A group with one active *read* Idle member and one *archived* member
+        // that still carries an unread marker (archive doesn't clear `unread`)
+        // must NOT be promoted: the dismissed member can't drag the group up.
+        // Rank should be the plain Idle bucket, identical to the same group
+        // without any unread anywhere.
+        let mut active_read = Instance::new("ar", "/tmp/ar");
+        active_read.group_path = "g".to_string();
+        active_read.status = crate::session::Status::Idle;
+
+        let mut archived_unread = Instance::new("au", "/tmp/au");
+        archived_unread.group_path = "g".to_string();
+        archived_unread.status = crate::session::Status::Idle;
+        archived_unread.mark_unread_auto();
+        archived_unread.archive(); // archived_at set; unread intentionally kept
+
+        let members = vec![active_read.clone(), archived_unread];
+        let key = attention_group_key("g", None, &members);
+
+        // Same group but with the second member simply read: ranks identical,
+        // proving the sunk unread member contributed nothing.
+        let read_baseline = vec![active_read.clone(), {
+            let mut other = Instance::new("o", "/tmp/o");
+            other.group_path = "g".to_string();
+            other.status = crate::session::Status::Idle;
+            other.archive();
+            other
+        }];
+        let baseline = attention_group_key("g", None, &read_baseline);
+        assert_eq!(
+            key.1, baseline.1,
+            "an archived unread member must not promote the group: rank={} baseline={}",
+            key.1, baseline.1
         );
     }
 
