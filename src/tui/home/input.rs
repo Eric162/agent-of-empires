@@ -3262,9 +3262,13 @@ impl HomeView {
                 _ => continue,
             };
             if let Some(inst) = self.get_instance(&id) {
-                let is_actionable = inst.status == Status::Waiting
-                    || matches!(inst.idle_age(), Some(age) if age < window)
-                    || (crate::session::unread_enabled() && inst.is_unread());
+                // Trashed rows are stopped and only surface under the collapsed
+                // Trash section; they never "need attention", so skip them even
+                // when a stale unread flag survived the trash (#2489).
+                let is_actionable = !inst.is_trashed()
+                    && (inst.status == Status::Waiting
+                        || matches!(inst.idle_age(), Some(age) if age < window)
+                        || (crate::session::unread_enabled() && inst.is_unread()));
                 if is_actionable {
                     self.cursor = idx;
                     self.update_selected();
@@ -3288,6 +3292,9 @@ impl HomeView {
             let Some(inst) = self.get_instance(&id) else {
                 continue;
             };
+            if inst.is_trashed() {
+                continue;
+            }
             if inst.status != Status::Idle {
                 continue;
             }

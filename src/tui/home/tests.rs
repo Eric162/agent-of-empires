@@ -7175,6 +7175,78 @@ fn trash_then_restore_round_trip() {
     );
 }
 
+/// Regression for #2489: trashing a session must not re-expand a Trash
+/// section the user has collapsed. Like single-row archive, the section
+/// header's count is the feedback; the collapse state is left untouched.
+#[test]
+#[serial]
+fn trashing_leaves_collapsed_trash_section_collapsed() {
+    let mut env = create_test_env_with_sessions(2);
+    assert!(
+        env.view.trashed_section_collapsed,
+        "Trash section defaults to collapsed"
+    );
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    env.view.trash_session_by_id(&id);
+
+    assert!(
+        env.view.get_instance(&id).unwrap().is_trashed(),
+        "session must be trashed"
+    );
+    assert!(
+        env.view.trashed_section_collapsed,
+        "trashing must not re-expand a collapsed Trash section"
+    );
+}
+
+/// Regression for #2489: `w` (jump to next needing-attention) must skip
+/// trashed rows even when a stale unread flag survived the trash. A trashed
+/// session is stopped and only lives under the Trash section, so it never
+/// "needs attention".
+#[test]
+#[serial]
+fn w_skips_unread_trashed_session() {
+    use crate::session::Status;
+    crate::session::set_unread_enabled(true);
+    let mut env = create_test_env_with_sessions(2);
+    // Non-strict so bare `w` routes to the jump handler, not the typing guard.
+    env.view.strict_hotkeys = false;
+    // Keep the Trash section expanded so the trashed row lands in `flat_items`;
+    // that is the only way `w`'s walk could reach it.
+    env.view.trashed_section_collapsed = false;
+
+    let trashed = env.view.instances[0].id.clone();
+    let active = env.view.instances[1].id.clone();
+    // The surviving active row is a plain idle session (the pass-2 fallback);
+    // the trashed row carries an unread flag, as it would after being trashed
+    // while unread.
+    env.view
+        .mutate_instance(&active, |inst| inst.status = Status::Idle);
+    env.view
+        .mutate_instance(&trashed, |inst| inst.mark_unread());
+    env.view.trash_session_by_id(&trashed);
+    assert!(env.view.get_instance(&trashed).unwrap().is_trashed());
+    assert!(
+        env.view.get_instance(&trashed).unwrap().is_unread(),
+        "the trashed row must still carry the unread flag for this regression"
+    );
+
+    env.view.select_session_by_id(&active);
+    env.view.handle_key(key(KeyCode::Char('w')), None);
+
+    let landed = match env.view.flat_items.get(env.view.cursor) {
+        Some(Item::Session { id, .. }) => Some(id.clone()),
+        _ => None,
+    };
+    assert_ne!(
+        landed.as_deref(),
+        Some(trashed.as_str()),
+        "`w` must not land on a trashed session even when it is unread"
+    );
+}
+
 #[test]
 #[serial]
 fn d_on_session_with_default_trash_persists_trash_marker() {

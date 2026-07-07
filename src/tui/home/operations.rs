@@ -1458,8 +1458,9 @@ impl HomeView {
     /// Move a session to the trash: stop its tmux sessions (a structured-view
     /// worker is reaped by the daemon reconciler once the row reads trashed)
     /// and set `trashed_at`. Durable artifacts are kept so it can be
-    /// restored. The Trash section is revealed so the user sees where the row
-    /// went. See #2489.
+    /// restored. The Trash section's collapse state is left untouched: like
+    /// single-row archive, the section header's count is the feedback, so a
+    /// user who collapsed it stays collapsed (#2489).
     pub(super) fn trash_session_by_id(&mut self, id: &str) {
         if let Err(e) = self.apply_user_action(id, |inst| inst.trash()) {
             tracing::warn!(target: "tui.session", session = %id, "trash failed: {e}");
@@ -1483,7 +1484,6 @@ impl HomeView {
         if let Some(reason) = relocate_warning {
             tracing::warn!(target: "tui.session", session = %id, "trash worktree relocation skipped: {reason}");
         }
-        self.reveal_trashed_section();
         self.rebuild_flat_items();
         self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
         self.update_selected();

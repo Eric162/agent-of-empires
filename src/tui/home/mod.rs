@@ -4081,12 +4081,6 @@ impl HomeView {
         });
     }
 
-    /// Expand the synthetic Trash section if collapsed. Used when trashing a
-    /// session so the user sees where the row went. No-op when already open.
-    pub(super) fn reveal_trashed_section(&mut self) {
-        self.trashed_section_collapsed = false;
-    }
-
     pub fn toggle_trashed_section(&mut self) {
         self.trashed_section_collapsed = !self.trashed_section_collapsed;
         self.rebuild_flat_items();
