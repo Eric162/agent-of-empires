@@ -1649,6 +1649,15 @@ impl Instance {
         self.status = src.status;
         self.last_accessed_at = self.last_accessed_at.max(src.last_accessed_at);
         self.idle_entered_at = src.idle_entered_at;
+        // Launch-config fields are TUI-authoritative and only mutated after
+        // creation by the restart dialog (engine / command / args swap). They
+        // have no peer writer, so a plain copy is safe. Syncing them here is
+        // required: `reconcile_from_disk`'s `*self = disk` reload runs on every
+        // launch, so a swap that never reached disk is silently reverted and
+        // the session respawns with its original tool. See #switching-tools.
+        self.tool = src.tool.clone();
+        self.command = src.command.clone();
+        self.extra_args = src.extra_args.clone();
     }
 
     /// Apply a passively-detected status transition to a disk row. Touches
@@ -7404,6 +7413,30 @@ mod tests {
             stored.base_branch_override.as_deref(),
             Some("upstream/main")
         );
+    }
+
+    #[test]
+    fn test_merge_from_tui_syncs_launch_config_swap() {
+        // The restart dialog mutates tool/command/extra_args in the TUI's
+        // in-memory row. save() -> merge_from_tui must carry those onto disk,
+        // otherwise reconcile_from_disk reverts the swap on the next launch and
+        // the session respawns with its original tool.
+        let mut stored = Instance::new("session", "/tmp/test");
+        stored.tool = "claude".to_string();
+        stored.command = String::new();
+        stored.extra_args = String::new();
+
+        let mut src = Instance::new("session", "/tmp/test");
+        src.id = stored.id.clone();
+        src.tool = "codex".to_string();
+        src.command = "codex-wrapper".to_string();
+        src.extra_args = "--foo".to_string();
+
+        stored.merge_from_tui(&src);
+
+        assert_eq!(stored.tool, "codex");
+        assert_eq!(stored.command, "codex-wrapper");
+        assert_eq!(stored.extra_args, "--foo");
     }
 
     #[test]
