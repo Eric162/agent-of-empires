@@ -3712,6 +3712,9 @@ impl App {
         // preview geometry against the now-grown window instead of leaving the
         // top clipped.
         tmux_session.reset_size_to_latest_client();
+        // Attaching a paired terminal leaves its tab as this session's current
+        // window; an agent attach must come back to the agent's own tab.
+        tmux_session.focus_own_window();
         self.home.clear_preview_pane_sync();
         let (attach_result, attached_status_updates) =
             self.with_attached_status_hooks(terminal, || tmux_session.attach())?;
@@ -3765,6 +3768,21 @@ impl App {
         // Get terminal size to pass to tmux session creation
         let size = crate::terminal::get_size();
 
+        // Under `AOE_USE_SHARED_TMUX_SESSION` the paired terminal's window is
+        // linked into the agent's session, so attach there and select the tab:
+        // attaching the terminal's own session would show a single window and no
+        // tab strip, defeating the point. `None` (no agent tmux session, e.g. a
+        // structured/ACP session) keeps the standalone attach.
+        let host_session = if crate::tmux::use_shared_tmux_session() {
+            instance
+                .tmux_session()
+                .ok()
+                .filter(|s| s.exists())
+                .map(|s| s.name().to_string())
+        } else {
+            None
+        };
+
         // Prepare the tmux session before leaving TUI mode
         let attach_fn: Box<dyn FnOnce() -> Result<()>> = match mode {
             TerminalMode::Container if instance.is_sandboxed() => {
@@ -3782,7 +3800,10 @@ impl App {
                         return Ok(());
                     }
                 }
-                Box::new(move || container_session.attach())
+                match host_session {
+                    Some(host) => Box::new(move || container_session.attach_via_host(&host)),
+                    None => Box::new(move || container_session.attach()),
+                }
             }
             _ => {
                 let terminal_session = instance.terminal_tmux_session()?;
@@ -3799,7 +3820,10 @@ impl App {
                         return Ok(());
                     }
                 }
-                Box::new(move || terminal_session.attach())
+                match host_session {
+                    Some(host) => Box::new(move || terminal_session.attach_via_host(&host)),
+                    None => Box::new(move || terminal_session.attach()),
+                }
             }
         };
 
@@ -3884,6 +3908,7 @@ impl App {
             &format!("{} ({})", instance.title, tool_name),
             branch,
             None,
+            Some(tool_name),
         );
 
         let attach_fn: Box<dyn FnOnce() -> Result<()>> = Box::new(move || tool_session.attach());

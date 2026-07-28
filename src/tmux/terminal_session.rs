@@ -218,6 +218,14 @@ impl PairedTerminal {
             process::kill_process_tree(pane_pid);
         }
 
+        // Kill the window before the session. `kill-session` alone would leave a
+        // window that is linked into the paired agent session alive there, as a
+        // stranded dead-pane tab, and the next terminal start would then append a
+        // second tab beside it. Killing the window drops the tab from every
+        // session holding it; tmux destroys a session left with no windows, so
+        // this subsumes the session kill in the common single-window case and the
+        // call below only matters if the user split off extra windows.
+        super::utils::kill_first_window(&self.name);
         super::utils::kill_session_if_present(&self.name)?;
 
         refresh_session_cache();
@@ -259,6 +267,24 @@ impl PairedTerminal {
         }
 
         Ok(())
+    }
+
+    /// Attach so this terminal is visible as a tab of `host_session` (the paired
+    /// agent session) rather than on its own. Selects the linked window there,
+    /// then hands off to the agent session's own attach, which is what makes the
+    /// tab strip visible at all.
+    ///
+    /// Falls back to [`Self::attach`] whenever the window is not actually linked
+    /// into the host, so a failed or skipped `link-window` still yields a usable
+    /// terminal instead of an error.
+    fn attach_via_host(&self, host_session: &str) -> Result<()> {
+        if !self.exists() {
+            bail!("{} does not exist: {}", self.kind.label(), self.name);
+        }
+        if !crate::tmux::select_linked_window(host_session, &self.name) {
+            return self.attach();
+        }
+        super::Session::from_name(host_session).attach()
     }
 
     fn capture_window_composited(&self, lines: usize) -> Result<String> {
@@ -343,6 +369,10 @@ impl TerminalSession {
         self.inner.attach()
     }
 
+    pub fn attach_via_host(&self, host_session: &str) -> Result<()> {
+        self.inner.attach_via_host(host_session)
+    }
+
     /// Preview capture with the window's other panes composited in; see
     /// [`super::Session::capture_window_composited`].
     pub fn capture_window_composited(&self, lines: usize) -> Result<String> {
@@ -422,6 +452,10 @@ impl ContainerTerminalSession {
         self.inner.attach()
     }
 
+    pub fn attach_via_host(&self, host_session: &str) -> Result<()> {
+        self.inner.attach_via_host(host_session)
+    }
+
     /// Preview capture with the window's other panes composited in; see
     /// [`super::Session::capture_window_composited`].
     pub fn capture_window_composited(&self, lines: usize) -> Result<String> {
@@ -435,41 +469,54 @@ impl ContainerTerminalSession {
 /// web tabs (`_t{N}` suffixes) and any title-change orphans are all reaped on
 /// session teardown. Mirrors [`crate::tmux::kill_all_tool_sessions_for_id`].
 pub fn kill_all_terminals_for_id(id: &str) {
-    let needle = format!("_{}", truncate_id(id, 8));
-
-    let output = crate::tmux::tmux_command()
-        .args(["list-sessions", "-F", "#{session_name}"])
-        .output();
-
-    if let Ok(out) = output {
-        if out.status.success() {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            for line in stdout.lines() {
-                if !line.starts_with(TERMINAL_PREFIX)
-                    && !line.starts_with(CONTAINER_TERMINAL_PREFIX)
-                {
-                    continue;
-                }
-                // The id segment is at the end for index 0, or immediately
-                // before the `_t{N}` suffix for additional terminals.
-                let Some(pos) = line.rfind(&needle) else {
-                    continue;
-                };
-                let after = &line[pos + needle.len()..];
-                if !after.is_empty() && !after.starts_with("_t") {
-                    continue;
-                }
-                if let Some(pid) = process::get_pane_pid(line) {
-                    process::kill_process_tree(pid);
-                }
-                let _ = crate::tmux::tmux_command()
-                    .args(["kill-session", "-t", line])
-                    .output();
-            }
+    for name in paired_terminal_sessions_for_id(id) {
+        if let Some(pid) = process::get_pane_pid(&name) {
+            process::kill_process_tree(pid);
         }
+        // Window before session, for the same reason as `PairedTerminal::kill`:
+        // a window linked into the agent session outlives `kill-session`.
+        crate::tmux::kill_first_window(&name);
+        let _ = crate::tmux::tmux_command()
+            .args(["kill-session", "-t", &name])
+            .output();
     }
 
     refresh_session_cache();
+}
+
+/// Live paired terminal tmux session names (host and container, any index)
+/// belonging to `id`, discovered by scanning tmux rather than from persisted
+/// state: only index 0 is cached on the `Instance`, so the multi-terminal web
+/// tabs (`_t{N}`) and any title-change orphans are otherwise invisible.
+pub fn paired_terminal_sessions_for_id(id: &str) -> Vec<String> {
+    let needle = format!("_{}", truncate_id(id, 8));
+
+    let Ok(out) = crate::tmux::tmux_command()
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| {
+            if !line.starts_with(TERMINAL_PREFIX) && !line.starts_with(CONTAINER_TERMINAL_PREFIX) {
+                return false;
+            }
+            // The id segment is at the end for index 0, or immediately
+            // before the `_t{N}` suffix for additional terminals.
+            let Some(pos) = line.rfind(&needle) else {
+                return false;
+            };
+            let after = &line[pos + needle.len()..];
+            after.is_empty() || after.starts_with("_t")
+        })
+        .map(str::to_string)
+        .collect()
 }
 
 #[cfg(test)]

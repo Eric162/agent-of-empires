@@ -1418,6 +1418,9 @@ async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         );
     }
 
+    // Land on the agent's own tab, not whichever paired-terminal tab was last
+    // viewed under `AOE_USE_SHARED_TMUX_SESSION`.
+    tmux_session.focus_own_window();
     tmux_session.attach()?;
     Ok(())
 }

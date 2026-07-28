@@ -1105,6 +1105,24 @@ impl Session {
     /// the policy `append_window_size_args` installs at session create.
     /// Best-effort: failures (session gone, tmux ENOENT) are swallowed
     /// so a stuck pane never blocks the user's exit from live mode.
+    /// Focus this session's own window before attaching, so an agent attach lands
+    /// on the agent and not on whichever tab was last viewed.
+    ///
+    /// Only meaningful under `AOE_USE_SHARED_TMUX_SESSION`, where paired terminals
+    /// are tabs of this session: attaching a terminal selects its tab, and tmux
+    /// persists that as the session's current window, so the next agent attach
+    /// would otherwise resume on the terminal.
+    ///
+    /// Deliberately a separate call rather than part of [`Self::attach`], because
+    /// the paired-terminal attach routes *through* this session's `attach` after
+    /// selecting the terminal's tab on purpose; folding this in would override it.
+    pub fn focus_own_window(&self) {
+        if !crate::tmux::use_shared_tmux_session() {
+            return;
+        }
+        crate::tmux::select_first_window(&self.name);
+    }
+
     pub fn reset_size_to_latest_client(&self) {
         if !self.exists() {
             return;

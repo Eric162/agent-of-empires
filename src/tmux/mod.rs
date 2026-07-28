@@ -21,9 +21,15 @@ pub(crate) use status_detection::{
     reconcile_claude_hook_status, reconcile_claude_idle_hook_status, reconcile_codex_hook_status,
     reconcile_waiting_hook,
 };
-pub use terminal_session::{kill_all_terminals_for_id, ContainerTerminalSession, TerminalSession};
+pub use terminal_session::{
+    kill_all_terminals_for_id, paired_terminal_sessions_for_id, ContainerTerminalSession,
+    TerminalSession,
+};
 pub use tool_session::{kill_all_tool_sessions_for_id, ToolSession};
-pub use utils::tmux_prefix_display;
+pub use utils::{
+    kill_first_window, link_window_into, select_first_window, select_linked_window,
+    set_window_name, tmux_prefix_display,
+};
 
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
@@ -205,6 +211,24 @@ pub const TOOL_PREFIX: &str = if cfg!(debug_assertions) {
 } else {
     "aoe_tool_"
 };
+
+/// Experimental: render an agent and its paired terminals as tabs (tmux
+/// windows) of a single attached session instead of separate sessions the user
+/// has to switch between.
+///
+/// Each surface still gets its own tmux session, so every existing
+/// `<session>:^.0` pane target keeps resolving; the paired terminal's window is
+/// additionally `link-window`'d into the agent's session, which is how one tmux
+/// window comes to belong to two sessions. That keeps the change additive: no
+/// pane targeting, session-scoped `@aoe_*` lock, or kill path has to change.
+///
+/// Gated on `AOE_USE_SHARED_TMUX_SESSION` while we decide whether to keep it.
+/// Read uncached so tests (and a user mid-session) can toggle it.
+pub fn use_shared_tmux_session() -> bool {
+    std::env::var("AOE_USE_SHARED_TMUX_SESSION")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
 
 /// Pre-fetched pane metadata from a single `tmux list-panes -a` call.
 #[derive(Debug, Clone)]
@@ -1083,6 +1107,33 @@ mod tests {
     // (`aoe_`) and debug (`aoe_dev_`) builds. Use the constant so the same
     // test bodies cover both.
     const P: &str = SESSION_PREFIX;
+
+    /// The shared-session model is opt-in while we evaluate it, so an unset or
+    /// unrecognized `AOE_USE_SHARED_TMUX_SESSION` must leave every existing user
+    /// on the separate-session behavior.
+    #[test]
+    #[serial_test::serial]
+    fn use_shared_tmux_session_is_opt_in() {
+        let key = "AOE_USE_SHARED_TMUX_SESSION";
+        let original = std::env::var(key).ok();
+
+        std::env::remove_var(key);
+        assert!(!use_shared_tmux_session(), "must default to off");
+
+        for on in ["1", "true", "TRUE"] {
+            std::env::set_var(key, on);
+            assert!(use_shared_tmux_session(), "`{on}` should enable it");
+        }
+        for off in ["0", "", "yes", "off"] {
+            std::env::set_var(key, off);
+            assert!(!use_shared_tmux_session(), "`{off}` should not enable it");
+        }
+
+        match original {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
 
     #[test]
     fn test_tmux_command_carries_socket_flag() {

@@ -77,6 +77,24 @@ pub fn apply_status_bar(
     )?;
     set_session_option(session_name, "status-left-length", "50")?;
 
+    // With shared sessions the window list is the tab strip, so it has to match
+    // the themed bar; tmux's default `#I:#W#{?window_flags,...}` renders raw
+    // index-and-flag noise against aoe's colors. Left untouched when the flag is
+    // off, where there is only ever one window and no tabs to style.
+    if crate::tmux::use_shared_tmux_session() {
+        set_session_option(session_name, "window-status-separator", " ")?;
+        set_session_option(
+            session_name,
+            "window-status-format",
+            &format!(" #[fg={hint}]#W "),
+        )?;
+        set_session_option(
+            session_name,
+            "window-status-current-format",
+            &format!(" #[fg={accent},bold]#W#[fg={fg},nobold] "),
+        )?;
+    }
+
     Ok(())
 }
 
@@ -124,9 +142,20 @@ pub fn apply_all_tmux_options(
     title: &str,
     branch: Option<&str>,
     sandbox: Option<&SandboxDisplay>,
+    window_name: Option<&str>,
 ) {
     use crate::session::config::{should_apply_tmux_mouse, should_apply_tmux_status_bar};
     use crate::tui::styles::load_theme;
+
+    // Naming is only meaningful once surfaces share a session and the tab list
+    // is visible, so it rides the same experimental flag. Deliberately outside
+    // the status-bar preference below: the window name is tmux state, not aoe
+    // chrome, so a user running their own status config still gets real labels.
+    if crate::tmux::use_shared_tmux_session() {
+        if let Some(name) = window_name {
+            crate::tmux::set_window_name(session_name, name);
+        }
+    }
 
     if should_apply_tmux_status_bar() {
         // Theme is a global preference; match the TUI's empty-name fallback
@@ -153,6 +182,9 @@ pub fn apply_all_tmux_options(
             "status-right",
             "status-right-length",
             "status-style",
+            "window-status-separator",
+            "window-status-format",
+            "window-status-current-format",
         ] {
             let _ = set_session_option_unset(session_name, option);
         }

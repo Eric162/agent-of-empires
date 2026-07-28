@@ -38,6 +38,27 @@ pub struct TerminalInfo {
     pub created: bool,
 }
 
+/// Tab label for a paired host terminal. Index 0 is the only terminal the TUI
+/// uses and stays unnumbered; the web dashboard's additional terminals (#2437)
+/// are numbered from 2 so the strip reads `terminal`, `terminal 2`, ... matching
+/// how the web already labels those tabs.
+pub(crate) fn terminal_window_name(index: u32) -> String {
+    if index == 0 {
+        "terminal".to_string()
+    } else {
+        format!("terminal {}", index + 1)
+    }
+}
+
+/// Container counterpart of [`terminal_window_name`].
+pub(crate) fn container_window_name(index: u32) -> String {
+    if index == 0 {
+        "container".to_string()
+    } else {
+        format!("container {}", index + 1)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
@@ -2772,6 +2793,7 @@ impl Instance {
             session.create_with_size(&self.project_path, None, size)?;
             // Apply all configured tmux options to terminal sessions too
             self.apply_terminal_tmux_options(index);
+            self.link_paired_window_into_agent(session.name());
         }
 
         // The persisted `terminal_info` cache is the index-0 fast path the TUI
@@ -2889,9 +2911,50 @@ impl Instance {
         if is_new {
             session.create_with_size(&self.project_path, Some(&session_cmd), size)?;
             self.apply_container_terminal_tmux_options(index);
+            self.link_paired_window_into_agent(session.name());
         }
 
         Ok(())
+    }
+
+    /// Under `AOE_USE_SHARED_TMUX_SESSION`, graft a freshly created paired
+    /// terminal's window into this session's agent tmux session so it shows up as
+    /// a tab there. The terminal keeps its own session, so this is purely
+    /// additive: `link-window` makes one window belong to both, leaving every
+    /// `<terminal>:^.0` pane target and the separate kill path intact.
+    ///
+    /// Silently does nothing when the flag is off, when the agent has no tmux
+    /// session (structured/ACP sessions never create one), or when the link
+    /// fails; in every case the terminal is still usable on its own session.
+    fn link_paired_window_into_agent(&self, terminal_session_name: &str) {
+        if !crate::tmux::use_shared_tmux_session() {
+            return;
+        }
+        let Ok(agent) = self.tmux_session() else {
+            return;
+        };
+        if !agent.exists() {
+            return;
+        }
+        crate::tmux::link_window_into(terminal_session_name, agent.name());
+    }
+
+    /// Re-attach every surviving paired terminal as a tab of `agent_session`.
+    ///
+    /// A restart kills and recreates the agent's tmux session, which discards its
+    /// window list while leaving the terminals' own sessions (and their scrollback)
+    /// untouched. Without this the terminals are still alive but no longer reachable
+    /// as tabs, so the restart looks like it destroyed them.
+    ///
+    /// Idempotent: `link_window_into` skips terminals already linked, so this is
+    /// safe to run on every launch, not just restarts.
+    pub(crate) fn relink_paired_windows(instance_id: &str, agent_session: &str) {
+        if !crate::tmux::use_shared_tmux_session() {
+            return;
+        }
+        for name in crate::tmux::paired_terminal_sessions_for_id(instance_id) {
+            crate::tmux::link_window_into(&name, agent_session);
+        }
     }
 
     pub fn kill_container_terminal(&self) -> Result<()> {
@@ -2933,7 +2996,12 @@ impl Instance {
     }
 
     /// Apply all configured tmux options to a session with the given name and title.
-    fn apply_session_tmux_options(&self, session_name: &str, display_title: &str) {
+    fn apply_session_tmux_options(
+        &self,
+        session_name: &str,
+        display_title: &str,
+        window_name: Option<&str>,
+    ) {
         let branch = self
             .worktree_info
             .as_ref()
@@ -2945,13 +3013,28 @@ impl Instance {
             display_title,
             branch,
             sandbox.as_ref(),
+            window_name,
         );
+    }
+
+    /// Tab label for this session's agent window, e.g. `agent (claude)`.
+    /// Falls back to a bare `agent` when the tool name is empty.
+    pub(crate) fn agent_window_name(&self) -> String {
+        if self.tool.is_empty() {
+            "agent".to_string()
+        } else {
+            format!("agent ({})", self.tool)
+        }
     }
 
     fn apply_container_terminal_tmux_options(&self, index: u32) {
         let name =
             tmux::ContainerTerminalSession::resolve_name_indexed(&self.id, &self.title, index);
-        self.apply_session_tmux_options(&name, &format!("{} (container)", self.title));
+        self.apply_session_tmux_options(
+            &name,
+            &format!("{} (container)", self.title),
+            Some(&container_window_name(index)),
+        );
     }
 
     pub fn start(&mut self) -> Result<()> {
@@ -3511,6 +3594,11 @@ impl Instance {
         let title = self.title.clone();
         let branch = self.worktree_info.as_ref().map(|w| w.branch.clone());
         let sandbox = self.sandbox_display();
+        let window_name = self.agent_window_name();
+        // A restart recreates this tmux session, dropping the linked terminal tabs
+        // it used to show while the terminals themselves survive; re-link them so
+        // the tab strip comes back with the agent.
+        let relink_id = self.id.clone();
         match std::thread::Builder::new()
             .name(format!("finalize-tmux-{}", instance_id_for_log))
             .spawn(move || {
@@ -3520,7 +3608,9 @@ impl Instance {
                         &title,
                         branch.as_deref(),
                         sandbox.as_ref(),
+                        Some(&window_name),
                     );
+                    Self::relink_paired_windows(&relink_id, &session_name);
                 })) {
                     tracing::error!(target: "session.store", "finalize-tmux thread panicked: {:?}", panic);
                 }
@@ -3846,7 +3936,11 @@ impl Instance {
 impl Instance {
     fn apply_terminal_tmux_options(&self, index: u32) {
         let name = tmux::TerminalSession::resolve_name_indexed(&self.id, &self.title, index);
-        self.apply_session_tmux_options(&name, &format!("{} (terminal)", self.title));
+        self.apply_session_tmux_options(
+            &name,
+            &format!("{} (terminal)", self.title),
+            Some(&terminal_window_name(index)),
+        );
     }
 
     pub fn get_container_for_instance(&mut self) -> Result<containers::DockerContainer> {
@@ -5663,6 +5757,39 @@ mod tests {
         let pinned = "/workspace/myrepo-worktrees/contexec".to_string();
         inst.sandbox_info.as_mut().unwrap().container_workdir = Some(pinned.clone());
         assert_eq!(inst.container_workdir(), pinned);
+    }
+
+    /// Tab labels must name the surface, not leak tmux's `automatic-rename`
+    /// output. The agent tab in particular has to read `agent (claude)` rather
+    /// than the bare version string Claude Code's versioned install path yields.
+    #[test]
+    fn agent_window_name_labels_the_tool() {
+        let mut inst = Instance::new("my-session", "/tmp/test");
+        inst.tool = "claude".to_string();
+        assert_eq!(inst.agent_window_name(), "agent (claude)");
+
+        inst.tool = "pi".to_string();
+        assert_eq!(inst.agent_window_name(), "agent (pi)");
+    }
+
+    #[test]
+    fn agent_window_name_falls_back_without_a_tool() {
+        let mut inst = Instance::new("my-session", "/tmp/test");
+        inst.tool = String::new();
+        assert_eq!(inst.agent_window_name(), "agent");
+    }
+
+    /// Index 0 is the TUI's only terminal and stays unnumbered; the web
+    /// dashboard's extra terminals are numbered from 2 to match how it already
+    /// labels those tabs.
+    #[test]
+    fn terminal_window_names_match_the_web_tab_labels() {
+        assert_eq!(terminal_window_name(0), "terminal");
+        assert_eq!(terminal_window_name(1), "terminal 2");
+        assert_eq!(terminal_window_name(2), "terminal 3");
+
+        assert_eq!(container_window_name(0), "container");
+        assert_eq!(container_window_name(1), "container 2");
     }
 
     #[test]

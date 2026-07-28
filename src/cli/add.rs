@@ -1177,6 +1177,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 }
 
                 let tmux_session = crate::tmux::Session::new(&instance.id, &instance.title)?;
+                tmux_session.focus_own_window();
                 tmux_session.attach()?;
             }
             Err(e) => {

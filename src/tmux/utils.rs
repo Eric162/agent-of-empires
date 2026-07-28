@@ -200,6 +200,184 @@ pub fn append_clipboard_passthrough_args(args: &mut Vec<String>, target: &str) {
     ]);
 }
 
+/// Pin the first window's name to `window_name` so the tab reads e.g.
+/// `agent (claude)` or `terminal` instead of tmux's default.
+///
+/// tmux's default `automatic-rename on` names a window after
+/// `#{pane_current_command}`, which for an agent installed at a versioned path
+/// (Claude Code lives at `.../claude/versions/2.1.220/claude`) renders as a bare
+/// version string. Both rename mechanisms are disabled explicitly:
+///   * `automatic-rename off` stops the command-name tracking.
+///   * `allow-rename off` stops the agent's own OSC 2 title escapes from
+///     overriding the name we just set.
+///
+/// Best-effort: a missing session or a tmux ENOENT is swallowed, since a tab
+/// label is cosmetic and must never fail a launch. Chained into one invocation
+/// so the window is never briefly visible under the wrong name.
+pub fn set_window_name(session_name: &str, window_name: &str) {
+    let target = format!("{session_name}:^");
+    let _ = crate::tmux::tmux_command()
+        .args([
+            "set-option",
+            "-w",
+            "-t",
+            &target,
+            "automatic-rename",
+            "off",
+            ";",
+            "set-option",
+            "-w",
+            "-t",
+            &target,
+            "allow-rename",
+            "off",
+            ";",
+            "rename-window",
+            "-t",
+            &target,
+            window_name,
+        ])
+        .output();
+}
+
+/// Make `source`'s first window appear as an additional tab in `dest`, without
+/// moving it: tmux linked windows belong to both sessions at once, so
+/// `source:^.0` keeps resolving to the same pane and every existing target
+/// string in aoe stays valid.
+///
+/// `-a` appends after the highest index rather than colliding with an existing
+/// one. Returns false when the link could not be made (either session missing,
+/// tmux unavailable), so the caller can fall back to the separate-session flow.
+///
+/// Already-linked windows are detected up front and reported as success: tmux is
+/// happy to link one window into the same session twice, at two indices, which
+/// would show the user duplicate tabs onto the same pane.
+pub fn link_window_into(source: &str, dest: &str) -> bool {
+    let Some(window_id) = first_window_id(source) else {
+        tracing::debug!(target: "tmux.window",
+            source = %source, dest = %dest, "link-window skipped: source window not found");
+        return false;
+    };
+    if window_index_in(dest, &window_id).is_some() {
+        return true;
+    }
+
+    let src_target = format!("{source}:^");
+    let dest_target = format!("{dest}:");
+    match crate::tmux::tmux_command()
+        .args(["link-window", "-a", "-s", &src_target, "-t", &dest_target])
+        .output()
+    {
+        Ok(out) if out.status.success() => true,
+        Ok(out) => {
+            tracing::debug!(target: "tmux.window",
+                source = %source, dest = %dest,
+                "link-window failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+            false
+        }
+        Err(e) => {
+            tracing::debug!(target: "tmux.window",
+                source = %source, dest = %dest, "link-window spawn failed: {}", e);
+            false
+        }
+    }
+}
+
+/// Make `session_name`'s own first window current, undoing a previous
+/// [`select_linked_window`].
+///
+/// A tmux session remembers its current window, and `attach-session` resumes
+/// there. Selecting a paired terminal's tab therefore persists: without this, a
+/// later agent attach would land on the terminal tab instead of the agent.
+///
+/// `^` is the lowest-numbered window, which is the surface's own: the session is
+/// created with it, and `link_window_into` appends paired terminals after it.
+/// Best-effort; a missing session is not an error.
+pub fn select_first_window(session_name: &str) {
+    let _ = crate::tmux::tmux_command()
+        .args(["select-window", "-t", &format!("{session_name}:^")])
+        .output();
+}
+
+/// Destroy `session_name`'s first window, removing it from *every* session that
+/// holds it.
+///
+/// This is the teardown counterpart of [`link_window_into`] and the reason a
+/// paired terminal cannot be torn down with `kill-session` alone: a linked window
+/// survives its originating session's death for as long as another session holds
+/// it, so killing the terminal's session leaves a dead-pane tab stranded in the
+/// agent's session. Killing the window removes the tab everywhere, and tmux then
+/// destroys any session left with no windows.
+///
+/// Best-effort; a missing session or window is not an error.
+pub fn kill_first_window(session_name: &str) {
+    let _ = crate::tmux::tmux_command()
+        .args(["kill-window", "-t", &format!("{session_name}:^")])
+        .output();
+}
+
+/// Make the window `source` owns current in `host`, so attaching `host` lands
+/// on that tab. Returns false when the window is not linked into `host` (or
+/// tmux is unreachable), letting the caller fall back to attaching `source`
+/// directly.
+///
+/// The window is addressed by its tmux window id (`@N`, stable across
+/// index renumbering) but selected by its index *within `host`*: a linked window
+/// belongs to several sessions, so `select-window -t @N` alone leaves it
+/// ambiguous which session's current window moves.
+pub fn select_linked_window(host: &str, source: &str) -> bool {
+    let Some(window_id) = first_window_id(source) else {
+        return false;
+    };
+    let Some(index) = window_index_in(host, &window_id) else {
+        return false;
+    };
+    crate::tmux::tmux_command()
+        .args(["select-window", "-t", &format!("{host}:{index}")])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// tmux window id (`@N`) of `session_name`'s first window.
+fn first_window_id(session_name: &str) -> Option<String> {
+    crate::tmux::tmux_command()
+        .args([
+            "display-message",
+            "-t",
+            &format!("{session_name}:^"),
+            "-p",
+            "#{window_id}",
+        ])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Index of the window with `window_id` as seen from `host`, or `None` when that
+/// window is not one of `host`'s.
+fn window_index_in(host: &str, window_id: &str) -> Option<String> {
+    let output = crate::tmux::tmux_command()
+        .args([
+            "list-windows",
+            "-t",
+            host,
+            "-F",
+            "#{window_index} #{window_id}",
+        ])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    stdout.lines().find_map(|line| {
+        let (index, id) = line.trim().split_once(' ')?;
+        (id == window_id).then(|| index.to_string())
+    })
+}
+
 pub fn is_pane_dead(session_name: &str) -> bool {
     // Use `^.0` to target the first window's first pane regardless of
     // base-index or which pane is active, so the check always hits the
@@ -313,12 +491,374 @@ fn format_tmux_prefix(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tmux::test_helpers::TmuxTestSession;
 
     #[test]
     fn test_sanitize_session_name() {
         assert_eq!(sanitize_session_name("my-project"), "my-project");
         assert_eq!(sanitize_session_name("my project"), "my_project");
         assert_eq!(sanitize_session_name("a".repeat(30).as_str()).len(), 20);
+    }
+
+    fn tmux_available_for_window_tests() -> bool {
+        crate::tmux::tmux_command()
+            .arg("-V")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn spawn_probe_session(name: &str) {
+        let output = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                name,
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sleep 30",
+            ])
+            .output()
+            .expect("tmux new-session");
+        assert!(output.status.success(), "failed to create {name}");
+    }
+
+    fn window_names_in(session: &str) -> Vec<String> {
+        let out = crate::tmux::tmux_command()
+            .args(["list-windows", "-t", session, "-F", "#{window_name}"])
+            .output()
+            .expect("tmux list-windows");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .collect()
+    }
+
+    /// `set_window_name` must survive tmux's own renaming: with the default
+    /// `automatic-rename on` the window would be renamed back to
+    /// `#{pane_current_command}` (`sleep` here, a bare version string for a
+    /// real agent), so this locks the `automatic-rename off` half of the fix.
+    #[test]
+    #[serial_test::serial]
+    fn set_window_name_pins_the_tab_label() {
+        if !tmux_available_for_window_tests() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let guard = TmuxTestSession::new("aoe_test_winname");
+        spawn_probe_session(guard.name());
+
+        set_window_name(guard.name(), "agent (claude)");
+
+        assert_eq!(window_names_in(guard.name()), vec!["agent (claude)"]);
+
+        let automatic = crate::tmux::tmux_command()
+            .args([
+                "show-options",
+                "-w",
+                "-v",
+                "-t",
+                &format!("{}:^", guard.name()),
+                "automatic-rename",
+            ])
+            .output()
+            .expect("tmux show-options");
+        assert_eq!(
+            String::from_utf8_lossy(&automatic.stdout).trim(),
+            "off",
+            "automatic-rename must be off or tmux renames the tab back"
+        );
+    }
+
+    /// The core of the shared-session model: after `link_window_into` the
+    /// terminal's window is a second tab of the agent session, while the
+    /// terminal session still exists and still resolves its own `:^.0` pane
+    /// target. That last assertion is what keeps the change additive.
+    #[test]
+    #[serial_test::serial]
+    fn link_window_into_adds_a_tab_without_moving_the_window() {
+        if !tmux_available_for_window_tests() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let agent = TmuxTestSession::new("aoe_test_link_agent");
+        let term = TmuxTestSession::new("aoe_test_link_term");
+        spawn_probe_session(agent.name());
+        spawn_probe_session(term.name());
+        set_window_name(agent.name(), "agent (claude)");
+        set_window_name(term.name(), "terminal");
+
+        assert!(link_window_into(term.name(), agent.name()));
+
+        assert_eq!(
+            window_names_in(agent.name()),
+            vec!["agent (claude)", "terminal"],
+            "the agent session should now show both tabs, agent first"
+        );
+        assert_eq!(
+            window_names_in(term.name()),
+            vec!["terminal"],
+            "the terminal session must still own its window"
+        );
+
+        let pane = crate::tmux::tmux_command()
+            .args([
+                "display-message",
+                "-t",
+                &format!("{}:^.0", term.name()),
+                "-p",
+                "#{pane_dead}",
+            ])
+            .output()
+            .expect("tmux display-message");
+        assert!(
+            pane.status.success(),
+            "`<terminal>:^.0` must keep resolving after linking, or every \
+             existing pane target in aoe breaks"
+        );
+    }
+
+    /// `kill-session` is not enough to tear down a linked terminal: tmux keeps the
+    /// window alive for as long as another session holds it, stranding a dead-pane
+    /// tab in the agent session that the next terminal start then doubles up on.
+    /// This pins the semantics that force `kill_first_window` to exist.
+    #[test]
+    #[serial_test::serial]
+    fn kill_session_alone_strands_a_linked_window() {
+        if !tmux_available_for_window_tests() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let agent = TmuxTestSession::new("aoe_test_strand_agent");
+        let term = TmuxTestSession::new("aoe_test_strand_term");
+        spawn_probe_session(agent.name());
+        spawn_probe_session(term.name());
+        set_window_name(term.name(), "terminal");
+        assert!(link_window_into(term.name(), agent.name()));
+
+        kill_session_if_present(term.name()).expect("kill terminal session");
+
+        assert!(
+            window_names_in(agent.name()).contains(&"terminal".to_string()),
+            "documents the tmux behavior the teardown fix works around"
+        );
+    }
+
+    /// The bug-2 fix: killing the window drops the tab from the agent session too,
+    /// so exiting and restarting a terminal cannot accumulate stale tabs.
+    #[test]
+    #[serial_test::serial]
+    fn kill_first_window_removes_the_tab_from_the_host() {
+        if !tmux_available_for_window_tests() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let agent = TmuxTestSession::new("aoe_test_killwin_agent");
+        let term = TmuxTestSession::new("aoe_test_killwin_term");
+        spawn_probe_session(agent.name());
+        spawn_probe_session(term.name());
+        set_window_name(agent.name(), "agent (claude)");
+        set_window_name(term.name(), "terminal");
+        assert!(link_window_into(term.name(), agent.name()));
+
+        kill_first_window(term.name());
+
+        assert_eq!(
+            window_names_in(agent.name()),
+            vec!["agent (claude)"],
+            "the terminal tab must be gone from the agent session"
+        );
+        assert!(
+            !crate::tmux::session_exists(term.name()),
+            "tmux should destroy the terminal session once its last window dies"
+        );
+    }
+
+    /// Re-linking an already-linked window is treated as success, so a repeated
+    /// terminal start (or a respawn after a dead pane) is idempotent rather than
+    /// logging a spurious failure.
+    #[test]
+    #[serial_test::serial]
+    fn link_window_into_is_idempotent() {
+        if !tmux_available_for_window_tests() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let agent = TmuxTestSession::new("aoe_test_relink_agent");
+        let term = TmuxTestSession::new("aoe_test_relink_term");
+        spawn_probe_session(agent.name());
+        spawn_probe_session(term.name());
+
+        assert!(link_window_into(term.name(), agent.name()));
+        assert!(link_window_into(term.name(), agent.name()));
+        assert_eq!(
+            window_names_in(agent.name()).len(),
+            2,
+            "re-linking must not append a duplicate tab"
+        );
+    }
+
+    /// The bug-1 shape: a restart kills and recreates the agent session, which
+    /// drops its window list while the terminal's own session survives. Re-linking
+    /// must restore the tab, with the terminal's pane (and scrollback) intact,
+    /// rather than the terminal appearing destroyed.
+    #[test]
+    #[serial_test::serial]
+    fn relinking_restores_the_tab_after_the_agent_session_is_recreated() {
+        if !tmux_available_for_window_tests() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let agent = TmuxTestSession::new("aoe_test_restart_agent");
+        let term = TmuxTestSession::new("aoe_test_restart_term");
+        spawn_probe_session(agent.name());
+        spawn_probe_session(term.name());
+        set_window_name(term.name(), "terminal");
+        assert!(link_window_into(term.name(), agent.name()));
+        let pane_pid_before = crate::process::get_pane_pid(term.name());
+        assert!(pane_pid_before.is_some());
+
+        // What `Instance::kill_clean` does on restart: kill only the agent session.
+        kill_session_if_present(agent.name()).expect("kill agent session");
+        assert!(
+            crate::tmux::session_exists(term.name()),
+            "the terminal session must outlive an agent restart"
+        );
+        spawn_probe_session(agent.name());
+        set_window_name(agent.name(), "agent (claude)");
+        assert_eq!(
+            window_names_in(agent.name()),
+            vec!["agent (claude)"],
+            "the recreated agent session starts with no terminal tabs"
+        );
+
+        assert!(link_window_into(term.name(), agent.name()));
+
+        assert_eq!(
+            window_names_in(agent.name()),
+            vec!["agent (claude)", "terminal"],
+            "the terminal tab should be back, after the agent tab"
+        );
+        assert_eq!(
+            crate::process::get_pane_pid(term.name()),
+            pane_pid_before,
+            "re-linking must reuse the surviving pane, not respawn it"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn link_window_into_fails_for_missing_session() {
+        if !tmux_available_for_window_tests() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let term = TmuxTestSession::new("aoe_test_link_orphan");
+        spawn_probe_session(term.name());
+        assert!(
+            !link_window_into(term.name(), "aoe_test_link_no_such_session"),
+            "linking into a missing session must report failure so the caller \
+             falls back to the standalone attach"
+        );
+    }
+
+    /// `select_linked_window` makes the linked tab current in the *host*, which
+    /// is what lets the attach land on the terminal tab.
+    #[test]
+    #[serial_test::serial]
+    fn select_linked_window_makes_the_tab_current_in_the_host() {
+        if !tmux_available_for_window_tests() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let agent = TmuxTestSession::new("aoe_test_sel_agent");
+        let term = TmuxTestSession::new("aoe_test_sel_term");
+        spawn_probe_session(agent.name());
+        spawn_probe_session(term.name());
+        set_window_name(agent.name(), "agent (claude)");
+        set_window_name(term.name(), "terminal");
+        assert!(link_window_into(term.name(), agent.name()));
+
+        assert!(select_linked_window(agent.name(), term.name()));
+
+        let current = crate::tmux::tmux_command()
+            .args([
+                "display-message",
+                "-t",
+                agent.name(),
+                "-p",
+                "#{window_name}",
+            ])
+            .output()
+            .expect("tmux display-message");
+        assert_eq!(
+            String::from_utf8_lossy(&current.stdout).trim(),
+            "terminal",
+            "the host session's current window should be the linked terminal"
+        );
+    }
+
+    /// tmux persists a session's current window, and `attach-session` resumes
+    /// there, so selecting a terminal tab leaks into the *next* agent attach:
+    /// pressing Enter on the agent would land on the terminal. `select_first_window`
+    /// is what brings focus back to the agent's own tab.
+    #[test]
+    #[serial_test::serial]
+    fn selecting_a_terminal_tab_persists_until_the_first_window_is_reselected() {
+        if !tmux_available_for_window_tests() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let agent = TmuxTestSession::new("aoe_test_focus_agent");
+        let term = TmuxTestSession::new("aoe_test_focus_term");
+        spawn_probe_session(agent.name());
+        spawn_probe_session(term.name());
+        set_window_name(agent.name(), "agent (claude)");
+        set_window_name(term.name(), "terminal");
+        assert!(link_window_into(term.name(), agent.name()));
+
+        let current = |session: &str| -> String {
+            let out = crate::tmux::tmux_command()
+                .args(["display-message", "-t", session, "-p", "#{window_name}"])
+                .output()
+                .expect("tmux display-message");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        assert!(select_linked_window(agent.name(), term.name()));
+        assert_eq!(
+            current(agent.name()),
+            "terminal",
+            "documents the sticky current-window behavior behind the bug"
+        );
+
+        select_first_window(agent.name());
+
+        assert_eq!(
+            current(agent.name()),
+            "agent (claude)",
+            "an agent attach must resume on the agent tab, not the terminal"
+        );
+    }
+
+    /// An unlinked terminal must report false rather than silently selecting
+    /// something else, so `attach_via_host` falls back to its own session.
+    #[test]
+    #[serial_test::serial]
+    fn select_linked_window_false_when_not_linked() {
+        if !tmux_available_for_window_tests() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let agent = TmuxTestSession::new("aoe_test_nolink_agent");
+        let term = TmuxTestSession::new("aoe_test_nolink_term");
+        spawn_probe_session(agent.name());
+        spawn_probe_session(term.name());
+
+        assert!(!select_linked_window(agent.name(), term.name()));
     }
 
     #[test]
