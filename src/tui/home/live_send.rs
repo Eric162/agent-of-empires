@@ -821,20 +821,22 @@ fn probe_pane_count(name: &str) -> u16 {
         .max(1)
 }
 
-/// Capture transport for a split window's passive preview: every pane, laid
-/// back out on the window grid.
+/// Capture transport for a split window: every pane laid back out on the window
+/// grid, plus pane 0's cursor.
 ///
-/// Publishes no cursor. The composite has no single meaningful cursor (each
-/// pane has its own), and the render only paints one under live-send, which
-/// this path never runs in.
+/// The cursor rides along because this path also serves live-send whenever no VT
+/// channel is available (arming failed, `[tmux] vt_live` off, non-unix).
+/// Dropping it there would cost a split preview its painted cursor and, worse,
+/// the alternate-screen and mouse-mode flags the wheel forward reads to decide
+/// how to scroll a full-screen agent.
 fn capture_composited(
     name: &str,
     lines: usize,
     forward_empty: bool,
 ) -> (Option<String>, Option<crate::tmux::PaneCursor>) {
     let session = crate::tmux::Session::from_name(name);
-    match session.capture_window_composited(lines) {
-        Ok(content) => (Some(content), None),
+    match session.capture_window_composited_with_cursor(lines) {
+        Ok((content, cursor)) => (Some(content), cursor),
         Err(_) if forward_empty => (Some(String::new()), None),
         Err(_) => (None, None),
     }

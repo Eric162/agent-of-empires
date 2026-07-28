@@ -122,6 +122,11 @@ pub struct PaneCursor {
     pub position_reliable: bool,
 }
 
+/// tmux format line every cursor probe requests, parsed by
+/// [`PaneCursor::parse`]. Shared so the plain capture and the composited one
+/// cannot drift into asking for different fields.
+const CURSOR_FMT: &str = "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height} #{history_size} #{pane_width} #{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag} #{mouse_all_flag}";
+
 impl PaneCursor {
     /// Parse the single space-separated line emitted by the
     /// `#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height}
@@ -225,6 +230,22 @@ fn parse_pane_segments(raw: &str, sentinel: &str) -> Vec<CapturedPane> {
     }
     flush(&mut panes, current.take());
     panes
+}
+
+/// Flag a cursor's POSITION as untrustworthy while keeping its always-valid
+/// mode flags, for the composite paths that fall through to a scrollback-bearing
+/// pane-0 capture.
+///
+/// [`Session::capture_pane_with_cursor`] earns the right to trust a position by
+/// probing twice around its capture and comparing; a single probe against
+/// content that includes scrollback has no such evidence, so the render skips
+/// painting rather than risk the row-drift bug while the wheel forward (which
+/// reads only the mode flags) keeps working.
+fn unreliable_position(cursor: Option<PaneCursor>) -> Option<PaneCursor> {
+    cursor.map(|c| PaneCursor {
+        position_reliable: false,
+        ..c
+    })
 }
 
 /// A delta beyond this many rows between a window and its pane is a multi-pane
@@ -564,8 +585,36 @@ impl Session {
     /// so this reads as "a split window doesn't scroll back" rather than
     /// misbehaving.
     pub fn capture_window_composited(&self, lines: usize) -> Result<String> {
+        Ok(self.capture_window_composited_with_cursor(lines)?.0)
+    }
+
+    /// [`capture_window_composited`](Self::capture_window_composited) plus pane
+    /// 0's cursor, for the live preview.
+    ///
+    /// Pane 0 owns the cursor because it is the pane that receives input, and
+    /// tmux puts it at the window origin, so its coordinates index the
+    /// composite untranslated. The probe targets `^.0` explicitly rather than
+    /// the window, whose format fields would resolve against whichever pane the
+    /// user happens to have selected.
+    ///
+    /// On a composite the cursor is rebased onto the window's dimensions: the
+    /// renderer anchors it by `pane_height` against the painted line count,
+    /// which is now the whole window rather than one pane.
+    pub fn capture_window_composited_with_cursor(
+        &self,
+        lines: usize,
+    ) -> Result<(String, Option<PaneCursor>)> {
+        /// Gates the window-dimensions line. A chained `display-message` can
+        /// silently produce nothing while the invocation still exits 0 (the
+        /// same hazard `is_probe_line` guards in the vt seed path), and without
+        /// a sentinel the capture's first row would be mistaken for the header
+        /// and dropped from the fallback content.
+        const WINDOW_SENTINEL: &str = "@@aoe-win@@";
+        /// Gates the cursor line, for the same reason.
+        const CURSOR_SENTINEL: &str = "@@aoe-cur@@";
+
         if !self.exists() {
-            return Ok(String::new());
+            return Ok((String::new(), None));
         }
 
         let window = format!("{}:^", self.name);
@@ -577,7 +626,16 @@ impl Session {
                 "-t",
                 &window,
                 "-F",
-                "#{window_panes} #{window_width} #{window_height}",
+                &format!(
+                    "{WINDOW_SENTINEL} #{{window_panes}} #{{window_width}} #{{window_height}}"
+                ),
+                ";",
+                "display-message",
+                "-p",
+                "-t",
+                &pane0,
+                "-F",
+                &format!("{CURSOR_SENTINEL} {CURSOR_FMT}"),
                 ";",
                 "capture-pane",
                 "-t",
@@ -590,30 +648,61 @@ impl Session {
             .output()?;
 
         if !output.status.success() {
-            return Ok(String::new());
+            return Ok((String::new(), None));
         }
 
+        // Consume the sentinel-tagged preamble line by line; the first line
+        // that carries neither sentinel is where the capture starts. Either
+        // probe going missing costs only its own information, never a row of
+        // pane content.
         let raw = String::from_utf8_lossy(&output.stdout);
-        let mut parts = raw.splitn(2, '\n');
-        let header = parts.next().unwrap_or("");
-        let pane0_content = parts.next().unwrap_or("").to_string();
+        let mut rest: &str = &raw;
+        let mut dims: Option<(u16, u16, u16)> = None;
+        let mut cursor: Option<PaneCursor> = None;
+        while let Some((line, tail)) = rest.split_once('\n') {
+            if let Some(fields) = line.strip_prefix(WINDOW_SENTINEL) {
+                let mut f = fields.split_whitespace();
+                dims = match (f.next(), f.next(), f.next()) {
+                    (Some(c), Some(w), Some(h)) => {
+                        match (c.parse().ok(), w.parse().ok(), h.parse().ok()) {
+                            (Some(c), Some(w), Some(h)) => Some((c, w, h)),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+            } else if let Some(fields) = line.strip_prefix(CURSOR_SENTINEL) {
+                cursor = PaneCursor::parse(fields.trim());
+            } else {
+                break;
+            }
+            rest = tail;
+        }
+        let pane0_content = rest.to_string();
 
-        let mut fields = header.split_whitespace();
-        let count: u16 = fields.next().and_then(|f| f.parse().ok()).unwrap_or(1);
-        let window_width: u16 = fields.next().and_then(|f| f.parse().ok()).unwrap_or(0);
-        let window_height: u16 = fields.next().and_then(|f| f.parse().ok()).unwrap_or(0);
-
+        let Some((count, window_width, window_height)) = dims else {
+            return Ok((pane0_content, unreliable_position(cursor)));
+        };
         if count <= 1 || window_width == 0 || window_height == 0 {
-            return Ok(pane0_content);
+            return Ok((pane0_content, unreliable_position(cursor)));
         }
 
         // Any failure in the split path (fork error, unparseable layout) falls
         // back to the pane-0 bytes already in hand, so a composite that cannot
         // be built is never worse than the old single-pane preview.
-        Ok(self
-            .capture_window_layout(count)
-            .map(|layout| layout.composite())
-            .unwrap_or(pane0_content))
+        let Some(layout) = self.capture_window_layout(count) else {
+            return Ok((pane0_content, unreliable_position(cursor)));
+        };
+        // The composite is the visible window with no scrollback, so the row a
+        // single probe reported cannot have drifted underneath it, and the
+        // position stands.
+        let cursor = cursor.map(|mut c| {
+            c.pane_height = layout.window_height;
+            c.pane_width = layout.window_width;
+            c.history_size = 0;
+            c
+        });
+        Ok((layout.composite(), cursor))
     }
 
     /// Second fork of [`capture_window_composited`](Self::capture_window_composited):
@@ -627,7 +716,7 @@ impl Session {
     ///
     /// Returned rather than composited on the spot so the live preview can
     /// cache a layout across frames and re-render only pane 0 from its VT grid
-    /// (see [`WindowLayout::with_first_pane_rows`]).
+    /// (see [`WindowLayout::composite_with_first_pane_rows`]).
     pub(crate) fn capture_window_layout(&self, count: u16) -> Option<WindowLayout> {
         /// Marks the start of each pane's segment in the chained output. Pane
         /// content could in principle contain this line, which would split one
@@ -737,8 +826,7 @@ impl Session {
 
         let target = format!("{}:^.0", self.name);
         let start = format!("-{}", lines);
-        const HEADER_FMT: &str =
-            "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height} #{history_size} #{pane_width} #{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag} #{mouse_all_flag}";
+        const HEADER_FMT: &str = CURSOR_FMT;
         let output = crate::tmux::tmux_command()
             .args([
                 "display-message",
@@ -2395,6 +2483,94 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A composited capture must return the pane's cursor, and on an unsplit
+    /// window it must return the same bytes and cursor mode flags the plain
+    /// cursor-bearing capture does.
+    ///
+    /// The cursor matters because this is live-send's transport whenever no VT
+    /// channel is available: without it a split preview loses both its painted
+    /// cursor and the alternate-screen / mouse flags the wheel forward reads.
+    #[test]
+    #[serial_test::serial]
+    fn composited_capture_carries_the_pane_cursor() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let guard = TmuxTestSession::new("aoe_test_composite_cursor");
+        let session_name = guard.name().to_string();
+        crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session_name,
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sh -c 'echo ALPHA; sleep 30'",
+            ])
+            .output()
+            .expect("tmux new-session");
+        crate::tmux::tmux_command()
+            .args(["set-option", "-t", &session_name, "pane-base-index", "0"])
+            .output()
+            .expect("tmux set-option pane-base-index");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let session = Session {
+            name: session_name.clone(),
+        };
+        let (content, cursor) = session
+            .capture_window_composited_with_cursor(20)
+            .expect("composited capture");
+        let plain = session.capture_pane(20).expect("capture_pane");
+        assert_eq!(
+            content, plain,
+            "unsplit window must still pass pane bytes through untouched"
+        );
+        assert!(
+            content.contains("ALPHA"),
+            "first captured row went missing: {content:?}"
+        );
+        let cursor = cursor.expect("a cursor for a live pane");
+        assert_eq!(cursor.pane_width, 80, "cursor carries the pane geometry");
+
+        // Now split, and the cursor must be rebased onto the window so the
+        // renderer's `pane_height` anchoring still lines up with the composite.
+        crate::tmux::tmux_command()
+            .args([
+                "split-window",
+                "-h",
+                "-t",
+                &session_name,
+                "sh -c 'echo BRAVO; sleep 30'",
+            ])
+            .output()
+            .expect("tmux split-window");
+        std::thread::sleep(std::time::Duration::from_millis(400));
+
+        let (content, cursor) = session
+            .capture_window_composited_with_cursor(20)
+            .expect("composited capture");
+        assert!(content.contains("ALPHA") && content.contains("BRAVO"));
+        let cursor = cursor.expect("a cursor for the split window");
+        assert_eq!(
+            cursor.pane_width, 80,
+            "rebased onto the window, not pane 0 (which is now ~39 wide)"
+        );
+        assert_eq!(
+            cursor.history_size, 0,
+            "a composite has no scrollback to advertise"
+        );
+        assert!(
+            cursor.position_reliable,
+            "visible-only composite cannot have drifted"
+        );
     }
 
     /// The two composite transports must agree byte for byte on a static

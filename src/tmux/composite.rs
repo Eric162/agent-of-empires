@@ -102,6 +102,41 @@ impl WindowLayout {
     }
 }
 
+/// Drop a composed row's trailing padding, which buys nothing and only risks
+/// the renderer wrapping a row that is exactly the viewport width.
+///
+/// Trailing spaces are only padding when nothing is colouring them. The
+/// rightmost pane's last row may legitimately end in a background fill running
+/// to the window edge (a status bar, a selection), which arrives here as an SGR
+/// followed by spaces; blanket-trimming those would strip the cells while
+/// leaving the escape, silently shortening the fill.
+/// [`crate::tmux::vt::capture_rows_padded`] treats a styled blank as content
+/// for the same reason, so this keeps the two halves of the pipeline agreeing.
+///
+/// Padding this module and `capture_rows_padded` append is always introduced by
+/// an explicit reset, so a reset immediately before the spaces is the signal
+/// that they are safe to drop (along with the now-pointless reset). A row of
+/// bare spaces carrying no escapes at all is a blank row and trims to nothing.
+fn trim_padding(line: &str) -> &str {
+    let trimmed = line.trim_end_matches(' ');
+    if trimmed.len() == line.len() {
+        return line;
+    }
+    if let Some(rest) = trimmed.strip_suffix(SGR_RESET) {
+        return rest;
+    }
+    // Unstyled blanks: no escape anywhere, so there is nothing to preserve.
+    if !trimmed.contains('\x1b') {
+        return trimmed;
+    }
+    // Spaces under a live SGR: a coloured fill, not padding.
+    line
+}
+
+/// The reset [`crate::tmux::vt::capture_rows_padded`] emits before padding a row
+/// out to its pane's width.
+const SGR_RESET: &str = "\x1b[0m";
+
 /// Border glyphs. tmux draws proper tee/cross junctions; a preview only needs
 /// the two edges, so a full-width gap row is drawn as an unbroken rule rather
 /// than tracking which columns carry a vertical border through it.
@@ -177,9 +212,7 @@ pub(crate) fn composite_window(
                 }
             }
         }
-        // Trailing padding buys nothing and only risks the renderer wrapping a
-        // row that is exactly the viewport width. Escapes are left alone.
-        out.push_str(line.trim_end_matches(' '));
+        out.push_str(trim_padding(&line));
     }
     out
 }
@@ -351,6 +384,43 @@ mod tests {
     fn a_zero_width_pane_cannot_stall_the_walk() {
         let panes = [pane(0, 0, 0, 1, &[""]), pane(1, 0, 2, 1, &["ok"])];
         assert_eq!(composite_window(3, 1, &panes), "│ok");
+    }
+
+    #[test]
+    fn a_styled_fill_running_to_the_window_edge_survives_the_trim() {
+        // The rightmost pane ends in a background fill (a status bar). Blanket
+        // trimming trailing spaces would strip the coloured cells and leave the
+        // escape behind, shortening the fill.
+        let filled = format!("ab{}  ", "\x1b[44m");
+        let panes = [pane(0, 0, 2, 1, &["xy"]), pane(3, 0, 4, 1, &[&filled])];
+        let out = composite_window(7, 1, &panes);
+        assert_eq!(out, format!("xy│{filled}"), "styled fill was trimmed");
+    }
+
+    #[test]
+    fn reset_prefixed_padding_is_still_trimmed() {
+        // What `capture_rows_padded` appends: an explicit reset, then spaces.
+        // Both go, since nothing is colouring them.
+        let padded = format!("ab{}  ", SGR_RESET);
+        let panes = [pane(0, 0, 2, 1, &["xy"]), pane(3, 0, 4, 1, &[&padded])];
+        assert_eq!(composite_window(7, 1, &panes), "xy│ab");
+    }
+
+    #[test]
+    fn trim_padding_handles_each_tail_shape() {
+        assert_eq!(trim_padding("abc"), "abc", "no trailing spaces: untouched");
+        assert_eq!(trim_padding("abc   "), "abc", "bare spaces: trimmed");
+        assert_eq!(trim_padding("     "), "", "blank row: trims to nothing");
+        assert_eq!(
+            trim_padding("\x1b[31mred\x1b[0m   "),
+            "\x1b[31mred",
+            "reset-prefixed padding: reset and spaces both dropped"
+        );
+        assert_eq!(
+            trim_padding("\x1b[44m   "),
+            "\x1b[44m   ",
+            "spaces under a live SGR: preserved"
+        );
     }
 
     #[test]
