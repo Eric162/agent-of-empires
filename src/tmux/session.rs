@@ -1455,6 +1455,90 @@ mod tests {
             .unwrap_or(false)
     }
 
+    /// Create a detached session for the composite tests, applying the guards
+    /// the rest of this module treats as mandatory:
+    ///
+    /// * `pane-base-index 0` chained into the create, so the `^.0` targets
+    ///   these paths use resolve on a host that sets `pane-base-index 1`
+    ///   globally (#488, #2231).
+    /// * [`refresh_session_cache`] afterwards, because every capture entry point
+    ///   is `exists()`-gated and a cache refreshed concurrently by another test
+    ///   would make the call a silent `Ok("")` rather than a visible failure.
+    fn start_composite_session(name: &str, cols: u16, rows: u16, cmd: &str) -> Session {
+        let status = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                name,
+                "-x",
+                &cols.to_string(),
+                "-y",
+                &rows.to_string(),
+                cmd,
+                ";",
+                "set-option",
+                "-t",
+                name,
+                "pane-base-index",
+                "0",
+            ])
+            .status()
+            .expect("tmux new-session");
+        assert!(status.success(), "failed to create {name}");
+        refresh_session_cache();
+        Session::from_name(name)
+    }
+
+    /// Split `session` horizontally and refresh the cache, mirroring
+    /// [`start_composite_session`]'s guards for the second pane.
+    fn split_composite_session(session: &Session, cmd: &str) {
+        let status = crate::tmux::tmux_command()
+            .args(["split-window", "-h", "-t", &session.name, cmd])
+            .status()
+            .expect("tmux split-window");
+        assert!(status.success(), "failed to split {}", session.name);
+        refresh_session_cache();
+    }
+
+    /// Poll until the pane has painted `needle`. A fixed sleep is flaky under
+    /// parallel suite load: the shell must spawn and the command run before a
+    /// capture sees anything. Mirrors
+    /// `capture_pane_with_cursor_returns_content_and_cursor`.
+    fn wait_for_pane_text(session: &Session, needle: &str) {
+        for _ in 0..50 {
+            if session
+                .capture_pane(20)
+                .map(|c| c.contains(needle))
+                .unwrap_or(false)
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!(
+            "pane {} never painted {needle:?}; last capture: {:?}",
+            session.name,
+            session.capture_pane(20)
+        );
+    }
+
+    /// Poll until the composited capture contains `needle`, for the panes a
+    /// plain `capture_pane` cannot see.
+    fn wait_for_composite_text(session: &Session, needle: &str) {
+        for _ in 0..50 {
+            if session
+                .capture_window_composited(20)
+                .map(|c| c.contains(needle))
+                .unwrap_or(false)
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("composite for {} never painted {needle:?}", session.name);
+    }
+
     #[test]
     fn raw_byte_batches_chunks_and_preserves_order() {
         let payload: Vec<u8> = (0..=255u8)
@@ -2293,27 +2377,9 @@ mod tests {
         }
 
         let guard = TmuxTestSession::new("aoe_test_composite_single");
-        let session_name = guard.name().to_string();
-        let output = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session_name,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sh -c 'echo ALPHA; sleep 30'",
-            ])
-            .output()
-            .expect("tmux new-session");
-        assert!(output.status.success());
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        let session = start_composite_session(guard.name(), 80, 24, "sh -c 'echo ALPHA; sleep 30'");
+        wait_for_pane_text(&session, "ALPHA");
 
-        let session = Session {
-            name: session_name.clone(),
-        };
         let plain = session.capture_pane(10).expect("capture_pane");
         let composited = session
             .capture_window_composited(10)
@@ -2336,45 +2402,12 @@ mod tests {
         }
 
         let guard = TmuxTestSession::new("aoe_test_composite_split");
-        let session_name = guard.name().to_string();
-        let output = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session_name,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sh -c 'echo ALPHA; sleep 30'",
-            ])
-            .output()
-            .expect("tmux new-session");
-        assert!(output.status.success());
-        crate::tmux::tmux_command()
-            .args(["set-option", "-t", &session_name, "pane-base-index", "0"])
-            .output()
-            .expect("tmux set-option pane-base-index");
+        let session = start_composite_session(guard.name(), 80, 24, "sh -c 'echo ALPHA; sleep 30'");
+        wait_for_pane_text(&session, "ALPHA");
+        // `C-b %`: a second pane beside the first.
+        split_composite_session(&session, "sh -c 'echo BRAVO; sleep 30'");
+        wait_for_composite_text(&session, "BRAVO");
 
-        // `C-b %`: a second pane beside the first. Selecting it also proves
-        // the composite does not depend on which pane is active.
-        let output = crate::tmux::tmux_command()
-            .args([
-                "split-window",
-                "-h",
-                "-t",
-                &session_name,
-                "sh -c 'echo BRAVO; sleep 30'",
-            ])
-            .output()
-            .expect("tmux split-window");
-        assert!(output.status.success());
-        std::thread::sleep(std::time::Duration::from_millis(400));
-
-        let session = Session {
-            name: session_name.clone(),
-        };
         let plain = session.capture_pane(10).expect("capture_pane");
         let composited = session
             .capture_window_composited(10)
@@ -2413,46 +2446,15 @@ mod tests {
         }
 
         let guard = TmuxTestSession::new("aoe_test_layout_order");
-        let session_name = guard.name().to_string();
-        let output = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session_name,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sh -c 'echo ALPHA; sleep 30'",
-            ])
-            .output()
-            .expect("tmux new-session");
-        assert!(output.status.success());
-        crate::tmux::tmux_command()
-            .args(["set-option", "-t", &session_name, "pane-base-index", "0"])
-            .output()
-            .expect("tmux set-option pane-base-index");
-        crate::tmux::tmux_command()
-            .args([
-                "split-window",
-                "-h",
-                "-t",
-                &session_name,
-                "sh -c 'echo BRAVO; sleep 30'",
-            ])
-            .output()
-            .expect("tmux split-window");
+        let session = start_composite_session(guard.name(), 80, 24, "sh -c 'echo ALPHA; sleep 30'");
+        wait_for_pane_text(&session, "ALPHA");
+        split_composite_session(&session, "sh -c 'echo BRAVO; sleep 30'");
+        wait_for_composite_text(&session, "BRAVO");
         // Make the SECOND pane active: pane 0 must still come back first.
         crate::tmux::tmux_command()
-            .args(["select-pane", "-t", &format!("{session_name}:^.1")])
+            .args(["select-pane", "-t", &format!("{}:^.1", session.name)])
             .output()
             .expect("tmux select-pane");
-        std::thread::sleep(std::time::Duration::from_millis(400));
-
-        let session = Session {
-            name: session_name.clone(),
-        };
         let layout = session
             .capture_window_layout(2)
             .expect("layout for a split window");
@@ -2501,30 +2503,9 @@ mod tests {
         }
 
         let guard = TmuxTestSession::new("aoe_test_composite_cursor");
-        let session_name = guard.name().to_string();
-        crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session_name,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sh -c 'echo ALPHA; sleep 30'",
-            ])
-            .output()
-            .expect("tmux new-session");
-        crate::tmux::tmux_command()
-            .args(["set-option", "-t", &session_name, "pane-base-index", "0"])
-            .output()
-            .expect("tmux set-option pane-base-index");
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        let session = start_composite_session(guard.name(), 80, 24, "sh -c 'echo ALPHA; sleep 30'");
+        wait_for_pane_text(&session, "ALPHA");
 
-        let session = Session {
-            name: session_name.clone(),
-        };
         let (content, cursor) = session
             .capture_window_composited_with_cursor(20)
             .expect("composited capture");
@@ -2542,17 +2523,8 @@ mod tests {
 
         // Now split, and the cursor must be rebased onto the window so the
         // renderer's `pane_height` anchoring still lines up with the composite.
-        crate::tmux::tmux_command()
-            .args([
-                "split-window",
-                "-h",
-                "-t",
-                &session_name,
-                "sh -c 'echo BRAVO; sleep 30'",
-            ])
-            .output()
-            .expect("tmux split-window");
-        std::thread::sleep(std::time::Duration::from_millis(400));
+        split_composite_session(&session, "sh -c 'echo BRAVO; sleep 30'");
+        wait_for_composite_text(&session, "BRAVO");
 
         let (content, cursor) = session
             .capture_window_composited_with_cursor(20)
@@ -2592,40 +2564,11 @@ mod tests {
         }
 
         let guard = TmuxTestSession::new("aoe_test_composite_agree");
-        let session_name = guard.name().to_string();
-        crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session_name,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sh -c 'echo ALPHA; sleep 30'",
-            ])
-            .output()
-            .expect("tmux new-session");
-        crate::tmux::tmux_command()
-            .args(["set-option", "-t", &session_name, "pane-base-index", "0"])
-            .output()
-            .expect("tmux set-option pane-base-index");
-        crate::tmux::tmux_command()
-            .args([
-                "split-window",
-                "-h",
-                "-t",
-                &session_name,
-                "sh -c 'echo BRAVO; sleep 30'",
-            ])
-            .output()
-            .expect("tmux split-window");
-        std::thread::sleep(std::time::Duration::from_millis(400));
+        let session = start_composite_session(guard.name(), 80, 24, "sh -c 'echo ALPHA; sleep 30'");
+        wait_for_pane_text(&session, "ALPHA");
+        split_composite_session(&session, "sh -c 'echo BRAVO; sleep 30'");
+        wait_for_composite_text(&session, "BRAVO");
 
-        let session = Session {
-            name: session_name.clone(),
-        };
         // Passive fallback: one fork per pane, composited on the spot.
         let fallback = session
             .capture_window_composited(24)

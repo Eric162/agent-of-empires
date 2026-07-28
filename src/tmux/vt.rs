@@ -818,17 +818,20 @@ fn row_to_ansi(screen: &vt100::Screen, row: u16, cols: u16) -> String {
 /// counts as content: it is drawn as a coloured space, exactly as a mid-row
 /// styled blank already is.
 ///
-/// The count is in display columns, not cells: the loop below advances past a
-/// wide glyph's continuation cell, so a row ending in a wide char reports the
-/// two columns it actually occupies.
+/// The count is in display COLUMNS, not cells, so a trailing wide glyph
+/// contributes both of the columns it occupies. Its continuation cell carries no
+/// contents and, unstyled, no style either, so advancing by one per occupied
+/// cell would under-count by one and leave
+/// [`capture_rows_padded`] appending a space to a row that already fills its
+/// pane, shifting every pane to its right by a column.
 fn row_last_col(screen: &vt100::Screen, row: u16, cols: u16) -> u16 {
     let mut last = 0u16;
     for col in 0..cols {
-        if screen
-            .cell(row, col)
-            .is_some_and(|cell| cell.has_contents() || cell_has_style(cell))
-        {
-            last = col + 1;
+        if let Some(cell) = screen.cell(row, col) {
+            if cell.has_contents() || cell_has_style(cell) {
+                let width = if cell.is_wide() { 2 } else { 1 };
+                last = col.saturating_add(width).min(cols);
+            }
         }
     }
     last
@@ -1697,8 +1700,11 @@ mod tests {
     }
 
     /// Display columns a row occupies once its escape sequences are removed.
+    /// Measured as width, not `chars().count()`, so a wide glyph is counted as
+    /// the two columns it actually paints.
     fn visible_width(row: &str) -> usize {
-        crate::tmux::utils::strip_ansi(row).chars().count()
+        use unicode_width::UnicodeWidthStr;
+        UnicodeWidthStr::width(crate::tmux::utils::strip_ansi(row).as_str())
     }
 
     #[test]
@@ -1739,6 +1745,37 @@ mod tests {
             "padding not reset: {:?}",
             rows[0]
         );
+    }
+
+    #[test]
+    fn capture_rows_padded_counts_a_trailing_wide_glyph_as_two_columns() {
+        // A wide glyph's continuation cell holds no contents and, unstyled, no
+        // style, so counting one column per occupied cell under-counts the row
+        // by one. The padding step then appended a space to a row that already
+        // filled its pane, making it `cols + 1` wide and shifting every pane to
+        // its right by a column.
+        let rows = capture_rows_padded("ab漢".as_bytes(), 4, 1);
+        assert_eq!(
+            visible_width(&rows[0]),
+            4,
+            "row should exactly fill the pane: {:?}",
+            rows[0]
+        );
+        assert!(
+            !rows[0].ends_with(' '),
+            "no padding belongs on a row that already fills its width: {:?}",
+            rows[0]
+        );
+
+        // The same glyph with room to spare still pads, to the right total.
+        let rows = capture_rows_padded("ab漢".as_bytes(), 7, 1);
+        assert_eq!(visible_width(&rows[0]), 7, "{:?}", rows[0]);
+
+        // A wide glyph split by the pane edge cannot push the count past `cols`.
+        let rows = capture_rows_padded("abc漢".as_bytes(), 4, 2);
+        for (i, r) in rows.iter().enumerate() {
+            assert_eq!(visible_width(r), 4, "row {i}: {r:?}");
+        }
     }
 
     #[test]
