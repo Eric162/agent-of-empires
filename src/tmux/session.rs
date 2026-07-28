@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::{
+    composite::{composite_window, CapturedPane, PaneGeom},
     probe_session_existence, refresh_session_cache,
     utils::{
         append_clipboard_passthrough_args, append_mouse_on_args, append_pane_base_index_args,
@@ -188,6 +189,42 @@ fn merge_cursor_probes(
         }
         _ => None,
     }
+}
+
+/// Split the chained multi-pane capture into one [`CapturedPane`] per pane.
+///
+/// The output is a flat byte stream of `<sentinel + geometry>` lines each
+/// followed by that pane's `capture-pane` rows, so the sentinel is the only
+/// frame marker. A pane whose geometry line does not parse is dropped rather
+/// than shifting every later pane's content onto the wrong rectangle.
+fn parse_pane_segments(raw: &str, sentinel: &str) -> Vec<CapturedPane> {
+    let mut panes: Vec<CapturedPane> = Vec::new();
+    let mut current: Option<(PaneGeom, Vec<&str>)> = None;
+
+    let flush = |panes: &mut Vec<CapturedPane>, entry: Option<(PaneGeom, Vec<&str>)>| {
+        if let Some((geom, lines)) = entry {
+            let body = lines.join("\n");
+            panes.push(CapturedPane {
+                rows: crate::tmux::vt::capture_rows_padded(
+                    body.as_bytes(),
+                    geom.width,
+                    geom.height,
+                ),
+                geom,
+            });
+        }
+    };
+
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix(sentinel) {
+            flush(&mut panes, current.take());
+            current = PaneGeom::parse(rest).map(|geom| (geom, Vec::new()));
+        } else if let Some((_, lines)) = current.as_mut() {
+            lines.push(line);
+        }
+    }
+    flush(&mut panes, current.take());
+    panes
 }
 
 /// A delta beyond this many rows between a window and its pane is a multi-pane
@@ -502,6 +539,135 @@ impl Session {
         } else {
             Ok(String::new())
         }
+    }
+
+    /// Capture the whole first window, panes composited, for the passive
+    /// preview.
+    ///
+    /// [`capture_pane`](Self::capture_pane) shows `^.0` and nothing else, so a
+    /// user who splits the window watches aoe go blind to everything but the
+    /// agent's own pane. This reads every pane and lays them back out on the
+    /// window grid. Input is untouched and still pinned to `^.0` (#435, #488):
+    /// compositing is read-only, so the mis-targeted-keystroke class of bug
+    /// that the pin exists to prevent cannot arise here.
+    ///
+    /// The single-pane case, which is almost every session, costs the same one
+    /// fork as before: the pane count rides along as a header on the capture
+    /// that was already being taken, and its bytes are returned verbatim
+    /// (scrollback and all). Only a genuinely split window pays a second fork,
+    /// and that one is chained so it stays a single `tmux` invocation no matter
+    /// how many panes there are.
+    ///
+    /// Splits lose scrollback: panes have independent histories, so there is no
+    /// coherent way to stack them, and the composite covers the visible window
+    /// only. The preview's scroll offset clamps itself to the shorter capture,
+    /// so this reads as "a split window doesn't scroll back" rather than
+    /// misbehaving.
+    pub fn capture_window_composited(&self, lines: usize) -> Result<String> {
+        if !self.exists() {
+            return Ok(String::new());
+        }
+
+        let window = format!("{}:^", self.name);
+        let pane0 = format!("{}:^.0", self.name);
+        let output = crate::tmux::tmux_command()
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                &window,
+                "-F",
+                "#{window_panes} #{window_width} #{window_height}",
+                ";",
+                "capture-pane",
+                "-t",
+                &pane0,
+                "-p",
+                "-e",
+                "-S",
+                &format!("-{}", lines),
+            ])
+            .output()?;
+
+        if !output.status.success() {
+            return Ok(String::new());
+        }
+
+        let raw = String::from_utf8_lossy(&output.stdout);
+        let mut parts = raw.splitn(2, '\n');
+        let header = parts.next().unwrap_or("");
+        let pane0_content = parts.next().unwrap_or("").to_string();
+
+        let mut fields = header.split_whitespace();
+        let count: u16 = fields.next().and_then(|f| f.parse().ok()).unwrap_or(1);
+        let window_width: u16 = fields.next().and_then(|f| f.parse().ok()).unwrap_or(0);
+        let window_height: u16 = fields.next().and_then(|f| f.parse().ok()).unwrap_or(0);
+
+        if count <= 1 || window_width == 0 || window_height == 0 {
+            return Ok(pane0_content);
+        }
+
+        // Any failure in the split path (fork error, unparseable layout) falls
+        // back to the pane-0 bytes already in hand, so a composite that cannot
+        // be built is never worse than the old single-pane preview.
+        Ok(self
+            .capture_split_window(count, window_width, window_height)
+            .unwrap_or(pane0_content))
+    }
+
+    /// Second fork of [`capture_window_composited`](Self::capture_window_composited):
+    /// geometry plus visible capture for each of `count` panes, chained into one
+    /// `tmux` invocation, spliced by [`composite_window`].
+    ///
+    /// Pane indices are contiguous from 0 within a window (tmux renumbers them
+    /// as the layout changes, unlike window indices) and `pane-base-index` is
+    /// forced to 0 when the session is created, so `^.0..^.{count-1}` addresses
+    /// every pane without a prior `list-panes` round trip.
+    fn capture_split_window(
+        &self,
+        count: u16,
+        window_width: u16,
+        window_height: u16,
+    ) -> Option<String> {
+        /// Marks the start of each pane's segment in the chained output. Pane
+        /// content could in principle contain this line, which would split one
+        /// pane's rows in two; the cost is a single garbled preview frame, and
+        /// the string is unusual enough to make that a non-event.
+        const SENTINEL: &str = "@@aoe-pane@@";
+
+        let mut args: Vec<String> = Vec::new();
+        for i in 0..count {
+            let target = format!("{}:^.{}", self.name, i);
+            if !args.is_empty() {
+                args.push(";".to_string());
+            }
+            args.extend([
+                "display-message".to_string(),
+                "-p".to_string(),
+                "-t".to_string(),
+                target.clone(),
+                "-F".to_string(),
+                format!("{SENTINEL} #{{pane_left}} #{{pane_top}} #{{pane_width}} #{{pane_height}}"),
+                ";".to_string(),
+                "capture-pane".to_string(),
+                "-t".to_string(),
+                target,
+                "-p".to_string(),
+                "-e".to_string(),
+            ]);
+        }
+
+        let output = crate::tmux::tmux_command().args(&args).output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+
+        let raw = String::from_utf8_lossy(&output.stdout);
+        let panes = parse_pane_segments(&raw, SENTINEL);
+        if panes.is_empty() {
+            return None;
+        }
+        Some(composite_window(window_width, window_height, &panes))
     }
 
     /// Capture the pane's full scrollback (from session start) with wrapped
@@ -1220,6 +1386,40 @@ mod tests {
         assert_eq!(chrome_rows(40, 18), 0, "split layout is not chrome");
         // Degenerate: pane taller than window can't underflow.
         assert_eq!(chrome_rows(10, 20), 0, "saturating, no panic");
+    }
+
+    #[test]
+    fn pane_segments_split_the_chained_capture_by_sentinel() {
+        // Shape of the chained fork's stdout: a geometry line per pane, each
+        // followed by that pane's rows.
+        let raw = "@@s@@ 0 0 6 2\nleft1\nleft2\n@@s@@ 7 0 6 2\nright1\nright2\n";
+        let panes = parse_pane_segments(raw, "@@s@@");
+        assert_eq!(panes.len(), 2);
+        assert_eq!(panes[0].geom.left, 0);
+        assert_eq!(panes[1].geom.left, 7);
+        // Rows come back padded to the pane's width, which is what lets the
+        // compositor concatenate them without measuring.
+        assert_eq!(panes[0].rows.len(), 2);
+        assert!(panes[0].rows[0].contains("left1"));
+        assert!(panes[1].rows[1].contains("right2"));
+    }
+
+    #[test]
+    fn pane_segments_drop_a_pane_with_unparseable_geometry() {
+        // A bad geometry line must not push its rows onto the next pane's
+        // rectangle; the pane is dropped and the rest still parse.
+        let raw = "@@s@@ bogus\norphan\n@@s@@ 0 0 4 1\nkeep\n";
+        let panes = parse_pane_segments(raw, "@@s@@");
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].geom.width, 4);
+        assert!(panes[0].rows[0].contains("keep"));
+    }
+
+    #[test]
+    fn pane_segments_are_empty_when_no_sentinel_appears() {
+        // A tmux that emitted nothing recognisable must yield no panes, so the
+        // caller falls back to its already-captured pane-0 bytes.
+        assert!(parse_pane_segments("just some output\n", "@@s@@").is_empty());
     }
 
     #[test]
@@ -1970,6 +2170,125 @@ mod tests {
         assert!(
             !session.is_pane_running_shell(),
             "is_pane_running_shell should check first window (sleep), not active window (sh)"
+        );
+    }
+
+    /// An unsplit window must composite to exactly what `capture_pane`
+    /// returns, so the overwhelmingly common case is provably unchanged.
+    #[test]
+    #[serial_test::serial]
+    fn composited_capture_matches_capture_pane_when_unsplit() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let guard = TmuxTestSession::new("aoe_test_composite_single");
+        let session_name = guard.name().to_string();
+        let output = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session_name,
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sh -c 'echo ALPHA; sleep 30'",
+            ])
+            .output()
+            .expect("tmux new-session");
+        assert!(output.status.success());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let session = Session {
+            name: session_name.clone(),
+        };
+        let plain = session.capture_pane(10).expect("capture_pane");
+        let composited = session
+            .capture_window_composited(10)
+            .expect("capture_window_composited");
+        assert!(plain.contains("ALPHA"), "control capture empty: {plain:?}");
+        assert_eq!(
+            composited, plain,
+            "an unsplit window must pass the pane bytes through untouched"
+        );
+    }
+
+    /// The point of the feature: a pane the user split off by hand shows up in
+    /// the preview instead of being invisible.
+    #[test]
+    #[serial_test::serial]
+    fn composited_capture_includes_a_split_off_pane() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let guard = TmuxTestSession::new("aoe_test_composite_split");
+        let session_name = guard.name().to_string();
+        let output = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session_name,
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sh -c 'echo ALPHA; sleep 30'",
+            ])
+            .output()
+            .expect("tmux new-session");
+        assert!(output.status.success());
+        crate::tmux::tmux_command()
+            .args(["set-option", "-t", &session_name, "pane-base-index", "0"])
+            .output()
+            .expect("tmux set-option pane-base-index");
+
+        // `C-b %`: a second pane beside the first. Selecting it also proves
+        // the composite does not depend on which pane is active.
+        let output = crate::tmux::tmux_command()
+            .args([
+                "split-window",
+                "-h",
+                "-t",
+                &session_name,
+                "sh -c 'echo BRAVO; sleep 30'",
+            ])
+            .output()
+            .expect("tmux split-window");
+        assert!(output.status.success());
+        std::thread::sleep(std::time::Duration::from_millis(400));
+
+        let session = Session {
+            name: session_name.clone(),
+        };
+        let plain = session.capture_pane(10).expect("capture_pane");
+        let composited = session
+            .capture_window_composited(10)
+            .expect("capture_window_composited");
+
+        // The old behaviour: pane 0 only, split pane invisible.
+        assert!(plain.contains("ALPHA"));
+        assert!(
+            !plain.contains("BRAVO"),
+            "control: capture_pane should not see the split pane"
+        );
+        // The new behaviour: both panes, side by side on the same rows.
+        assert!(
+            composited.contains("ALPHA") && composited.contains("BRAVO"),
+            "composite missed a pane:\n{composited}"
+        );
+        let seam_row = composited
+            .lines()
+            .find(|l| l.contains("ALPHA"))
+            .expect("row with ALPHA");
+        assert!(
+            seam_row.contains("BRAVO"),
+            "panes should share a row, not stack:\n{seam_row:?}"
         );
     }
 

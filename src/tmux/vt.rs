@@ -807,11 +807,21 @@ fn cell_sgr(cell: &vt100::Cell) -> String {
 /// with their spaces stripped (#2433 regression). Emitting literal spaces keeps
 /// the column layout intact while preserving colour and intensity.
 fn row_to_ansi(screen: &vt100::Screen, row: u16, cols: u16) -> String {
-    // Trim trailing *unstyled* blank cells, mirroring `capture-pane`'s
-    // trailing-space trim, so a row never carries a full width of padding into
-    // ratatui's wrapper. A trailing blank that carries styling (a background
-    // fill running to the edge) is kept: it is drawn as a coloured space below,
-    // exactly as a mid-row styled blank already is.
+    let last = row_last_col(screen, row, cols);
+    row_to_ansi_upto(screen, row, last)
+}
+
+/// Columns of `row` that carry content, i.e. the trim point past which only
+/// *unstyled* blank cells remain. Mirrors `capture-pane`'s trailing-space trim
+/// so a row never carries a full width of padding into ratatui's wrapper. A
+/// trailing blank that carries styling (a background fill running to the edge)
+/// counts as content: it is drawn as a coloured space, exactly as a mid-row
+/// styled blank already is.
+///
+/// The count is in display columns, not cells: the loop below advances past a
+/// wide glyph's continuation cell, so a row ending in a wide char reports the
+/// two columns it actually occupies.
+fn row_last_col(screen: &vt100::Screen, row: u16, cols: u16) -> u16 {
     let mut last = 0u16;
     for col in 0..cols {
         if screen
@@ -821,7 +831,13 @@ fn row_to_ansi(screen: &vt100::Screen, row: u16, cols: u16) -> String {
             last = col + 1;
         }
     }
+    last
+}
 
+/// Serialise columns `0..last` of `row`. Split out of [`row_to_ansi`] so the
+/// pane compositor can ask for a row rendered to its pane's full width rather
+/// than to the trim point.
+fn row_to_ansi_upto(screen: &vt100::Screen, row: u16, last: u16) -> String {
     let mut out = String::new();
     let mut cur_sgr: Option<String> = None;
     let mut col = 0u16;
@@ -853,6 +869,48 @@ fn row_to_ansi(screen: &vt100::Screen, row: u16, cols: u16) -> String {
         col += if cell.is_wide() { 2 } else { 1 };
     }
     out
+}
+
+/// Render `raw` (one pane's `capture-pane -e -p` output) as exactly `rows`
+/// ANSI rows, each padded with spaces to `cols` display columns.
+///
+/// The compositor splices panes side by side by *concatenating* their rows, so
+/// unlike the single-pane preview path every row must occupy its pane's full
+/// width: a trimmed row would let the next pane's first column slide left into
+/// the gap. Going through a `vt100::Parser` rather than splitting the bytes on
+/// newlines is what makes that safe, because a row's escape sequences are
+/// resolved into cells before they are re-serialised, so no SGR state can leak
+/// across a pane boundary into its neighbour.
+pub(crate) fn capture_rows_padded(raw: &[u8], cols: u16, rows: u16) -> Vec<String> {
+    let cols = cols.max(1);
+    let rows = rows.max(1);
+    // Parse at two rows minimum, then read back only the pane's real height.
+    // vt100 0.16 underflows (panics) whenever content wraps on a ONE-row grid,
+    // regardless of scrollback, and `resize-pane -y 1` makes that a layout a
+    // user can actually produce. Captured content is already wrapped to the
+    // pane's width so it normally fits exactly; this keeps a stale geometry
+    // (the pane resized between the probe and the capture) from taking down
+    // the render thread.
+    let mut parser = vt100::Parser::new(rows.max(2), cols, 0);
+    // `capture-pane` joins rows with a bare LF, which staircases each row off
+    // the previous one's end column unless it is promoted to CRLF first (the
+    // same seeding fix the live channel applies).
+    parser.process(&lf_to_crlf(strip_trailing_row_terminator(raw)));
+
+    let screen = parser.screen();
+    (0..rows)
+        .map(|row| {
+            let last = row_last_col(screen, row, cols);
+            let mut out = row_to_ansi_upto(screen, row, last);
+            if last < cols {
+                // Reset before padding so a styled final cell (a background
+                // fill) does not bleed its colour across the gap.
+                out.push_str("\x1b[0m");
+                out.extend(std::iter::repeat_n(' ', (cols - last) as usize));
+            }
+            out
+        })
+        .collect()
 }
 
 /// Assemble the last `max_lines` rows of (scrollback + visible screen) as
@@ -1589,6 +1647,69 @@ mod tests {
             !content.contains("\x1b[10C") && !content.contains("\x1b[C"),
             "cursor-forward escape leaked:\n{content:?}"
         );
+    }
+
+    /// Display columns a row occupies once its escape sequences are removed.
+    fn visible_width(row: &str) -> usize {
+        crate::tmux::utils::strip_ansi(row).chars().count()
+    }
+
+    #[test]
+    fn capture_rows_padded_fills_every_row_to_the_pane_width() {
+        // The compositor concatenates rows to splice panes side by side, so a
+        // short row must be padded or the next pane slides left into the gap.
+        let rows = capture_rows_padded(b"ab\nlonger\n", 8, 3);
+        assert_eq!(rows.len(), 3, "one entry per pane row, blanks included");
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(visible_width(row), 8, "row {i} not padded: {row:?}");
+        }
+        assert!(rows[0].contains("ab"));
+        assert!(rows[1].contains("longer"));
+    }
+
+    #[test]
+    fn capture_rows_padded_unstaircases_bare_lf_input() {
+        // Same hazard `lf_to_crlf` fixes for the live seed: `capture-pane`
+        // joins rows with a bare LF, which would staircase each pane row off
+        // the previous one's end column.
+        let rows = capture_rows_padded(b"line-1\nline-2\n", 10, 2);
+        let plain: Vec<String> = rows
+            .iter()
+            .map(|r| crate::tmux::utils::strip_ansi(r))
+            .collect();
+        assert_eq!(plain[0].trim_end(), "line-1");
+        assert_eq!(plain[1].trim_end(), "line-2", "row 1 staircased");
+    }
+
+    #[test]
+    fn capture_rows_padded_resets_style_before_padding() {
+        // A row ending in a background fill must not bleed that colour across
+        // the border into the pane beside it.
+        let rows = capture_rows_padded(b"\x1b[41mred", 8, 1);
+        assert_eq!(visible_width(&rows[0]), 8);
+        assert!(
+            rows[0].ends_with("\x1b[0m     "),
+            "padding not reset: {:?}",
+            rows[0]
+        );
+    }
+
+    #[test]
+    fn capture_rows_padded_survives_a_one_row_pane_that_wraps() {
+        // `resize-pane -y 1` is a real layout, and vt100 panics on a wrapping
+        // one-row grid, so this must come back with a single padded row.
+        let rows = capture_rows_padded(b"keep", 3, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(visible_width(&rows[0]), 3);
+    }
+
+    #[test]
+    fn capture_rows_padded_truncates_content_wider_than_the_pane() {
+        // Content wider than the pane wraps inside the parser rather than
+        // overflowing the row and shifting the neighbour.
+        let rows = capture_rows_padded(b"abcdefgh", 4, 2);
+        assert_eq!(visible_width(&rows[0]), 4);
+        assert_eq!(visible_width(&rows[1]), 4);
     }
 
     #[test]

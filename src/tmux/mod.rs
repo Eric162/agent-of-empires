@@ -1,5 +1,6 @@
 //! tmux integration module
 
+pub(crate) mod composite;
 pub(crate) mod env;
 mod session;
 pub mod status_bar;

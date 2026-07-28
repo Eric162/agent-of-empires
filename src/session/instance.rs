@@ -5191,6 +5191,13 @@ impl Instance {
         // accepted width/height and silently ignored them.)
         self.tmux_session()?.capture_pane(lines)
     }
+
+    /// Like [`capture_output`](Self::capture_output) but with the window's
+    /// other panes composited in, for the passive preview. Costs the same
+    /// single fork when the session has not been split.
+    pub fn capture_output_composited(&self, lines: usize) -> Result<String> {
+        self.tmux_session()?.capture_window_composited(lines)
+    }
 }
 
 fn generate_id() -> String {

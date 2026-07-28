@@ -1,0 +1,266 @@
+//! Splice a tmux window's panes into one screen-shaped snapshot.
+//!
+//! `capture-pane` is per-pane and tmux has no command that returns a window
+//! with its panes composited, so the preview historically showed only the
+//! pinned `^.0` pane and a user's split was invisible (see
+//! [`crate::tmux::Session::capture_window_composited`] for the capture side).
+//! This module is the pure half: given each pane's geometry and its captured
+//! rows, lay them back out on the window grid and draw tmux-style borders in
+//! the gaps between them.
+//!
+//! Compositing is read-only and changes nothing about input routing, which
+//! stays pinned to `^.0` (#435, #488).
+
+/// One pane's rectangle within its window, from
+/// `#{pane_left} #{pane_top} #{pane_width} #{pane_height}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PaneGeom {
+    pub left: u16,
+    pub top: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
+impl PaneGeom {
+    /// Parse the four space-separated fields tmux emits for a pane's
+    /// rectangle. Returns `None` for a malformed line so a single unparseable
+    /// pane degrades that pane to border fill rather than failing the frame.
+    pub(crate) fn parse(line: &str) -> Option<Self> {
+        let mut f = line.split_whitespace();
+        let left = f.next()?.parse().ok()?;
+        let top = f.next()?.parse().ok()?;
+        let width = f.next()?.parse().ok()?;
+        let height = f.next()?.parse().ok()?;
+        Some(Self {
+            left,
+            top,
+            width,
+            height,
+        })
+    }
+
+    fn covers_row(&self, row: u16) -> bool {
+        row >= self.top && row < self.top.saturating_add(self.height)
+    }
+
+    fn covers(&self, row: u16, col: u16) -> bool {
+        self.covers_row(row) && col >= self.left && col < self.left.saturating_add(self.width)
+    }
+}
+
+/// A pane's rectangle plus its rows, each already padded to `geom.width`
+/// display columns by [`crate::tmux::vt::capture_rows_padded`].
+pub(crate) struct CapturedPane {
+    pub geom: PaneGeom,
+    pub rows: Vec<String>,
+}
+
+/// Border glyphs. tmux draws proper tee/cross junctions; a preview only needs
+/// the two edges, so a full-width gap row is drawn as an unbroken rule rather
+/// than tracking which columns carry a vertical border through it.
+const BORDER_VERTICAL: char = '│';
+const BORDER_HORIZONTAL: char = '─';
+
+/// Lay `panes` back onto a `window_width` x `window_height` grid and return the
+/// rows joined by `\n`, ready to be handed to the preview cache exactly like a
+/// single-pane `capture-pane` result.
+///
+/// Walks each window row left to right, emitting a pane's row whole whenever
+/// the cursor reaches that pane's left edge and a border glyph otherwise. Rows
+/// are emitted whole, never sliced at a column, which is what keeps the
+/// ANSI-laden content correct: slicing a styled row at a display column would
+/// mean parsing SGR state mid-string.
+///
+/// A column the walk cannot attribute to any pane advances by one and is
+/// filled, so a layout this function does not understand degrades to border
+/// fill instead of panicking or dropping the frame.
+pub(crate) fn composite_window(
+    window_width: u16,
+    window_height: u16,
+    panes: &[CapturedPane],
+) -> String {
+    let mut out = String::new();
+    for row in 0..window_height {
+        if row > 0 {
+            out.push('\n');
+        }
+        // An unclaimed cell is a border only where it actually separates two
+        // panes, and which glyph depends on the direction it separates them
+        // in: a pane directly above or below makes it part of a horizontal
+        // rule, a pane to the left or right makes it part of a vertical one.
+        // A cell with no pane on any side is void (the dead corner beside a
+        // short pane) and stays blank rather than drawing a border to nowhere.
+        // Genuine cross junctions resolve to the horizontal rule; tmux would
+        // draw a tee there, which a preview does not need.
+        let covered = |r: u16, c: u16| panes.iter().any(|p| p.geom.covers(r, c));
+        let gap_fill = |col: u16| -> char {
+            if row.checked_sub(1).is_some_and(|r| covered(r, col))
+                || covered(row.saturating_add(1), col)
+            {
+                BORDER_HORIZONTAL
+            } else if col.checked_sub(1).is_some_and(|c| covered(row, c))
+                || covered(row, col.saturating_add(1))
+            {
+                BORDER_VERTICAL
+            } else {
+                ' '
+            }
+        };
+
+        let mut line = String::new();
+        let mut col = 0u16;
+        while col < window_width {
+            let hit = panes
+                .iter()
+                .find(|p| p.geom.left == col && p.geom.covers_row(row));
+            match hit {
+                Some(pane) if pane.geom.width > 0 => {
+                    if let Some(text) = pane.rows.get((row - pane.geom.top) as usize) {
+                        line.push_str(text);
+                    } else {
+                        // Short capture (pane resized mid-frame): pad rather
+                        // than shift every pane to its right.
+                        line.extend(std::iter::repeat_n(' ', pane.geom.width as usize));
+                    }
+                    col = col.saturating_add(pane.geom.width);
+                }
+                _ => {
+                    line.push(gap_fill(col));
+                    col = col.saturating_add(1);
+                }
+            }
+        }
+        // Trailing padding buys nothing and only risks the renderer wrapping a
+        // row that is exactly the viewport width. Escapes are left alone.
+        out.push_str(line.trim_end_matches(' '));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pane(left: u16, top: u16, width: u16, height: u16, rows: &[&str]) -> CapturedPane {
+        CapturedPane {
+            geom: PaneGeom {
+                left,
+                top,
+                width,
+                height,
+            },
+            rows: rows.iter().map(|r| r.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn parses_a_geometry_line() {
+        assert_eq!(
+            PaneGeom::parse("0 0 80 24"),
+            Some(PaneGeom {
+                left: 0,
+                top: 0,
+                width: 80,
+                height: 24
+            })
+        );
+        assert_eq!(PaneGeom::parse("0 0 80"), None);
+        assert_eq!(PaneGeom::parse("a b c d"), None);
+        assert_eq!(PaneGeom::parse(""), None);
+    }
+
+    #[test]
+    fn single_pane_fills_the_window_unchanged() {
+        let panes = [pane(0, 0, 5, 2, &["hello", "world"])];
+        assert_eq!(composite_window(5, 2, &panes), "hello\nworld");
+    }
+
+    #[test]
+    fn side_by_side_panes_are_joined_by_a_vertical_border() {
+        // `C-b %`: two panes split at column 5, tmux's border occupying it.
+        let panes = [
+            pane(0, 0, 5, 2, &["aaaaa", "bbbbb"]),
+            pane(6, 0, 5, 2, &["ccccc", "ddddd"]),
+        ];
+        assert_eq!(composite_window(11, 2, &panes), "aaaaa│ccccc\nbbbbb│ddddd");
+    }
+
+    #[test]
+    fn stacked_panes_are_joined_by_a_horizontal_border() {
+        // `C-b "`: the row between the panes belongs to no pane.
+        let panes = [pane(0, 0, 4, 1, &["topp"]), pane(0, 2, 4, 1, &["botm"])];
+        assert_eq!(composite_window(4, 3, &panes), "topp\n────\nbotm");
+    }
+
+    #[test]
+    fn a_pane_shorter_than_its_neighbour_pads_rather_than_shifting() {
+        // The right pane spans both rows; the left only the first. Row 1 must
+        // still start the right pane at the same column, and the space the
+        // short pane vacated reads as the rule tmux would draw beneath it.
+        let panes = [
+            pane(0, 0, 3, 1, &["abc"]),
+            pane(4, 0, 3, 2, &["xyz", "uvw"]),
+        ];
+        assert_eq!(composite_window(7, 2, &panes), "abc│xyz\n───│uvw");
+    }
+
+    #[test]
+    fn a_row_missing_from_a_capture_pads_its_width() {
+        // Pane claims two rows but the capture came back with one (a resize
+        // raced the frame). The neighbour must not slide left.
+        let panes = [
+            pane(0, 0, 3, 2, &["abc"]),
+            pane(4, 0, 3, 2, &["xyz", "uvw"]),
+        ];
+        assert_eq!(composite_window(7, 2, &panes), "abc│xyz\n   │uvw");
+    }
+
+    #[test]
+    fn a_left_column_split_in_two_draws_a_rule_between_its_panes() {
+        // The layout `C-b %` then `C-b "` produces: a tall pane down the right
+        // side, and the left column split into two stacked panes. The rule
+        // between the stacked pair must stop at the vertical border rather
+        // than running through it or vanishing.
+        let panes = [
+            pane(0, 0, 4, 1, &["top1"]),
+            pane(0, 2, 4, 1, &["bot1"]),
+            pane(5, 0, 4, 3, &["rgt1", "rgt2", "rgt3"]),
+        ];
+        assert_eq!(
+            composite_window(9, 3, &panes),
+            "top1│rgt1\n────│rgt2\nbot1│rgt3"
+        );
+    }
+
+    #[test]
+    fn ansi_rows_are_spliced_without_being_cut() {
+        // A styled row must arrive at the seam intact, escapes and all.
+        let left = "\x1b[0m\x1b[31mred\x1b[0m";
+        let right = "\x1b[0m\x1b[32mgrn\x1b[0m";
+        let panes = [pane(0, 0, 3, 1, &[left]), pane(4, 0, 3, 1, &[right])];
+        let out = composite_window(7, 1, &panes);
+        assert_eq!(out, format!("{left}│{right}"));
+    }
+
+    #[test]
+    fn an_unclaimed_column_degrades_to_border_fill() {
+        // A layout the walk cannot attribute (pane starts at 2, nothing at 0)
+        // must still produce a full-width row instead of looping or panicking.
+        // Only the column abutting the pane reads as a border; the rest is void.
+        let panes = [pane(2, 0, 3, 1, &["xyz"])];
+        assert_eq!(composite_window(5, 1, &panes), " │xyz");
+    }
+
+    #[test]
+    fn a_zero_width_pane_cannot_stall_the_walk() {
+        let panes = [pane(0, 0, 0, 1, &[""]), pane(1, 0, 2, 1, &["ok"])];
+        assert_eq!(composite_window(3, 1, &panes), "│ok");
+    }
+
+    #[test]
+    fn no_panes_renders_a_blank_grid() {
+        // Nothing to separate, so nothing to draw: borders only appear where
+        // they divide real panes.
+        assert_eq!(composite_window(3, 2, &[]), "\n");
+    }
+}

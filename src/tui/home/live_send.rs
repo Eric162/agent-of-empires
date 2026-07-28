@@ -782,6 +782,12 @@ pub(in crate::tui) struct LiveCaptureWorker {
     /// down an armed channel (disabling its `pipe-pane`) and falls back to
     /// the capture path in place, no restart needed.
     vt_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Whether live-send is attached to the pane this worker is capturing.
+    /// Set alongside the cadence by `set_live`. Gates the split-window
+    /// composite: a passive preview shows every pane the user has split off,
+    /// but live mode stays on the single pinned `^.0` pane, which is the one
+    /// that receives input and owns the cursor being painted.
+    live: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for LiveCaptureWorker {
@@ -790,6 +796,53 @@ impl Drop for LiveCaptureWorker {
         // Wake the worker so it sees `stop` and exits now rather than after
         // its current inter-capture sleep.
         self.nudge();
+    }
+}
+
+/// How often the worker re-asks how many panes its target window has. The
+/// answer only changes when the user splits or closes a pane by hand, so a
+/// lazy cadence is plenty; it costs one tiny `display-message` fork on the one
+/// pane currently being previewed, and only outside live mode.
+const PANE_COUNT_PROBE_MS: u64 = 2_000;
+
+/// How many panes the worker's target window has, for deciding whether the
+/// passive preview needs the composite path. Returns 1 on any failure, which
+/// keeps the caller on the cheap single-pane transport.
+fn probe_pane_count(name: &str) -> u16 {
+    crate::tmux::tmux_command()
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            &format!("{name}:^"),
+            "-F",
+            "#{window_panes}",
+        ])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// Capture transport for a split window's passive preview: every pane, laid
+/// back out on the window grid.
+///
+/// Publishes no cursor. The composite has no single meaningful cursor (each
+/// pane has its own), and the render only paints one under live-send, which
+/// this path never runs in.
+fn capture_composited(
+    name: &str,
+    lines: usize,
+    forward_empty: bool,
+) -> (Option<String>, Option<crate::tmux::PaneCursor>) {
+    let session = crate::tmux::Session::from_name(name);
+    match session.capture_window_composited(lines) {
+        Ok(content) => (Some(content), None),
+        Err(_) if forward_empty => (Some(String::new()), None),
+        Err(_) => (None, None),
     }
 }
 
@@ -825,6 +878,8 @@ impl LiveCaptureWorker {
         // `[tmux] vt_live` value right after spawn (and on every config
         // refresh), so the worker itself never touches the config file.
         let vt_enabled = Arc::new(AtomicBool::new(true));
+        let live = Arc::new(AtomicBool::new(false));
+        let live_cell = live.clone();
         let lines_cell = capture_lines.clone();
         let target_cell = target.clone();
         let slot = latest.clone();
@@ -865,6 +920,12 @@ impl LiveCaptureWorker {
             // panes. Reset on target change so a new pane arms immediately.
             #[cfg(unix)]
             let mut last_vt_arm: Option<std::time::Instant> = None;
+            // Panes in the target window, refreshed on the lazy
+            // `PANE_COUNT_PROBE_MS` cadence. Starts at 1 so the first cycle
+            // takes the cheap path; a user's split shows up within a couple of
+            // seconds. Reset on retarget so a probe runs for the new pane.
+            let mut pane_count: u16 = 1;
+            let mut last_pane_probe: Option<std::time::Instant> = None;
             while !stop_flag.load(Ordering::Relaxed) {
                 let lines = lines_cell.load(Ordering::Relaxed);
                 // Read the target without holding the lock across the fork:
@@ -898,6 +959,8 @@ impl LiveCaptureWorker {
                         vt_source = None;
                         last_vt_arm = None;
                     }
+                    pane_count = 1;
+                    last_pane_probe = None;
                 }
                 // `[tmux] vt_live`, re-read every cycle. Toggling off while a
                 // channel is armed tears it down (disabling its `pipe-pane`);
@@ -914,6 +977,25 @@ impl LiveCaptureWorker {
                 }
                 if lines > 0 && !name.is_empty() {
                     let forward_empty = forward_empty_cell.load(Ordering::Relaxed);
+                    // Outside live mode, keep a lazy count of the target
+                    // window's panes so a hand-made split stops being
+                    // invisible. Live mode never composites, so it never pays
+                    // for the probe either.
+                    let is_live = live_cell.load(Ordering::Relaxed);
+                    if !is_live
+                        && last_pane_probe.is_none_or(|t| {
+                            t.elapsed() >= std::time::Duration::from_millis(PANE_COUNT_PROBE_MS)
+                        })
+                    {
+                        last_pane_probe = Some(std::time::Instant::now());
+                        pane_count = probe_pane_count(&name);
+                    }
+                    // A split window's passive preview goes through the
+                    // compositor, which reads every pane. That bypasses the VT
+                    // grid (a channel mirrors one pane only), so the cost lands
+                    // exclusively on split windows; an unsplit session keeps the
+                    // fork-free steady state untouched.
+                    let composite = !is_live && pane_count > 1;
                     // An OSC 52 clipboard write the displayed agent emitted
                     // since the last cycle (VT path only). Published below
                     // under the same retarget guard as the cursor.
@@ -932,7 +1014,14 @@ impl LiveCaptureWorker {
                     // hold the last-good frame (drop it); forward panes
                     // (terminals) surface empty so stale text clears.
                     #[cfg(unix)]
-                    let (capture, cursor_now) = if vt_enabled {
+                    let (capture, cursor_now) = if composite {
+                        // Drop any armed channel: it mirrors `^.0` alone, and
+                        // holding it would keep the exclusive `pipe-pane` slot
+                        // from a viewer that can actually use it.
+                        vt_source = None;
+                        last_vt_arm = None;
+                        capture_composited(&name, lines, forward_empty)
+                    } else if vt_enabled {
                         if vt_source.is_none()
                             && last_vt_arm.is_none_or(|t| t.elapsed() >= VT_REARM_INTERVAL)
                         {
@@ -967,7 +1056,11 @@ impl LiveCaptureWorker {
                         capture_via_tmux(&name, lines, forward_empty)
                     };
                     #[cfg(not(unix))]
-                    let (capture, cursor_now) = capture_via_tmux(&name, lines, forward_empty);
+                    let (capture, cursor_now) = if composite {
+                        capture_composited(&name, lines, forward_empty)
+                    } else {
+                        capture_via_tmux(&name, lines, forward_empty)
+                    };
                     // Chunk-arrival timing for the repaint-quiescence debounce,
                     // only when sampling a live VT grid. `None` on the
                     // capture-pane fallback and non-unix, which leaves pacing to
@@ -1116,6 +1209,7 @@ impl LiveCaptureWorker {
             cursor,
             clipboard,
             vt_enabled,
+            live,
         }
     }
 
@@ -1204,6 +1298,7 @@ impl LiveCaptureWorker {
     /// cycle now (the passive wheel forward reads it), and the render only
     /// paints it under live-send, so a backgrounded preview never shows one.
     pub(in crate::tui) fn set_live(&self, live: bool) {
+        self.live.store(live, std::sync::atomic::Ordering::Relaxed);
         let ms = if live {
             LIVE_CAPTURE_INTERVAL_FAST_MS
         } else {
