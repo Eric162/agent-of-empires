@@ -1506,37 +1506,40 @@ mod tests {
     /// capture sees anything. Mirrors
     /// `capture_pane_with_cursor_returns_content_and_cursor`.
     fn wait_for_pane_text(session: &Session, needle: &str) {
-        for _ in 0..50 {
-            if session
-                .capture_pane(20)
-                .map(|c| c.contains(needle))
-                .unwrap_or(false)
-            {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        panic!(
-            "pane {} never painted {needle:?}; last capture: {:?}",
-            session.name,
-            session.capture_pane(20)
-        );
+        wait_for_text(session, needle, "pane", |s| s.capture_pane(20));
     }
 
     /// Poll until the composited capture contains `needle`, for the panes a
     /// plain `capture_pane` cannot see.
     fn wait_for_composite_text(session: &Session, needle: &str) {
+        wait_for_text(session, needle, "composite", |s| {
+            s.capture_window_composited(20)
+        });
+    }
+
+    /// Shared poll loop. Reports the LAST OBSERVED capture on timeout rather
+    /// than taking a fresh one, which is the thing you want when this trips in
+    /// CI: a re-capture at panic time can show different content than the poll
+    /// ever saw, which sends the reader chasing the wrong thing.
+    fn wait_for_text(
+        session: &Session,
+        needle: &str,
+        what: &str,
+        capture: impl Fn(&Session) -> Result<String>,
+    ) {
+        let mut last = None;
         for _ in 0..50 {
-            if session
-                .capture_window_composited(20)
-                .map(|c| c.contains(needle))
-                .unwrap_or(false)
-            {
+            let seen = capture(session).unwrap_or_default();
+            if seen.contains(needle) {
                 return;
             }
+            last = Some(seen);
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        panic!("composite for {} never painted {needle:?}", session.name);
+        panic!(
+            "{what} for {} never painted {needle:?}; last seen: {last:?}",
+            session.name
+        );
     }
 
     #[test]
@@ -2450,11 +2453,34 @@ mod tests {
         wait_for_pane_text(&session, "ALPHA");
         split_composite_session(&session, "sh -c 'echo BRAVO; sleep 30'");
         wait_for_composite_text(&session, "BRAVO");
-        // Make the SECOND pane active: pane 0 must still come back first.
-        crate::tmux::tmux_command()
+        // Make the SECOND pane active: pane 0 must still come back first. The
+        // select must be asserted, or a failure leaves pane 0 active and the
+        // assertions below pass for the boring reason, silently retiring the
+        // premise this test exists to check.
+        let selected = crate::tmux::tmux_command()
             .args(["select-pane", "-t", &format!("{}:^.1", session.name)])
             .output()
             .expect("tmux select-pane");
+        assert!(
+            selected.status.success(),
+            "select-pane must land, or this degrades to the pane-0-already-active case"
+        );
+        let active = crate::tmux::tmux_command()
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                &format!("{}:^", session.name),
+                "-F",
+                "#{pane_index}",
+            ])
+            .output()
+            .expect("tmux display-message");
+        assert_eq!(
+            String::from_utf8_lossy(&active.stdout).trim(),
+            "1",
+            "pane 1 should be the active pane before the layout is captured"
+        );
         let layout = session
             .capture_window_layout(2)
             .expect("layout for a split window");
