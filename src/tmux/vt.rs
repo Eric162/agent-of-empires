@@ -1526,6 +1526,53 @@ impl VtChannel {
         (content, Some(cursor))
     }
 
+    /// Sample the VISIBLE grid as `want_rows` rows padded to `want_cols`
+    /// display columns, for splicing this pane into a composited window.
+    ///
+    /// Unlike [`sample`](Self::sample) this never reaches into scrollback: a
+    /// composite shows the live window only, since panes have independent
+    /// histories with no coherent way to stack them.
+    ///
+    /// `want_cols` / `want_rows` come from tmux's view of the pane, which can
+    /// briefly disagree with the grid mid-resize. Padding and truncating to the
+    /// requested rectangle keeps that frame merely stale instead of shifting
+    /// every pane to its right.
+    pub(crate) fn sample_rows_padded(
+        &self,
+        want_cols: u16,
+        want_rows: u16,
+    ) -> Option<(Vec<String>, PaneCursor)> {
+        self.reconcile_size();
+        self.refresh_owner_heartbeat();
+        let cols = self.cols.load(Ordering::Relaxed);
+        let rows = self.rows.load(Ordering::Relaxed);
+        let want_cols = want_cols.max(1);
+        let want_rows = want_rows.max(1);
+
+        let p = self.parser.lock().ok()?;
+        let screen = p.screen();
+        let readable_cols = cols.min(want_cols);
+        let out = (0..want_rows)
+            .map(|row| {
+                if row >= rows {
+                    // Grid shorter than tmux says the pane is: blank filler
+                    // rather than a row borrowed from somewhere else.
+                    return " ".repeat(want_cols as usize);
+                }
+                let last = row_last_col(screen, row, readable_cols);
+                let mut line = row_to_ansi_upto(screen, row, last);
+                if last < want_cols {
+                    line.push_str("\x1b[0m");
+                    line.extend(std::iter::repeat_n(' ', (want_cols - last) as usize));
+                }
+                line
+            })
+            .collect();
+        let cursor = cursor_from_screen(screen, rows, cols);
+        drop(p);
+        Some((out, cursor))
+    }
+
     /// Whether the forwarder is connected and the reader loop is running. A
     /// channel that never connected, or whose pipe has since closed, reports
     /// `false` so input and capture fall back to the legacy tmux path instead
@@ -1981,6 +2028,58 @@ mod tests {
             last_owner_hb: Mutex::new(Instant::now()),
         });
         (ch, alive)
+    }
+
+    #[test]
+    fn sample_rows_padded_renders_the_visible_grid_at_the_requested_rectangle() {
+        // The live composite asks for pane 0's rectangle as tmux reports it,
+        // which can differ from the grid's own size mid-resize. Every returned
+        // row must occupy exactly the requested width, and there must be
+        // exactly the requested number of them, or the panes spliced to the
+        // right of this one shift.
+        let name = format!("aoe_test_vt_padded_{}", std::process::id());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (ch, _alive) = dummy_channel(&name, dir.path());
+        // Grid is 4 rows x 20 cols (see `dummy_channel`).
+        ch.parser
+            .lock()
+            .unwrap()
+            .process(b"hello\r\nworld\r\n\x1b[41mfilled");
+
+        // Exact rectangle.
+        let (rows, cursor) = ch.sample_rows_padded(20, 4).expect("sample");
+        assert_eq!(rows.len(), 4);
+        for (i, r) in rows.iter().enumerate() {
+            assert_eq!(
+                crate::tmux::utils::strip_ansi(r).chars().count(),
+                20,
+                "row {i} not padded to width: {r:?}"
+            );
+        }
+        assert!(crate::tmux::utils::strip_ansi(&rows[0]).starts_with("hello"));
+        assert!(crate::tmux::utils::strip_ansi(&rows[1]).starts_with("world"));
+        // Cursor comes straight off the grid and is always trustworthy.
+        assert!(cursor.position_reliable);
+
+        // Narrower and shorter than the grid: truncate, never overflow.
+        let (rows, _) = ch.sample_rows_padded(6, 2).expect("sample");
+        assert_eq!(rows.len(), 2);
+        for r in &rows {
+            assert_eq!(crate::tmux::utils::strip_ansi(r).chars().count(), 6);
+        }
+
+        // Taller than the grid (tmux says the pane grew before the grid caught
+        // up): the extra rows are blank filler at the right width, not rows
+        // borrowed from elsewhere.
+        let (rows, _) = ch.sample_rows_padded(10, 6).expect("sample");
+        assert_eq!(rows.len(), 6);
+        for (i, r) in rows.iter().enumerate() {
+            let plain = crate::tmux::utils::strip_ansi(r);
+            assert_eq!(plain.chars().count(), 10, "row {i}: {r:?}");
+            if i >= 4 {
+                assert!(plain.trim().is_empty(), "row {i} should be filler: {r:?}");
+            }
+        }
     }
 
     #[test]

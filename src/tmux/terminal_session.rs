@@ -235,12 +235,6 @@ impl PairedTerminal {
         }
         super::Session::from_name(&self.name).capture_window_composited(lines)
     }
-
-    fn capture_pane(&self, lines: usize) -> Result<String> {
-        // Shared with the agent session / web live view paths: same
-        // `^.0` targeting and trailing-blank preservation semantics.
-        super::Session::from_name(&self.name).capture_pane(lines)
-    }
 }
 
 pub struct TerminalSession {
@@ -303,12 +297,8 @@ impl TerminalSession {
         self.inner.attach()
     }
 
-    pub fn capture_pane(&self, lines: usize) -> Result<String> {
-        self.inner.capture_pane(lines)
-    }
-
-    /// Passive-preview capture with the window's other panes composited in;
-    /// see [`super::Session::capture_window_composited`].
+    /// Preview capture with the window's other panes composited in; see
+    /// [`super::Session::capture_window_composited`].
     pub fn capture_window_composited(&self, lines: usize) -> Result<String> {
         self.inner.capture_window_composited(lines)
     }
@@ -372,12 +362,8 @@ impl ContainerTerminalSession {
         self.inner.attach()
     }
 
-    pub fn capture_pane(&self, lines: usize) -> Result<String> {
-        self.inner.capture_pane(lines)
-    }
-
-    /// Passive-preview capture with the window's other panes composited in;
-    /// see [`super::Session::capture_window_composited`].
+    /// Preview capture with the window's other panes composited in; see
+    /// [`super::Session::capture_window_composited`].
     pub fn capture_window_composited(&self, lines: usize) -> Result<String> {
         self.inner.capture_window_composited(lines)
     }

@@ -55,6 +55,53 @@ pub(crate) struct CapturedPane {
     pub rows: Vec<String>,
 }
 
+/// A window's dimensions and every pane's rectangle plus captured rows.
+///
+/// Held as a unit so the live preview can cache one across frames: the panes
+/// the user is only *watching* refresh on a lazy cadence, while pane 0 (the
+/// one receiving input, whose latency is the only one that can be felt) is
+/// re-rendered every frame from its VT grid.
+pub(crate) struct WindowLayout {
+    pub window_width: u16,
+    pub window_height: u16,
+    pub panes: Vec<CapturedPane>,
+}
+
+impl WindowLayout {
+    pub(crate) fn composite(&self) -> String {
+        composite_window(self.window_width, self.window_height, &self.panes)
+    }
+
+    /// The first pane's rectangle, which tmux guarantees sits at the window
+    /// origin: pane indices follow layout order, so index 0 is the top-left
+    /// pane, and closing it renumbers whichever pane takes that corner. That
+    /// is what lets a VT grid's cursor be painted onto the composite with no
+    /// coordinate translation.
+    pub(crate) fn first_pane(&self) -> Option<PaneGeom> {
+        self.panes.first().map(|p| p.geom)
+    }
+
+    /// Composite with the first pane's rows swapped for `rows`, for the live
+    /// path's fresh VT-grid frame over a cached layout.
+    pub(crate) fn composite_with_first_pane_rows(&self, rows: &[String]) -> String {
+        let Some(first) = self.panes.first() else {
+            return self.composite();
+        };
+        let mut panes: Vec<CapturedPane> = Vec::with_capacity(self.panes.len());
+        panes.push(CapturedPane {
+            geom: first.geom,
+            rows: rows.to_vec(),
+        });
+        for pane in &self.panes[1..] {
+            panes.push(CapturedPane {
+                geom: pane.geom,
+                rows: pane.rows.clone(),
+            });
+        }
+        composite_window(self.window_width, self.window_height, &panes)
+    }
+}
+
 /// Border glyphs. tmux draws proper tee/cross junctions; a preview only needs
 /// the two edges, so a full-width gap row is drawn as an unbroken rule rather
 /// than tracking which columns carry a vertical border through it.
@@ -213,6 +260,55 @@ mod tests {
             pane(4, 0, 3, 2, &["xyz", "uvw"]),
         ];
         assert_eq!(composite_window(7, 2, &panes), "abc│xyz\n   │uvw");
+    }
+
+    fn layout(w: u16, h: u16, panes: Vec<CapturedPane>) -> WindowLayout {
+        WindowLayout {
+            window_width: w,
+            window_height: h,
+            panes,
+        }
+    }
+
+    #[test]
+    fn first_pane_is_the_one_at_the_window_origin() {
+        // tmux orders pane indices by layout, so index 0 is the top-left pane.
+        // The live path relies on this to paint pane 0's cursor onto the
+        // composite without translating its coordinates.
+        let l = layout(
+            9,
+            1,
+            vec![pane(0, 0, 4, 1, &["left"]), pane(5, 0, 4, 1, &["rght"])],
+        );
+        let first = l.first_pane().expect("a first pane");
+        assert_eq!((first.left, first.top), (0, 0));
+    }
+
+    #[test]
+    fn swapping_the_first_pane_rows_leaves_the_others_alone() {
+        // The live path's whole trick: a cached layout re-rendered with only
+        // pane 0 refreshed from its VT grid.
+        let l = layout(
+            9,
+            2,
+            vec![
+                pane(0, 0, 4, 2, &["old1", "old2"]),
+                pane(5, 0, 4, 2, &["keep", "same"]),
+            ],
+        );
+        let fresh = vec!["new1".to_string(), "new2".to_string()];
+        assert_eq!(
+            l.composite_with_first_pane_rows(&fresh),
+            "new1│keep\nnew2│same"
+        );
+        // The cached layout is not consumed: the next frame swaps again.
+        assert_eq!(l.composite(), "old1│keep\nold2│same");
+    }
+
+    #[test]
+    fn swapping_rows_on_an_empty_layout_is_a_no_op() {
+        let l = layout(3, 1, vec![]);
+        assert_eq!(l.composite_with_first_pane_rows(&["x".to_string()]), "");
     }
 
     #[test]

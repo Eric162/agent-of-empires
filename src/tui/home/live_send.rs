@@ -782,12 +782,6 @@ pub(in crate::tui) struct LiveCaptureWorker {
     /// down an armed channel (disabling its `pipe-pane`) and falls back to
     /// the capture path in place, no restart needed.
     vt_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Whether live-send is attached to the pane this worker is capturing.
-    /// Set alongside the cadence by `set_live`. Gates the split-window
-    /// composite: a passive preview shows every pane the user has split off,
-    /// but live mode stays on the single pinned `^.0` pane, which is the one
-    /// that receives input and owns the cursor being painted.
-    live: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for LiveCaptureWorker {
@@ -846,6 +840,67 @@ fn capture_composited(
     }
 }
 
+/// How long a cached window layout serves the composite before the panes
+/// around pane 0 are re-captured.
+///
+/// Only pane 0 receives input, so only its latency can be felt; the panes
+/// beside it are being watched, not driven. Refreshing them at this cadence
+/// while pane 0 comes from its VT grid every frame keeps echo latency
+/// identical to an unsplit session, at roughly three forks a second instead of
+/// one per frame.
+const COMPOSITE_LAYOUT_MS: u64 = 300;
+
+/// Composite transport for a split window with a live VT channel on pane 0.
+///
+/// Pane 0's rows come from the grid every call (so typing echoes at full
+/// speed); every other pane comes from `cache`, re-captured on the
+/// [`COMPOSITE_LAYOUT_MS`] cadence. Falls back to the all-panes fork whenever
+/// there is no usable layout or the grid cannot be read.
+fn capture_composited_over_grid(
+    name: &str,
+    channel: &crate::tmux::vt::VtChannel,
+    cache: &mut Option<(std::time::Instant, crate::tmux::composite::WindowLayout)>,
+    pane_count: u16,
+    lines: usize,
+    forward_empty: bool,
+) -> (Option<String>, Option<crate::tmux::PaneCursor>) {
+    let stale = cache.as_ref().is_none_or(|(at, _)| {
+        at.elapsed() >= std::time::Duration::from_millis(COMPOSITE_LAYOUT_MS)
+    });
+    if stale {
+        if let Some(layout) =
+            crate::tmux::Session::from_name(name).capture_window_layout(pane_count)
+        {
+            *cache = Some((std::time::Instant::now(), layout));
+        }
+    }
+
+    let Some((_, layout)) = cache.as_ref() else {
+        return capture_composited(name, lines, forward_empty);
+    };
+    let Some(first) = layout.first_pane() else {
+        return capture_composited(name, lines, forward_empty);
+    };
+    let Some((rows, mut cursor)) = channel.sample_rows_padded(first.width, first.height) else {
+        return capture_composited(name, lines, forward_empty);
+    };
+
+    // The cursor is pane 0's, and tmux puts pane 0 at the window origin, so its
+    // coordinates already index the composite with no translation. What must be
+    // restated is the frame it is measured against: the renderer anchors the
+    // cursor by `pane_height` against the painted line count, which is now the
+    // whole window rather than one pane.
+    cursor.pane_height = layout.window_height;
+    cursor.pane_width = layout.window_width;
+    // A composite carries no scrollback (panes have independent histories), so
+    // the preview must not advertise any to scroll into.
+    cursor.history_size = 0;
+    (
+        Some(layout.composite_with_first_pane_rows(&rows)),
+        Some(cursor),
+    )
+}
+
 /// The default capture transport: one `capture-pane` fork that folds in the
 /// cursor probe. Shared by the worker's non-VT path on all platforms.
 fn capture_via_tmux(
@@ -878,8 +933,6 @@ impl LiveCaptureWorker {
         // `[tmux] vt_live` value right after spawn (and on every config
         // refresh), so the worker itself never touches the config file.
         let vt_enabled = Arc::new(AtomicBool::new(true));
-        let live = Arc::new(AtomicBool::new(false));
-        let live_cell = live.clone();
         let lines_cell = capture_lines.clone();
         let target_cell = target.clone();
         let slot = latest.clone();
@@ -926,6 +979,14 @@ impl LiveCaptureWorker {
             // seconds. Reset on retarget so a probe runs for the new pane.
             let mut pane_count: u16 = 1;
             let mut last_pane_probe: Option<std::time::Instant> = None;
+            // Window geometry plus the captured rows of every pane, reused
+            // across frames while pane 0 is re-rendered from its VT grid.
+            // Dropped on retarget and whenever the pane count changes, since
+            // the cached rectangles then describe a layout that is gone.
+            let mut composite_layout: Option<(
+                std::time::Instant,
+                crate::tmux::composite::WindowLayout,
+            )> = None;
             while !stop_flag.load(Ordering::Relaxed) {
                 let lines = lines_cell.load(Ordering::Relaxed);
                 // Read the target without holding the lock across the fork:
@@ -961,6 +1022,7 @@ impl LiveCaptureWorker {
                     }
                     pane_count = 1;
                     last_pane_probe = None;
+                    composite_layout = None;
                 }
                 // `[tmux] vt_live`, re-read every cycle. Toggling off while a
                 // channel is armed tears it down (disabling its `pipe-pane`);
@@ -977,25 +1039,27 @@ impl LiveCaptureWorker {
                 }
                 if lines > 0 && !name.is_empty() {
                     let forward_empty = forward_empty_cell.load(Ordering::Relaxed);
-                    // Outside live mode, keep a lazy count of the target
-                    // window's panes so a hand-made split stops being
-                    // invisible. Live mode never composites, so it never pays
-                    // for the probe either.
-                    let is_live = live_cell.load(Ordering::Relaxed);
-                    if !is_live
-                        && last_pane_probe.is_none_or(|t| {
-                            t.elapsed() >= std::time::Duration::from_millis(PANE_COUNT_PROBE_MS)
-                        })
-                    {
+                    // Keep a lazy count of the target window's panes so a
+                    // hand-made split stops being invisible. One tiny fork
+                    // every couple of seconds on the single previewed pane.
+                    if last_pane_probe.is_none_or(|t| {
+                        t.elapsed() >= std::time::Duration::from_millis(PANE_COUNT_PROBE_MS)
+                    }) {
                         last_pane_probe = Some(std::time::Instant::now());
-                        pane_count = probe_pane_count(&name);
+                        let seen = probe_pane_count(&name);
+                        if seen != pane_count {
+                            // Layout changed under us; the cached rectangles no
+                            // longer describe this window.
+                            composite_layout = None;
+                            pane_count = seen;
+                        }
                     }
-                    // A split window's passive preview goes through the
-                    // compositor, which reads every pane. That bypasses the VT
-                    // grid (a channel mirrors one pane only), so the cost lands
-                    // exclusively on split windows; an unsplit session keeps the
-                    // fork-free steady state untouched.
-                    let composite = !is_live && pane_count > 1;
+                    // A split window renders through the compositor in BOTH
+                    // passive and live mode. With a VT channel armed the split
+                    // costs no more per frame than an unsplit session: pane 0
+                    // still comes from the grid, and only the panes beside it
+                    // are re-captured, on their own slower cadence.
+                    let composite = pane_count > 1;
                     // An OSC 52 clipboard write the displayed agent emitted
                     // since the last cycle (VT path only). Published below
                     // under the same retarget guard as the cursor.
@@ -1014,14 +1078,7 @@ impl LiveCaptureWorker {
                     // hold the last-good frame (drop it); forward panes
                     // (terminals) surface empty so stale text clears.
                     #[cfg(unix)]
-                    let (capture, cursor_now) = if composite {
-                        // Drop any armed channel: it mirrors `^.0` alone, and
-                        // holding it would keep the exclusive `pipe-pane` slot
-                        // from a viewer that can actually use it.
-                        vt_source = None;
-                        last_vt_arm = None;
-                        capture_composited(&name, lines, forward_empty)
-                    } else if vt_enabled {
+                    let (capture, cursor_now) = if vt_enabled {
                         if vt_source.is_none()
                             && last_vt_arm.is_none_or(|t| t.elapsed() >= VT_REARM_INTERVAL)
                         {
@@ -1046,12 +1103,28 @@ impl LiveCaptureWorker {
                         }
                         match vt_source.as_ref() {
                             Some(v) => {
-                                let (content, cur) = v.sample(lines);
                                 clipboard_now = v.take_clipboard();
-                                (Some(content), cur)
+                                if composite {
+                                    capture_composited_over_grid(
+                                        &name,
+                                        v,
+                                        &mut composite_layout,
+                                        pane_count,
+                                        lines,
+                                        forward_empty,
+                                    )
+                                } else {
+                                    let (content, cur) = v.sample(lines);
+                                    (Some(content), cur)
+                                }
                             }
+                            // No grid for pane 0, so every pane comes from the
+                            // fork instead.
+                            None if composite => capture_composited(&name, lines, forward_empty),
                             None => capture_via_tmux(&name, lines, forward_empty),
                         }
+                    } else if composite {
+                        capture_composited(&name, lines, forward_empty)
                     } else {
                         capture_via_tmux(&name, lines, forward_empty)
                     };
@@ -1209,7 +1282,6 @@ impl LiveCaptureWorker {
             cursor,
             clipboard,
             vt_enabled,
-            live,
         }
     }
 
@@ -1298,7 +1370,6 @@ impl LiveCaptureWorker {
     /// cycle now (the passive wheel forward reads it), and the render only
     /// paints it under live-send, so a backgrounded preview never shows one.
     pub(in crate::tui) fn set_live(&self, live: bool) {
-        self.live.store(live, std::sync::atomic::Ordering::Relaxed);
         let ms = if live {
             LIVE_CAPTURE_INTERVAL_FAST_MS
         } else {

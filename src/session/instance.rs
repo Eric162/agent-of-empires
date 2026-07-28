@@ -5185,16 +5185,9 @@ impl Instance {
         self.update_status_with_metadata(None);
     }
 
-    pub fn capture_output(&self, lines: usize) -> Result<String> {
-        // capture-pane has no size parameters: the pane is captured at
-        // the window's own dimensions. (A previous *_with_size variant
-        // accepted width/height and silently ignored them.)
-        self.tmux_session()?.capture_pane(lines)
-    }
-
-    /// Like [`capture_output`](Self::capture_output) but with the window's
-    /// other panes composited in, for the passive preview. Costs the same
-    /// single fork when the session has not been split.
+    /// Capture the session's window for the preview, with any panes the user
+    /// split off composited in. `capture-pane` has no size parameters: the
+    /// window is captured at its own dimensions.
     pub fn capture_output_composited(&self, lines: usize) -> Result<String> {
         self.tmux_session()?.capture_window_composited(lines)
     }

@@ -2224,17 +2224,16 @@ impl HomeView {
                 // always overwrite, falling back to an empty body (the same
                 // "session looks gone" signal the non-live path uses).
                 let same_session = s.preview_cache.session_id.as_deref() == Some(id);
-                // Outside live mode the preview shows the whole window, panes
-                // and all; live mode stays on the pinned `^.0` pane so this
-                // cold-start frame matches what the worker will publish next
-                // instead of flickering between the two shapes.
-                let fork_capture = s.get_instance(id).and_then(|inst| {
-                    if in_live {
-                        inst.capture_output(capture_lines).ok()
-                    } else {
-                        inst.capture_output_composited(capture_lines).ok()
-                    }
-                });
+                // Composited in BOTH modes, matching what the worker publishes.
+                // This fallback also runs on every idle refresh (the worker
+                // dedups unchanged frames, so it has nothing to hand over), so a
+                // pane-0-only capture here would clobber the worker's composite
+                // a beat after each keystroke and leave the split visible for
+                // only one frame at a time. On an unsplit window this returns
+                // the pane bytes verbatim, so nothing changes there.
+                let fork_capture = s
+                    .get_instance(id)
+                    .and_then(|inst| inst.capture_output_composited(capture_lines).ok());
                 if in_live {
                     match fork_capture {
                         Some(content) if !content.is_empty() => Some(content),
@@ -2267,19 +2266,9 @@ impl HomeView {
             false,
             |s| &mut s.terminal_preview_cache,
             |s, id, capture_lines| {
-                let in_live = s
-                    .live_send
-                    .as_ref()
-                    .is_some_and(|st| st.target == live_send::LiveSendTarget::Terminal);
                 s.get_instance(id).map(|inst| {
                     inst.terminal_tmux_session()
-                        .and_then(|sess| {
-                            if in_live {
-                                sess.capture_pane(capture_lines)
-                            } else {
-                                sess.capture_window_composited(capture_lines)
-                            }
-                        })
+                        .and_then(|sess| sess.capture_window_composited(capture_lines))
                         .unwrap_or_default()
                 })
             },
@@ -2306,19 +2295,9 @@ impl HomeView {
             false,
             |s| &mut s.container_terminal_preview_cache,
             |s, id, capture_lines| {
-                let in_live = s
-                    .live_send
-                    .as_ref()
-                    .is_some_and(|st| st.target == live_send::LiveSendTarget::ContainerTerminal);
                 s.get_instance(id).map(|inst| {
                     inst.container_terminal_tmux_session()
-                        .and_then(|sess| {
-                            if in_live {
-                                sess.capture_pane(capture_lines)
-                            } else {
-                                sess.capture_window_composited(capture_lines)
-                            }
-                        })
+                        .and_then(|sess| sess.capture_window_composited(capture_lines))
                         .unwrap_or_default()
                 })
             },
@@ -2350,17 +2329,10 @@ impl HomeView {
             false,
             |s| &mut s.tool_preview_cache,
             |s, id, capture_lines| {
-                let in_live = s.live_send.as_ref().is_some_and(|st| {
-                    st.target == live_send::LiveSendTarget::Tool(tool_name.to_string())
-                });
                 s.get_instance(id).map(|inst| {
-                    let sess = crate::tmux::ToolSession::new(&inst.id, &inst.title, tool_name);
-                    if in_live {
-                        sess.capture_pane(capture_lines)
-                    } else {
-                        sess.capture_window_composited(capture_lines)
-                    }
-                    .unwrap_or_default()
+                    crate::tmux::ToolSession::new(&inst.id, &inst.title, tool_name)
+                        .capture_window_composited(capture_lines)
+                        .unwrap_or_default()
                 })
             },
         );

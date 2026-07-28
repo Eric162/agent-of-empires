@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::{
-    composite::{composite_window, CapturedPane, PaneGeom},
+    composite::{CapturedPane, PaneGeom, WindowLayout},
     probe_session_existence, refresh_session_cache,
     utils::{
         append_clipboard_passthrough_args, append_mouse_on_args, append_pane_base_index_args,
@@ -611,36 +611,44 @@ impl Session {
         // back to the pane-0 bytes already in hand, so a composite that cannot
         // be built is never worse than the old single-pane preview.
         Ok(self
-            .capture_split_window(count, window_width, window_height)
+            .capture_window_layout(count)
+            .map(|layout| layout.composite())
             .unwrap_or(pane0_content))
     }
 
     /// Second fork of [`capture_window_composited`](Self::capture_window_composited):
-    /// geometry plus visible capture for each of `count` panes, chained into one
-    /// `tmux` invocation, spliced by [`composite_window`].
+    /// window dimensions plus geometry and visible capture for each of `count`
+    /// panes, chained into one `tmux` invocation.
     ///
     /// Pane indices are contiguous from 0 within a window (tmux renumbers them
     /// as the layout changes, unlike window indices) and `pane-base-index` is
     /// forced to 0 when the session is created, so `^.0..^.{count-1}` addresses
     /// every pane without a prior `list-panes` round trip.
-    fn capture_split_window(
-        &self,
-        count: u16,
-        window_width: u16,
-        window_height: u16,
-    ) -> Option<String> {
+    ///
+    /// Returned rather than composited on the spot so the live preview can
+    /// cache a layout across frames and re-render only pane 0 from its VT grid
+    /// (see [`WindowLayout::with_first_pane_rows`]).
+    pub(crate) fn capture_window_layout(&self, count: u16) -> Option<WindowLayout> {
         /// Marks the start of each pane's segment in the chained output. Pane
         /// content could in principle contain this line, which would split one
         /// pane's rows in two; the cost is a single garbled preview frame, and
         /// the string is unusual enough to make that a non-event.
         const SENTINEL: &str = "@@aoe-pane@@";
+        /// Leading line carrying the window's own dimensions, so a cached
+        /// layout is self-contained and needs no separate probe.
+        const WINDOW_SENTINEL: &str = "@@aoe-win@@";
 
-        let mut args: Vec<String> = Vec::new();
+        let mut args: Vec<String> = vec![
+            "display-message".to_string(),
+            "-p".to_string(),
+            "-t".to_string(),
+            format!("{}:^", self.name),
+            "-F".to_string(),
+            format!("{WINDOW_SENTINEL} #{{window_width}} #{{window_height}}"),
+        ];
         for i in 0..count {
             let target = format!("{}:^.{}", self.name, i);
-            if !args.is_empty() {
-                args.push(";".to_string());
-            }
+            args.push(";".to_string());
             args.extend([
                 "display-message".to_string(),
                 "-p".to_string(),
@@ -663,11 +671,24 @@ impl Session {
         }
 
         let raw = String::from_utf8_lossy(&output.stdout);
-        let panes = parse_pane_segments(&raw, SENTINEL);
+        let (header, rest) = raw.split_once('\n')?;
+        let dims = header.strip_prefix(WINDOW_SENTINEL)?;
+        let mut fields = dims.split_whitespace();
+        let window_width: u16 = fields.next().and_then(|f| f.parse().ok())?;
+        let window_height: u16 = fields.next().and_then(|f| f.parse().ok())?;
+        if window_width == 0 || window_height == 0 {
+            return None;
+        }
+
+        let panes = parse_pane_segments(rest, SENTINEL);
         if panes.is_empty() {
             return None;
         }
-        Some(composite_window(window_width, window_height, &panes))
+        Some(WindowLayout {
+            window_width,
+            window_height,
+            panes,
+        })
     }
 
     /// Capture the pane's full scrollback (from session start) with wrapped
@@ -2289,6 +2310,164 @@ mod tests {
         assert!(
             seam_row.contains("BRAVO"),
             "panes should share a row, not stack:\n{seam_row:?}"
+        );
+    }
+
+    /// The live path caches a layout and re-renders only pane 0 from its VT
+    /// grid, so the layout must come back with pane 0 first, at the window
+    /// origin, and with rectangles that tile the real window.
+    #[test]
+    #[serial_test::serial]
+    fn captured_layout_puts_pane_zero_first_at_the_origin() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let guard = TmuxTestSession::new("aoe_test_layout_order");
+        let session_name = guard.name().to_string();
+        let output = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session_name,
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sh -c 'echo ALPHA; sleep 30'",
+            ])
+            .output()
+            .expect("tmux new-session");
+        assert!(output.status.success());
+        crate::tmux::tmux_command()
+            .args(["set-option", "-t", &session_name, "pane-base-index", "0"])
+            .output()
+            .expect("tmux set-option pane-base-index");
+        crate::tmux::tmux_command()
+            .args([
+                "split-window",
+                "-h",
+                "-t",
+                &session_name,
+                "sh -c 'echo BRAVO; sleep 30'",
+            ])
+            .output()
+            .expect("tmux split-window");
+        // Make the SECOND pane active: pane 0 must still come back first.
+        crate::tmux::tmux_command()
+            .args(["select-pane", "-t", &format!("{session_name}:^.1")])
+            .output()
+            .expect("tmux select-pane");
+        std::thread::sleep(std::time::Duration::from_millis(400));
+
+        let session = Session {
+            name: session_name.clone(),
+        };
+        let layout = session
+            .capture_window_layout(2)
+            .expect("layout for a split window");
+        assert_eq!(layout.panes.len(), 2);
+        assert_eq!(layout.window_width, 80);
+        let first = layout.first_pane().expect("first pane");
+        assert_eq!(
+            (first.left, first.top),
+            (0, 0),
+            "pane 0 must sit at the window origin for the cursor math to hold"
+        );
+        // Pane 0 is the agent's, even though pane 1 is the active one.
+        assert!(
+            layout.panes[0].rows.iter().any(|r| r.contains("ALPHA")),
+            "pane 0 rows: {:?}",
+            layout.panes[0].rows
+        );
+        assert!(layout.panes[1].rows.iter().any(|r| r.contains("BRAVO")));
+        // Every row is padded to its own pane's width, which is what lets the
+        // compositor concatenate them.
+        for (i, pane) in layout.panes.iter().enumerate() {
+            for row in &pane.rows {
+                assert_eq!(
+                    crate::tmux::utils::strip_ansi(row).chars().count(),
+                    pane.geom.width as usize,
+                    "pane {i} row not padded to {}: {row:?}",
+                    pane.geom.width
+                );
+            }
+        }
+    }
+
+    /// The two composite transports must agree byte for byte on a static
+    /// window.
+    ///
+    /// The live path renders a cached layout with pane 0 swapped for its VT
+    /// grid rows, while the passive fallback re-forks every pane. Any
+    /// divergence in shape between them shows up as the preview flickering
+    /// between two renderings as one path takes over from the other, which is
+    /// exactly the bug that shipped when the fallback still captured pane 0
+    /// alone: the split was visible for one frame after each keystroke and
+    /// vanished during idle.
+    #[test]
+    #[serial_test::serial]
+    fn both_composite_transports_agree_on_a_static_window() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let guard = TmuxTestSession::new("aoe_test_composite_agree");
+        let session_name = guard.name().to_string();
+        crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session_name,
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sh -c 'echo ALPHA; sleep 30'",
+            ])
+            .output()
+            .expect("tmux new-session");
+        crate::tmux::tmux_command()
+            .args(["set-option", "-t", &session_name, "pane-base-index", "0"])
+            .output()
+            .expect("tmux set-option pane-base-index");
+        crate::tmux::tmux_command()
+            .args([
+                "split-window",
+                "-h",
+                "-t",
+                &session_name,
+                "sh -c 'echo BRAVO; sleep 30'",
+            ])
+            .output()
+            .expect("tmux split-window");
+        std::thread::sleep(std::time::Duration::from_millis(400));
+
+        let session = Session {
+            name: session_name.clone(),
+        };
+        // Passive fallback: one fork per pane, composited on the spot.
+        let fallback = session
+            .capture_window_composited(24)
+            .expect("capture_window_composited");
+        let layout = session.capture_window_layout(2).expect("layout");
+        // Live path, minus the grid: swapping pane 0's own captured rows back
+        // in must be a no-op, which is what makes the swap safe to do with
+        // fresher rows every frame.
+        let swapped = layout.composite_with_first_pane_rows(&layout.panes[0].rows.clone());
+
+        assert_eq!(
+            fallback,
+            layout.composite(),
+            "fork-per-frame and cached-layout renderings diverged"
+        );
+        assert_eq!(
+            fallback, swapped,
+            "swapping pane 0's rows for identical rows changed the frame"
         );
     }
 
