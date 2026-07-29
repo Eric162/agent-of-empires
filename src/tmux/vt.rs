@@ -724,6 +724,9 @@ fn cursor_from_screen(screen: &vt100::Screen, rows: u16, cols: u16) -> PaneCurso
         // Authoritative: the cursor is read straight from the owned grid, not
         // probed against a racing capture, so it is always trustworthy.
         position_reliable: true,
+        // The grid is pane 0's alone. `capture_composited_over_grid` sets this
+        // when it splices that grid into a composited window.
+        composite_pane0: None,
     }
 }
 

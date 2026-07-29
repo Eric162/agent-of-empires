@@ -203,6 +203,62 @@ fn split_bracketed_paste(text: &str) -> Vec<live_send::TmuxKey> {
     vec![live_send::TmuxKey::HexBytes(bytes)]
 }
 
+/// The rectangle mouse coordinates are mapped into, or `None` when the pointer
+/// is not over the pane that receives input.
+///
+/// Normally the previewed pane is sized to the preview output rect, so the rect
+/// IS the pane. On a composited preview (the user split the window) the rect is
+/// the whole window while input still goes to pane 0 alone (#435, #488), so the
+/// pane-0 sub-rectangle is the right target: mapping against the full rect would
+/// report a column past pane 0's right edge to the agent as though its own pane
+/// were window-wide. A pointer outside pane 0 has no meaningful coordinate to
+/// report at all, so it is dropped rather than clamped to the nearest edge,
+/// which would otherwise synthesise a click or hover on pane 0's border.
+///
+/// Pane 0 sits at the window origin, so the sub-rectangle shares the preview's
+/// top-left corner and only its extent differs.
+fn mouse_target_rect(
+    cursor: &crate::tmux::PaneCursor,
+    pane: ratatui::layout::Rect,
+    col: u16,
+    row: u16,
+) -> Option<ratatui::layout::Rect> {
+    // Unsplit: the rect IS the pane, and containment stays the caller's business
+    // (`hit_preview` gates the press) with `map_pane_cell` clamping the rest, so
+    // this must not start rejecting cells that used to clamp.
+    if cursor.composite_pane0.is_none() {
+        return Some(pane);
+    }
+    let pane0 = mouse_pane_rect(cursor, pane);
+    let inside = col >= pane0.x
+        && col < pane0.x.saturating_add(pane0.width)
+        && row >= pane0.y
+        && row < pane0.y.saturating_add(pane0.height);
+    inside.then_some(pane0)
+}
+
+/// The input pane's rectangle within the preview, with no containment test:
+/// pane 0's sub-rectangle on a composited preview, else the whole preview rect.
+///
+/// Split from [`mouse_target_rect`] for the mid-gesture case. A drag or release
+/// is deliberately not position-gated so a gesture that began on pane 0 still
+/// completes, and those events need a clamped coordinate even after the pointer
+/// has wandered off pane 0.
+fn mouse_pane_rect(
+    cursor: &crate::tmux::PaneCursor,
+    pane: ratatui::layout::Rect,
+) -> ratatui::layout::Rect {
+    match cursor.composite_pane0 {
+        Some((width, height)) => ratatui::layout::Rect {
+            x: pane.x,
+            y: pane.y,
+            width: width.min(pane.width),
+            height: height.min(pane.height),
+        },
+        None => pane,
+    }
+}
+
 /// Map a hovered screen cell `(col, row)` into a forwarded app's 1-based
 /// mouse coordinate space, relative to its pane `pane` (the live-send target
 /// is sized to the preview output rect, so this maps directly), clamped
@@ -290,8 +346,9 @@ fn hover_forward_bytes(
     col: u16,
     row: u16,
 ) -> Option<Vec<u8>> {
+    let target = mouse_target_rect(cursor, pane, col, row)?;
     (cursor.alternate_on && cursor.mouse_all)
-        .then(|| mouse_event_bytes(3, false, true, cursor.mouse_sgr, pane, col, row))
+        .then(|| mouse_event_bytes(3, false, true, cursor.mouse_sgr, target, col, row))
 }
 
 /// Page presses delivered per wheel notch for a no-mouse full-screen app.
@@ -315,11 +372,15 @@ fn wheel_forward_key(
     if !cursor.alternate_on {
         return None;
     }
+    // Outside pane 0 on a composited preview there is nothing to drive: the
+    // pointer is over a pane that receives no input, and paging pane 0 because
+    // the wheel turned somewhere else would be a scroll the user did not aim.
+    let target = mouse_target_rect(cursor, pane, col, row)?;
     if cursor.mouse_tracking {
         Some(live_send::TmuxKey::HexBytes(wheel_mouse_bytes(
             up,
             cursor.mouse_sgr,
-            pane,
+            target,
             col,
             row,
         )))
@@ -4401,13 +4462,23 @@ impl HomeView {
             self.mouse_forward_btn = None;
             return false;
         };
+        // On a composited preview only pane 0 takes input, so a PRESS outside it
+        // must not open a gesture: the pointer is over a pane the agent does not
+        // own, and forwarding would report the click at a clamped cell pane 0
+        // never saw. Drags and releases stay ungated so a gesture that began on
+        // pane 0 still completes.
+        let press = !release && !motion;
+        if press && mouse_target_rect(&cursor, self.preview_text_view.pane, col, row).is_none() {
+            self.mouse_forward_btn = None;
+            return false;
+        }
         self.mouse_forward_btn = if release { None } else { Some(base_button) };
         let bytes = mouse_event_bytes(
             base_button,
             release,
             motion,
             cursor.mouse_sgr,
-            self.preview_text_view.pane,
+            mouse_pane_rect(&cursor, self.preview_text_view.pane),
             col,
             row,
         );
@@ -6777,6 +6848,7 @@ mod tests {
             mouse_sgr,
             mouse_all: false,
             position_reliable: true,
+            composite_pane0: None,
         }
     }
 
@@ -6811,6 +6883,75 @@ mod tests {
         let mut normal = cursor_for(false, true, true);
         normal.mouse_all = true;
         assert_eq!(hover_forward_bytes(&normal, pane, 10, 5), None);
+    }
+
+    /// On a composited preview the rect is the whole window while input still
+    /// goes to pane 0 alone, so a pointer over a neighbouring pane must not be
+    /// mapped against the full rect: that reported a column past pane 0's right
+    /// edge to the agent as though its own pane were window-wide.
+    #[test]
+    fn composited_preview_maps_the_mouse_into_pane_zero_only() {
+        use ratatui::layout::Rect;
+        // An 80x24 preview showing a window split at column 40.
+        let pane = Rect::new(0, 0, 80, 24);
+        let mut split = cursor_for(true, true, true);
+        split.mouse_all = true;
+        split.composite_pane0 = Some((40, 24));
+
+        // Inside pane 0: maps as before, 1-based.
+        assert_eq!(
+            hover_forward_bytes(&split, pane, 10, 5).as_deref(),
+            Some(b"\x1b[<35;11;6M".as_slice())
+        );
+        // Over the neighbour: dropped, not clamped to pane 0's border, which
+        // would synthesise a hover on a cell the pointer never touched.
+        assert_eq!(hover_forward_bytes(&split, pane, 60, 5), None);
+        assert_eq!(wheel_forward_key(&split, true, pane, 60, 5), None);
+        // The last column of pane 0 is still inside it; the first past it is not.
+        assert!(hover_forward_bytes(&split, pane, 39, 5).is_some());
+        assert_eq!(hover_forward_bytes(&split, pane, 40, 5), None);
+
+        // A no-mouse full-screen agent gets no page key from a wheel aimed at
+        // the neighbour either, but keeps it over pane 0.
+        let mut no_mouse = cursor_for(true, false, false);
+        no_mouse.composite_pane0 = Some((40, 24));
+        assert_eq!(wheel_forward_key(&no_mouse, true, pane, 60, 5), None);
+        assert!(wheel_forward_key(&no_mouse, true, pane, 10, 5).is_some());
+
+        // Unsplit is unchanged: no composite extent, so the whole rect maps.
+        let unsplit = {
+            let mut c = cursor_for(true, true, true);
+            c.mouse_all = true;
+            c
+        };
+        assert_eq!(
+            hover_forward_bytes(&unsplit, pane, 60, 5).as_deref(),
+            Some(b"\x1b[<35;61;6M".as_slice())
+        );
+        // And an unsplit cell OUTSIDE the rect must still CLAMP, not drop. The
+        // press is gated by `hit_preview`, and these helpers have always relied
+        // on `map_pane_cell` to clamp whatever reaches them, so adding the
+        // pane-0 containment test must not leak into the single-pane path.
+        assert_eq!(
+            hover_forward_bytes(&unsplit, pane, 999, 999).as_deref(),
+            Some(b"\x1b[<35;80;24M".as_slice()),
+            "unsplit coordinates clamp to the rect, they do not get dropped"
+        );
+    }
+
+    /// A pane 0 extent larger than the preview rect (the window is bigger than
+    /// the area it is being shown in, e.g. an attached client keeping its own
+    /// size) must clamp to the rect rather than admitting cells outside it.
+    #[test]
+    fn composite_pane_rect_clamps_to_the_preview() {
+        use ratatui::layout::Rect;
+        let pane = Rect::new(2, 3, 20, 10);
+        let mut cursor = cursor_for(true, true, true);
+        cursor.composite_pane0 = Some((999, 999));
+        assert_eq!(mouse_pane_rect(&cursor, pane), pane);
+        // And the origin is honoured: a cell above/left of the rect is outside.
+        assert_eq!(mouse_target_rect(&cursor, pane, 1, 3), None);
+        assert!(mouse_target_rect(&cursor, pane, 2, 3).is_some());
     }
 
     /// The fix for #2407: a full-screen pane with no mouse tracking must

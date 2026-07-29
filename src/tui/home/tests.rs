@@ -11395,6 +11395,7 @@ mod scroll_pane_isolation {
             mouse_sgr,
             mouse_all: false,
             position_reliable: true,
+            composite_pane0: None,
         }
     }
 

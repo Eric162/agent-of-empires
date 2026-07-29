@@ -4015,6 +4015,7 @@ mod tests {
             mouse_sgr: false,
             mouse_all: false,
             position_reliable: true,
+            composite_pane0: None,
         }
     }
 

@@ -914,6 +914,9 @@ fn capture_composited_over_grid(
     // A composite carries no scrollback (panes have independent histories), so
     // the preview must not advertise any to scroll into.
     cursor.history_size = 0;
+    // Rebasing onto the window erases how wide the input pane is, which mouse
+    // forwarding maps into; carry pane 0's extent so it can clamp.
+    cursor.composite_pane0 = Some((first.width, first.height));
     (
         Some(layout.composite_with_first_pane_rows(&rows)),
         Some(cursor),

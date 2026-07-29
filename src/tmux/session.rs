@@ -120,6 +120,22 @@ pub struct PaneCursor {
     /// works while an agent streams. `parse` sets it `true`; only the
     /// cross-probe check downgrades it.
     pub position_reliable: bool,
+    /// Pane 0's `(width, height)` within a COMPOSITED preview, or `None` when
+    /// the preview shows a single pane.
+    ///
+    /// Mouse forwarding maps the hovered cell into the previewed app's
+    /// coordinate space by treating the preview rect as the pane, which holds
+    /// while the two describe the same rectangle. A composite makes the rect the
+    /// whole window, so a pointer over a neighbouring pane maps to a column past
+    /// pane 0's right edge and is reported to the agent as though its own pane
+    /// were that wide. Pane 0 is the only pane that receives input (#435, #488),
+    /// so this carries its extent and the forward clamps to it, dropping events
+    /// that land outside.
+    ///
+    /// Only the extent is needed, never the origin: tmux keeps pane 0 at the
+    /// window origin, because pane indices follow layout order and closing pane
+    /// 0 renumbers whichever pane takes that corner.
+    pub composite_pane0: Option<(u16, u16)>,
 }
 
 /// tmux format line every cursor probe requests, parsed by
@@ -161,6 +177,9 @@ impl PaneCursor {
             // cross-probe check in `capture_pane_with_cursor` is the only
             // thing that downgrades this.
             position_reliable: true,
+            // A probe describes one pane. The composited paths overwrite this
+            // once they know the window really is split.
+            composite_pane0: None,
         })
     }
 }
@@ -700,6 +719,10 @@ impl Session {
             c.pane_height = layout.window_height;
             c.pane_width = layout.window_width;
             c.history_size = 0;
+            // Rebasing the frame onto the window is what the renderer needs, but
+            // it also erases the only record of how wide the input pane is, which
+            // mouse forwarding maps into. Carry pane 0's extent alongside.
+            c.composite_pane0 = layout.first_pane().map(|p| (p.width, p.height));
             c
         });
         Ok((layout.composite(), cursor))
@@ -1656,6 +1679,7 @@ mod tests {
                 mouse_sgr: true,
                 mouse_all: true,
                 position_reliable: true,
+                composite_pane0: None,
             }
         );
         // Legacy mouse (tracking on, SGR off) parses with mouse_sgr false.
