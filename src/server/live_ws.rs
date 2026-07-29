@@ -1162,6 +1162,7 @@ mod tests {
             mouse_sgr: false,
             mouse_all: false,
             position_reliable: true,
+            composite_pane0: None,
         };
         let json = frame_json("hello\nworld", Some(&cursor));
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1190,6 +1191,7 @@ mod tests {
             mouse_sgr: false,
             mouse_all: false,
             position_reliable: true,
+            composite_pane0: None,
         };
         let v: serde_json::Value = serde_json::from_str(&frame_json("x", Some(&cursor))).unwrap();
         assert_eq!(v["altScreen"], true);
@@ -1211,6 +1213,7 @@ mod tests {
             mouse_sgr: false,
             mouse_all: false,
             position_reliable: true,
+            composite_pane0: None,
         };
         let v: serde_json::Value = serde_json::from_str(&frame_json("x", Some(&cursor))).unwrap();
         assert!(v["cursor"].is_null());
