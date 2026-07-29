@@ -858,10 +858,20 @@ const COMPOSITE_LAYOUT_MS: u64 = 300;
 /// speed); every other pane comes from `cache`, re-captured on the
 /// [`COMPOSITE_LAYOUT_MS`] cadence. Falls back to the all-panes fork whenever
 /// there is no usable layout or the grid cannot be read.
+///
+/// `last_pane_probe` is reset whenever the layout capture fails, which is the
+/// signal that `pane_count` has gone stale: the chained capture addresses
+/// `^.0..^.{pane_count-1}`, so a pane the user closed since the last probe makes
+/// tmux exit non-zero (`can't find pane: N`) for the whole invocation. Without
+/// that reset the count would stay wrong until [`PANE_COUNT_PROBE_MS`] elapsed,
+/// and because the cache is only stamped on success the failing fork would be
+/// retried every frame while the preview kept compositing a ghost of the closed
+/// pane from the stale rectangles.
 fn capture_composited_over_grid(
     name: &str,
     channel: &crate::tmux::vt::VtChannel,
     cache: &mut Option<(std::time::Instant, crate::tmux::composite::WindowLayout)>,
+    last_pane_probe: &mut Option<std::time::Instant>,
     pane_count: u16,
     lines: usize,
     forward_empty: bool,
@@ -870,10 +880,17 @@ fn capture_composited_over_grid(
         at.elapsed() >= std::time::Duration::from_millis(COMPOSITE_LAYOUT_MS)
     });
     if stale {
-        if let Some(layout) =
-            crate::tmux::Session::from_name(name).capture_window_layout(pane_count)
-        {
-            *cache = Some((std::time::Instant::now(), layout));
+        match crate::tmux::Session::from_name(name).capture_window_layout(pane_count) {
+            Some(layout) => *cache = Some((std::time::Instant::now(), layout)),
+            // The window is no longer the one these rectangles describe. Drop
+            // them rather than compositing a pane that is gone, force a count
+            // re-probe on the next cycle, and let the fallback below carry this
+            // frame: it probes `window_panes` in the same fork as its capture,
+            // so it is correct no matter how stale the count had become.
+            None => {
+                *cache = None;
+                *last_pane_probe = None;
+            }
         }
     }
 
@@ -1111,6 +1128,7 @@ impl LiveCaptureWorker {
                                         &name,
                                         v,
                                         &mut composite_layout,
+                                        &mut last_pane_probe,
                                         pane_count,
                                         lines,
                                         forward_empty,
