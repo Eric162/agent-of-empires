@@ -793,32 +793,53 @@ impl Drop for LiveCaptureWorker {
     }
 }
 
-/// How often the worker re-asks how many panes its target window has. The
-/// answer only changes when the user splits or closes a pane by hand, so a
-/// lazy cadence is plenty; it costs one tiny `display-message` fork on the one
-/// pane currently being previewed, and only outside live mode.
-const PANE_COUNT_PROBE_MS: u64 = 2_000;
+/// How often the worker re-asks how many panes its target window has, and
+/// whether one is zoomed. The answer only changes when the user splits, closes,
+/// or zooms a pane by hand, so a lazy cadence is enough; it costs one tiny
+/// `display-message` fork on the previewed pane, in live mode as well as out of
+/// it (a mid-session split has to be noticed either way).
+///
+/// This bounds a visible transient rather than only a cost. The render-thread
+/// fallback probes `window_panes` in the SAME fork as its capture, so it composites
+/// as soon as the user splits, while the worker keeps publishing single-pane
+/// frames until this elapses; the preview alternates between the two until they
+/// agree. One second keeps that wobble short without putting the probe anywhere
+/// near per-frame. `VtChannel::sample` already forks `pane_size` about once a
+/// second, so this roughly doubles a cost that was already there rather than
+/// introducing one.
+const PANE_COUNT_PROBE_MS: u64 = 1_000;
 
 /// How many panes the worker's target window has, for deciding whether the
-/// passive preview needs the composite path. Returns 1 on any failure, which
-/// keeps the caller on the cheap single-pane transport.
+/// preview needs the composite path. Returns 1 on any failure, which keeps the
+/// caller on the cheap single-pane transport.
+///
+/// A zoomed pane (`C-b z`) also reports 1: tmux keeps `window_panes` at its real
+/// count while reporting every pane at the window's full rectangle, so the panes
+/// overlap and the compositor's tiling assumption does not hold. Compositing
+/// there hides the zoomed pane behind border fill, so the single-pane transport
+/// is both cheaper and more correct.
 fn probe_pane_count(name: &str) -> u16 {
-    crate::tmux::tmux_command()
+    let out = crate::tmux::tmux_command()
         .args([
             "display-message",
             "-p",
             "-t",
             &format!("{name}:^"),
             "-F",
-            "#{window_panes}",
+            "#{window_panes} #{window_zoomed_flag}",
         ])
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(1)
-        .max(1)
+        .and_then(|o| String::from_utf8(o.stdout).ok());
+    let Some(out) = out else { return 1 };
+    let mut fields = out.split_whitespace();
+    let count: u16 = fields.next().and_then(|f| f.parse().ok()).unwrap_or(1);
+    // Absent (older tmux, or a truncated line) reads as not zoomed.
+    if fields.next().is_some_and(|z| z != "0") {
+        return 1;
+    }
+    count.max(1)
 }
 
 /// Capture transport for a split window: every pane laid back out on the window
@@ -996,9 +1017,11 @@ impl LiveCaptureWorker {
             #[cfg(unix)]
             let mut last_vt_arm: Option<std::time::Instant> = None;
             // Panes in the target window, refreshed on the lazy
-            // `PANE_COUNT_PROBE_MS` cadence. Starts at 1 so the first cycle
-            // takes the cheap path; a user's split shows up within a couple of
-            // seconds. Reset on retarget so a probe runs for the new pane.
+            // `PANE_COUNT_PROBE_MS` cadence. The seed only covers the window
+            // between arming and the first probe, which runs on the first cycle
+            // (`last_pane_probe` starts unset), so an already-split window
+            // composites immediately rather than showing one pane first. Reset on
+            // retarget so a probe runs for the new pane.
             let mut pane_count: u16 = 1;
             let mut last_pane_probe: Option<std::time::Instant> = None;
             // Window geometry plus the captured rows of every pane, reused

@@ -43,6 +43,21 @@ impl PaneGeom {
         row >= self.top && row < self.top.saturating_add(self.height)
     }
 
+    /// Whether two pane rectangles share any cell.
+    ///
+    /// Panes in a normal window tile the grid, but a zoomed pane (`C-b z`) is
+    /// reported at the window's full rectangle while its neighbours keep their
+    /// own, so they overlap. [`composite_window`]'s walk assumes a tiling, so
+    /// [`crate::tmux::Session::capture_window_layout`] uses this to drop panes it
+    /// cannot lay out rather than painting a scrambled frame.
+    pub(crate) fn overlaps(&self, other: &Self) -> bool {
+        let x_overlap = self.left < other.left.saturating_add(other.width)
+            && other.left < self.left.saturating_add(self.width);
+        let y_overlap = self.top < other.top.saturating_add(other.height)
+            && other.top < self.top.saturating_add(self.height);
+        x_overlap && y_overlap
+    }
+
     fn covers(&self, row: u16, col: u16) -> bool {
         self.covers_row(row) && col >= self.left && col < self.left.saturating_add(self.width)
     }
@@ -142,10 +157,21 @@ const SGR_RESET: &str = "\x1b[0m";
 /// than tracking which columns carry a vertical border through it.
 const BORDER_VERTICAL: char = '│';
 const BORDER_HORIZONTAL: char = '─';
+/// Where a horizontal and a vertical rule cross. Reached only when no pane
+/// touches the cell orthogonally but one touches it diagonally.
+const BORDER_CROSS: char = '┼';
 
 /// Lay `panes` back onto a `window_width` x `window_height` grid and return the
-/// rows joined by `\n`, ready to be handed to the preview cache exactly like a
+/// rows, each terminated by `\n`, ready to be handed to the preview cache like a
 /// single-pane `capture-pane` result.
+///
+/// Every row is TERMINATED rather than joined, matching `capture-pane`, so the
+/// result always counts `window_height` lines. Joining instead lost the last row
+/// whenever it was blank (a stacked split with an idle shell underneath), because
+/// `str::lines` and the renderer's ANSI parser both drop a trailing empty segment.
+/// The cursor is rebased onto `window_height`, so a short count painted it a row
+/// above the text, and only for some splits, since a side-by-side border glyph
+/// makes the last row non-empty.
 ///
 /// Walks each window row left to right, emitting a pane's row whole whenever
 /// the cursor reaches that pane's left edge and a border glyph otherwise. Rows
@@ -163,27 +189,31 @@ pub(crate) fn composite_window(
 ) -> String {
     let mut out = String::new();
     for row in 0..window_height {
-        if row > 0 {
-            out.push('\n');
-        }
         // An unclaimed cell is a border only where it actually separates two
         // panes, and which glyph depends on the direction it separates them
         // in: a pane directly above or below makes it part of a horizontal
         // rule, a pane to the left or right makes it part of a vertical one.
         // A cell with no pane on any side is void (the dead corner beside a
-        // short pane) and stays blank rather than drawing a border to nowhere.
-        // Genuine cross junctions resolve to the horizontal rule; tmux would
-        // draw a tee there, which a preview does not need.
+        // short pane) and stays blank rather than drawing a border to nowhere,
+        // UNLESS a pane touches it diagonally, which only happens where a
+        // horizontal and a vertical rule cross. Those cells used to render as a
+        // hole in the middle of an otherwise unbroken rule.
         let covered = |r: u16, c: u16| panes.iter().any(|p| p.geom.covers(r, c));
         let gap_fill = |col: u16| -> char {
-            if row.checked_sub(1).is_some_and(|r| covered(r, col))
-                || covered(row.saturating_add(1), col)
-            {
+            let up = row.checked_sub(1);
+            let left = col.checked_sub(1);
+            let down = row.saturating_add(1);
+            let right = col.saturating_add(1);
+            if up.is_some_and(|r| covered(r, col)) || covered(down, col) {
                 BORDER_HORIZONTAL
-            } else if col.checked_sub(1).is_some_and(|c| covered(row, c))
-                || covered(row, col.saturating_add(1))
-            {
+            } else if left.is_some_and(|c| covered(row, c)) || covered(row, right) {
                 BORDER_VERTICAL
+            } else if up.zip(left).is_some_and(|(r, c)| covered(r, c))
+                || up.is_some_and(|r| covered(r, right))
+                || left.is_some_and(|c| covered(down, c))
+                || covered(down, right)
+            {
+                BORDER_CROSS
             } else {
                 ' '
             }
@@ -191,6 +221,11 @@ pub(crate) fn composite_window(
 
         let mut line = String::new();
         let mut col = 0u16;
+        // Whether the last thing written was pane content, whose SGR state may
+        // still be live. `capture_rows_padded` only resets when it actually pads,
+        // so a pane row whose fill runs to its own right edge leaves the colour
+        // set and would paint the border glyph beside it in that background.
+        let mut sgr_live = false;
         while col < window_width {
             let hit = panes
                 .iter()
@@ -199,6 +234,10 @@ pub(crate) fn composite_window(
                 Some(pane) if pane.geom.width > 0 => {
                     if let Some(text) = pane.rows.get((row - pane.geom.top) as usize) {
                         line.push_str(text);
+                        // A row that already ends in the padding reset needs no
+                        // second one; only a fill running to the pane's own right
+                        // edge leaves the colour set.
+                        sgr_live = text.contains('\x1b') && !text.ends_with(SGR_RESET);
                     } else {
                         // Short capture (pane resized mid-frame): pad rather
                         // than shift every pane to its right.
@@ -207,12 +246,17 @@ pub(crate) fn composite_window(
                     col = col.saturating_add(pane.geom.width);
                 }
                 _ => {
+                    if sgr_live {
+                        line.push_str(SGR_RESET);
+                        sgr_live = false;
+                    }
                     line.push(gap_fill(col));
                     col = col.saturating_add(1);
                 }
             }
         }
         out.push_str(trim_padding(&line));
+        out.push('\n');
     }
     out
 }
@@ -252,7 +296,7 @@ mod tests {
     #[test]
     fn single_pane_fills_the_window_unchanged() {
         let panes = [pane(0, 0, 5, 2, &["hello", "world"])];
-        assert_eq!(composite_window(5, 2, &panes), "hello\nworld");
+        assert_eq!(composite_window(5, 2, &panes), "hello\nworld\n");
     }
 
     #[test]
@@ -262,14 +306,17 @@ mod tests {
             pane(0, 0, 5, 2, &["aaaaa", "bbbbb"]),
             pane(6, 0, 5, 2, &["ccccc", "ddddd"]),
         ];
-        assert_eq!(composite_window(11, 2, &panes), "aaaaa│ccccc\nbbbbb│ddddd");
+        assert_eq!(
+            composite_window(11, 2, &panes),
+            "aaaaa│ccccc\nbbbbb│ddddd\n"
+        );
     }
 
     #[test]
     fn stacked_panes_are_joined_by_a_horizontal_border() {
         // `C-b "`: the row between the panes belongs to no pane.
         let panes = [pane(0, 0, 4, 1, &["topp"]), pane(0, 2, 4, 1, &["botm"])];
-        assert_eq!(composite_window(4, 3, &panes), "topp\n────\nbotm");
+        assert_eq!(composite_window(4, 3, &panes), "topp\n────\nbotm\n");
     }
 
     #[test]
@@ -281,7 +328,7 @@ mod tests {
             pane(0, 0, 3, 1, &["abc"]),
             pane(4, 0, 3, 2, &["xyz", "uvw"]),
         ];
-        assert_eq!(composite_window(7, 2, &panes), "abc│xyz\n───│uvw");
+        assert_eq!(composite_window(7, 2, &panes), "abc│xyz\n───│uvw\n");
     }
 
     #[test]
@@ -292,7 +339,7 @@ mod tests {
             pane(0, 0, 3, 2, &["abc"]),
             pane(4, 0, 3, 2, &["xyz", "uvw"]),
         ];
-        assert_eq!(composite_window(7, 2, &panes), "abc│xyz\n   │uvw");
+        assert_eq!(composite_window(7, 2, &panes), "abc│xyz\n   │uvw\n");
     }
 
     fn layout(w: u16, h: u16, panes: Vec<CapturedPane>) -> WindowLayout {
@@ -332,16 +379,129 @@ mod tests {
         let fresh = vec!["new1".to_string(), "new2".to_string()];
         assert_eq!(
             l.composite_with_first_pane_rows(&fresh),
-            "new1│keep\nnew2│same"
+            "new1│keep\nnew2│same\n"
         );
         // The cached layout is not consumed: the next frame swaps again.
-        assert_eq!(l.composite(), "old1│keep\nold2│same");
+        assert_eq!(l.composite(), "old1│keep\nold2│same\n");
+    }
+
+    /// A composite must always count `window_height` lines, whatever the bottom
+    /// row holds. The cursor is rebased onto `window_height`, so a row lost off
+    /// the bottom paints it one row too high, and a blank bottom row is the
+    /// common case (a stacked split with an idle shell underneath).
+    #[test]
+    fn every_row_is_terminated_so_the_line_count_matches_the_window() {
+        for (label, panes) in [
+            ("blank bottom row", vec![pane(0, 0, 4, 1, &["top."])]),
+            (
+                "content on every row",
+                vec![pane(0, 0, 4, 3, &["r0..", "r1..", "r2.."])],
+            ),
+            ("no panes at all", vec![]),
+        ] {
+            let out = composite_window(4, 3, &panes);
+            assert_eq!(out.lines().count(), 3, "{label}: lines() short");
+            assert!(out.ends_with('\n'), "{label}: last row not terminated");
+        }
+    }
+
+    /// A zoomed pane (`C-b z`) is reported at the window's full rectangle while
+    /// its neighbours keep theirs, so the rectangles OVERLAP and the walk's
+    /// tiling assumption breaks: it painted one pane then filled the rest of
+    /// every row with border glyphs, hiding the zoomed pane entirely. The capture
+    /// side drops overlapping panes; this pins the geometry test it relies on.
+    #[test]
+    fn overlapping_rectangles_are_detected() {
+        // The real measured zoom layout: 40x8 window split at column 20, then
+        // pane 1 zoomed to the full window.
+        let unzoomed_0 = PaneGeom {
+            left: 0,
+            top: 0,
+            width: 20,
+            height: 8,
+        };
+        let unzoomed_1 = PaneGeom {
+            left: 21,
+            top: 0,
+            width: 19,
+            height: 8,
+        };
+        let zoomed_1 = PaneGeom {
+            left: 0,
+            top: 0,
+            width: 40,
+            height: 8,
+        };
+        assert!(
+            !unzoomed_0.overlaps(&unzoomed_1),
+            "a normal split tiles and must not be dropped"
+        );
+        assert!(unzoomed_0.overlaps(&zoomed_1), "zoomed pane must be caught");
+        assert!(zoomed_1.overlaps(&unzoomed_0), "overlap is symmetric");
+        // Stacked panes separated by a rule row also tile.
+        let top = PaneGeom {
+            left: 0,
+            top: 0,
+            width: 9,
+            height: 1,
+        };
+        let bottom = PaneGeom {
+            left: 0,
+            top: 2,
+            width: 9,
+            height: 1,
+        };
+        assert!(!top.overlaps(&bottom));
+        // A zero-width pane touches nothing.
+        let empty = PaneGeom {
+            left: 0,
+            top: 0,
+            width: 0,
+            height: 8,
+        };
+        assert!(!empty.overlaps(&unzoomed_0));
+    }
+
+    /// Where a horizontal and a vertical rule cross, no pane touches the cell
+    /// orthogonally, so it used to render as a blank hole in the middle of an
+    /// otherwise unbroken rule. A pane on the diagonal marks it as a junction.
+    #[test]
+    fn a_rule_crossing_draws_a_junction_not_a_hole() {
+        // Four panes in a 2x2 grid, rules at row 1 and column 4.
+        let panes = [
+            pane(0, 0, 4, 1, &["tl.."]),
+            pane(5, 0, 4, 1, &["tr.."]),
+            pane(0, 2, 4, 1, &["bl.."]),
+            pane(5, 2, 4, 1, &["br.."]),
+        ];
+        let out = composite_window(9, 3, &panes);
+        let rule = out.lines().nth(1).expect("rule row");
+        assert_eq!(rule, "────┼────", "cross cell should be a junction");
+    }
+
+    /// The dead corner beside a SHORT pane has no pane on any side and no pane
+    /// on the diagonal either, so it must stay blank rather than being promoted
+    /// to a junction by the crossing rule above.
+    #[test]
+    fn a_dead_corner_stays_blank() {
+        // A one-row pane on the left, a three-row pane on the right. Rows 1-2 of
+        // the left column are void.
+        let panes = [
+            pane(0, 0, 3, 1, &["abc"]),
+            pane(4, 0, 3, 3, &["x", "y", "z"]),
+        ];
+        let out = composite_window(7, 3, &panes);
+        let last = out.lines().nth(2).expect("row 2");
+        assert!(
+            !last.contains('┼'),
+            "void corner became a junction: {last:?}"
+        );
     }
 
     #[test]
     fn swapping_rows_on_an_empty_layout_is_a_no_op() {
         let l = layout(3, 1, vec![]);
-        assert_eq!(l.composite_with_first_pane_rows(&["x".to_string()]), "");
+        assert_eq!(l.composite_with_first_pane_rows(&["x".to_string()]), "\n");
     }
 
     #[test]
@@ -357,7 +517,7 @@ mod tests {
         ];
         assert_eq!(
             composite_window(9, 3, &panes),
-            "top1│rgt1\n────│rgt2\nbot1│rgt3"
+            "top1│rgt1\n────│rgt2\nbot1│rgt3\n"
         );
     }
 
@@ -368,7 +528,7 @@ mod tests {
         let right = "\x1b[0m\x1b[32mgrn\x1b[0m";
         let panes = [pane(0, 0, 3, 1, &[left]), pane(4, 0, 3, 1, &[right])];
         let out = composite_window(7, 1, &panes);
-        assert_eq!(out, format!("{left}│{right}"));
+        assert_eq!(out, format!("{left}│{right}\n"));
     }
 
     #[test]
@@ -377,13 +537,13 @@ mod tests {
         // must still produce a full-width row instead of looping or panicking.
         // Only the column abutting the pane reads as a border; the rest is void.
         let panes = [pane(2, 0, 3, 1, &["xyz"])];
-        assert_eq!(composite_window(5, 1, &panes), " │xyz");
+        assert_eq!(composite_window(5, 1, &panes), " │xyz\n");
     }
 
     #[test]
     fn a_zero_width_pane_cannot_stall_the_walk() {
         let panes = [pane(0, 0, 0, 1, &[""]), pane(1, 0, 2, 1, &["ok"])];
-        assert_eq!(composite_window(3, 1, &panes), "│ok");
+        assert_eq!(composite_window(3, 1, &panes), "│ok\n");
     }
 
     #[test]
@@ -394,7 +554,7 @@ mod tests {
         let filled = format!("ab{}  ", "\x1b[44m");
         let panes = [pane(0, 0, 2, 1, &["xy"]), pane(3, 0, 4, 1, &[&filled])];
         let out = composite_window(7, 1, &panes);
-        assert_eq!(out, format!("xy│{filled}"), "styled fill was trimmed");
+        assert_eq!(out, format!("xy│{filled}\n"), "styled fill was trimmed");
     }
 
     #[test]
@@ -403,7 +563,7 @@ mod tests {
         // Both go, since nothing is colouring them.
         let padded = format!("ab{}  ", SGR_RESET);
         let panes = [pane(0, 0, 2, 1, &["xy"]), pane(3, 0, 4, 1, &[&padded])];
-        assert_eq!(composite_window(7, 1, &panes), "xy│ab");
+        assert_eq!(composite_window(7, 1, &panes), "xy│ab\n");
     }
 
     #[test]
@@ -427,6 +587,6 @@ mod tests {
     fn no_panes_renders_a_blank_grid() {
         // Nothing to separate, so nothing to draw: borders only appear where
         // they divide real panes.
-        assert_eq!(composite_window(3, 2, &[]), "\n");
+        assert_eq!(composite_window(3, 2, &[]), "\n\n");
     }
 }

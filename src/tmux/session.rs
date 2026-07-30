@@ -598,6 +598,10 @@ impl Session {
     /// and that one is chained so it stays a single `tmux` invocation no matter
     /// how many panes there are.
     ///
+    /// A zoomed pane (`C-b z`) is treated as unsplit and takes the same
+    /// single-pane path, because tmux reports zoomed panes at overlapping
+    /// rectangles that the compositor cannot tile.
+    ///
     /// Splits lose scrollback: panes have independent histories, so there is no
     /// coherent way to stack them, and the composite covers the visible window
     /// only. The preview's scroll offset clamps itself to the shorter capture,
@@ -646,7 +650,7 @@ impl Session {
                 &window,
                 "-F",
                 &format!(
-                    "{WINDOW_SENTINEL} #{{window_panes}} #{{window_width}} #{{window_height}}"
+                    "{WINDOW_SENTINEL} #{{window_panes}} #{{window_width}} #{{window_height}} #{{window_zoomed_flag}}"
                 ),
                 ";",
                 "display-message",
@@ -677,6 +681,7 @@ impl Session {
         let raw = String::from_utf8_lossy(&output.stdout);
         let mut rest: &str = &raw;
         let mut dims: Option<(u16, u16, u16)> = None;
+        let mut zoomed = false;
         let mut cursor: Option<PaneCursor> = None;
         while let Some((line, tail)) = rest.split_once('\n') {
             if let Some(fields) = line.strip_prefix(WINDOW_SENTINEL) {
@@ -690,6 +695,9 @@ impl Session {
                     }
                     _ => None,
                 };
+                // Absent (older tmux, or a truncated line) reads as not zoomed,
+                // which keeps the composite path rather than disabling it.
+                zoomed = f.next().is_some_and(|z| z != "0");
             } else if let Some(fields) = line.strip_prefix(CURSOR_SENTINEL) {
                 cursor = PaneCursor::parse(fields.trim());
             } else {
@@ -703,6 +711,17 @@ impl Session {
             return Ok((pane0_content, unreliable_position(cursor)));
         };
         if count <= 1 || window_width == 0 || window_height == 0 {
+            return Ok((pane0_content, unreliable_position(cursor)));
+        }
+        // A zoomed pane (`C-b z`) keeps `window_panes` at its real count but
+        // reports every pane at the window's full rectangle, so the panes
+        // OVERLAP. The compositor's walk assumes a tiling, and handed overlap it
+        // paints one pane and fills the rest of the row with border glyphs,
+        // hiding the zoomed pane's content, which is the only thing the user is
+        // looking at in tmux. Treat zoomed as unsplit: pane 0's bytes are already
+        // in hand, scrollback included, which is what the preview showed before
+        // compositing existed.
+        if zoomed {
             return Ok((pane0_content, unreliable_position(cursor)));
         }
 
@@ -792,10 +811,23 @@ impl Session {
             return None;
         }
 
-        let panes = parse_pane_segments(rest, SENTINEL);
+        let mut panes = parse_pane_segments(rest, SENTINEL);
         if panes.is_empty() {
             return None;
         }
+        // Backstop for the zoom guard in `capture_window_composited_with_cursor`
+        // and `probe_pane_count`: if any overlapping layout still reaches here,
+        // keep the first pane of each overlapping set rather than handing the
+        // compositor a non-tiling layout it would paint as border garbage. Pane 0
+        // comes first, so the pane that survives is always the one receiving
+        // input, and the frame degrades to "pane 0 plus empty space".
+        let mut kept: Vec<CapturedPane> = Vec::with_capacity(panes.len());
+        for pane in panes.drain(..) {
+            if !kept.iter().any(|k| k.geom.overlaps(&pane.geom)) {
+                kept.push(pane);
+            }
+        }
+        let panes = kept;
         Some(WindowLayout {
             window_width,
             window_height,
@@ -2458,6 +2490,132 @@ mod tests {
         assert!(
             seam_row.contains("BRAVO"),
             "panes should share a row, not stack:\n{seam_row:?}"
+        );
+    }
+
+    /// `C-b z` keeps `window_panes` at its real count while reporting every pane
+    /// at the window's FULL rectangle, so the rectangles overlap and the
+    /// compositor's tiling assumption breaks. Compositing that painted pane 0 at
+    /// its unzoomed width and filled the rest of every row with `─`, hiding the
+    /// zoomed pane, which is the only thing the user sees in tmux. The frame was
+    /// strictly worse than the pane-0-only preview it replaced, and permanently
+    /// so, since nothing self-heals a zoom.
+    ///
+    /// Zoomed must therefore be treated as unsplit, byte-for-byte identical to
+    /// the plain capture.
+    #[test]
+    #[serial_test::serial]
+    fn a_zoomed_pane_falls_back_to_the_plain_capture() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let guard = TmuxTestSession::new("aoe_test_composite_zoom");
+        let session = start_composite_session(guard.name(), 40, 8, "sh -c 'echo ALPHA; sleep 30'");
+        wait_for_pane_text(&session, "ALPHA");
+        split_composite_session(&session, "sh -c 'echo BRAVO; sleep 30'");
+        wait_for_composite_text(&session, "BRAVO");
+
+        // Control: unzoomed, both panes, and one line per window row.
+        let unzoomed = session
+            .capture_window_composited(10)
+            .expect("composite unzoomed");
+        assert!(
+            unzoomed.contains("ALPHA") && unzoomed.contains("BRAVO"),
+            "control: split should composite both panes:\n{unzoomed}"
+        );
+
+        let zoom = crate::tmux::tmux_command()
+            .args(["resize-pane", "-Z", "-t", &format!("{}:^.1", session.name)])
+            .status()
+            .expect("tmux resize-pane -Z");
+        assert!(zoom.success(), "zoom must land or this tests nothing");
+        assert_eq!(
+            String::from_utf8_lossy(
+                &crate::tmux::tmux_command()
+                    .args([
+                        "display-message",
+                        "-p",
+                        "-t",
+                        &format!("{}:^", session.name),
+                        "-F",
+                        "#{window_zoomed_flag}",
+                    ])
+                    .output()
+                    .expect("zoom probe")
+                    .stdout
+            )
+            .trim(),
+            "1",
+            "tmux did not report the window as zoomed"
+        );
+
+        let zoomed = session
+            .capture_window_composited(10)
+            .expect("composite zoomed");
+        assert!(
+            !zoomed.contains('─') && !zoomed.contains('│'),
+            "zoomed frame painted border fill over the window:\n{zoomed}"
+        );
+        assert_eq!(
+            zoomed,
+            session.capture_pane(10).expect("plain capture"),
+            "zoomed must be byte-identical to the pane-0 capture"
+        );
+
+        // Unzooming restores the composite rather than latching the fallback.
+        assert!(crate::tmux::tmux_command()
+            .args(["resize-pane", "-Z", "-t", &format!("{}:^.1", session.name)])
+            .status()
+            .expect("tmux unzoom")
+            .success());
+        let restored = session
+            .capture_window_composited(10)
+            .expect("composite after unzoom");
+        assert!(
+            restored.contains("ALPHA") && restored.contains("BRAVO"),
+            "unzoom did not restore the composite:\n{restored}"
+        );
+    }
+
+    /// A composited capture must carry one line per window row. It is handed to
+    /// the preview cache like a `capture-pane` result and the cursor is rebased
+    /// onto `window_height`, so a row lost off the bottom paints the cursor one
+    /// row too high. A stacked split with an idle shell underneath is the case
+    /// that produced it: the bottom row is blank, and joining rows rather than
+    /// terminating them let the renderer drop it.
+    #[test]
+    #[serial_test::serial]
+    fn a_stacked_split_composites_one_line_per_window_row() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let guard = TmuxTestSession::new("aoe_test_composite_rows");
+        let session = start_composite_session(guard.name(), 30, 10, "sh -c 'echo ALPHA; sleep 30'");
+        wait_for_pane_text(&session, "ALPHA");
+        // `C-b "`: stacked, so the bottom pane's last row is blank.
+        let split = crate::tmux::tmux_command()
+            .args([
+                "split-window",
+                "-v",
+                "-t",
+                &session.name,
+                "sh -c 'sleep 30'",
+            ])
+            .status()
+            .expect("tmux split-window -v");
+        assert!(split.success(), "failed to split {}", session.name);
+        refresh_session_cache();
+        wait_for_composite_text(&session, "ALPHA");
+
+        let composited = session.capture_window_composited(10).expect("composite");
+        assert_eq!(
+            composited.lines().count(),
+            10,
+            "composite must be window_height lines:\n{composited}"
         );
     }
 
