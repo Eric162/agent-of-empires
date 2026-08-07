@@ -1755,6 +1755,39 @@ impl Instance {
         self.extra_args = src.extra_args.clone();
     }
 
+    /// Drop every piece of session state that is scoped to the agent this
+    /// instance is moving *away* from, for a post-creation `tool` swap (the
+    /// TUI restart dialog's engine swap).
+    ///
+    /// Session ids live in per-agent namespaces: a Claude UUID means nothing
+    /// to codex or gemini, but `is_valid_session_id` accepts any shape, so a
+    /// carried-over sid makes the next launch emit `--resume <foreign-sid>`
+    /// and the new engine starts by failing to resume. #3077 made the swap
+    /// reach disk, which is what exposed this. Mirrors the state the
+    /// structured-view agent switch clears (`POST /api/acp/:id/switch`).
+    ///
+    /// Callers must persist the result themselves: `merge_from_tui`
+    /// deliberately does not sync these fields (the capture pollers own
+    /// `agent_session_id` through CAS writes), so an in-memory-only reset is
+    /// reverted by `reconcile_from_disk` on the next launch.
+    pub(crate) fn reset_agent_session_for_tool_swap(&mut self) {
+        self.agent_session_id = None;
+        self.resume_probe_failed_sid = None;
+        // A pin/clear/fork directive names an id in the old agent's namespace,
+        // so it cannot survive the swap either.
+        self.resume_intent = ResumeIntent::Default;
+        self.acp_session_id = None;
+        // Effort vocabularies are adapter-specific, so the old agent's pick is
+        // meaningless to the new one; it falls back to the new agent's default.
+        self.acp_effort = None;
+        self.import_pending = None;
+        self.fork_pending = None;
+        // The pinned structured-view agent belongs to the old tool; clearing it
+        // lets the spawn path pick the new tool's default agent instead of
+        // silently keeping the old backend alive across the swap.
+        self.agent_name = None;
+    }
+
     /// Apply a passively-detected status transition to a disk row. Touches
     /// the same three fields as [`Self::merge_from_tui`] (`status`,
     /// `idle_entered_at`, `last_accessed_at`); the real distinction is the

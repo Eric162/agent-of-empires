@@ -9500,6 +9500,49 @@ fn restart_selected_session_debounces_via_cooldown_map() {
     );
 }
 
+/// An engine swap must not carry the old agent's session state to the new
+/// one, in memory OR on disk. Session ids are per-agent namespaces, so a
+/// carried-over sid makes the next launch emit `--resume <foreign-sid>`; and
+/// an in-memory-only reset is reverted by `reconcile_from_disk` (which is why
+/// this asserts the disk row too). Follow-on to #3077, which is what made the
+/// swap reach disk in the first place.
+#[test]
+#[serial]
+fn restart_selected_session_tool_swap_clears_old_agent_session_state() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+    env.view.mutate_instance(&id, |inst| {
+        inst.tool = "claude".to_string();
+        inst.agent_session_id = Some("11111111-2222-3333-4444-555555555555".to_string());
+        inst.acp_session_id = Some("acp-sess-1".to_string());
+        inst.agent_name = Some("claude-code".to_string());
+        inst.acp_effort = Some("high".to_string());
+    });
+    env.view.save().unwrap();
+
+    env.view
+        .restart_selected_session(None, Some("codex"), None, None)
+        .unwrap();
+
+    let inst = env.view.instance_at(0);
+    assert_eq!(inst.tool, "codex");
+    assert_eq!(inst.agent_session_id, None, "in-memory sid must be dropped");
+    assert_eq!(inst.acp_session_id, None);
+    assert_eq!(inst.agent_name, None);
+    assert_eq!(inst.acp_effort, None);
+
+    let disk = Storage::new_unwatched("test").unwrap().load().unwrap();
+    let row = disk.iter().find(|i| i.id == id).unwrap();
+    assert_eq!(
+        row.agent_session_id, None,
+        "the old engine's sid must be gone from disk too, else reconcile_from_disk \
+         restores it and the new engine launches with --resume <foreign-sid>"
+    );
+    assert_eq!(row.acp_session_id, None);
+    assert_eq!(row.agent_name, None);
+}
+
 #[test]
 #[serial]
 fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
