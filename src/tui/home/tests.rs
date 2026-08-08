@@ -9512,14 +9512,31 @@ fn restart_selected_session_tool_swap_clears_old_agent_session_state() {
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
-    env.view.mutate_instance(&id, |inst| {
+    let seed = |inst: &mut Instance| {
         inst.tool = "claude".to_string();
         inst.agent_session_id = Some("11111111-2222-3333-4444-555555555555".to_string());
         inst.acp_session_id = Some("acp-sess-1".to_string());
         inst.agent_name = Some("claude-code".to_string());
         inst.acp_effort = Some("high".to_string());
-    });
-    env.view.save().unwrap();
+        inst.agent_model = Some("claude-opus-4-7".to_string());
+        // The approval posture is deliberately NOT reset; see the comment in
+        // `reset_agent_session_for_tool_swap`.
+        inst.acp_mode_id = Some("plan".to_string());
+    };
+    env.view.mutate_instance(&id, seed);
+    // Seed the disk row directly rather than through `save()`: `merge_from_tui`
+    // syncs only status + launch config, so a `save()` here would leave these
+    // fields absent on disk and the disk assertions below would pass
+    // vacuously.
+    env.view
+        .storages
+        .get("test")
+        .unwrap()
+        .update(|instances, _groups| {
+            seed(instances.iter_mut().find(|i| i.id == id).unwrap());
+            Ok(())
+        })
+        .unwrap();
 
     env.view
         .restart_selected_session(None, Some("codex"), None, None)
@@ -9531,6 +9548,16 @@ fn restart_selected_session_tool_swap_clears_old_agent_session_state() {
     assert_eq!(inst.acp_session_id, None);
     assert_eq!(inst.agent_name, None);
     assert_eq!(inst.acp_effort, None);
+    assert_eq!(
+        inst.agent_model, None,
+        "the old agent's model must be dropped"
+    );
+    assert_eq!(
+        inst.acp_mode_id.as_deref(),
+        Some("plan"),
+        "the approval posture must survive: clearing it resolves the adapter's \
+         bypass mode on a yolo_mode row"
+    );
 
     let disk = Storage::new_unwatched("test").unwrap().load().unwrap();
     let row = disk.iter().find(|i| i.id == id).unwrap();
@@ -9541,6 +9568,8 @@ fn restart_selected_session_tool_swap_clears_old_agent_session_state() {
     );
     assert_eq!(row.acp_session_id, None);
     assert_eq!(row.agent_name, None);
+    assert_eq!(row.agent_model, None);
+    assert_eq!(row.acp_mode_id.as_deref(), Some("plan"));
 }
 
 #[test]

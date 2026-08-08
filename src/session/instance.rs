@@ -1780,6 +1780,17 @@ impl Instance {
         // Effort vocabularies are adapter-specific, so the old agent's pick is
         // meaningless to the new one; it falls back to the new agent's default.
         self.acp_effort = None;
+        // Same for the pinned model: `claude-opus-4-7` means nothing to codex,
+        // and it is re-injected on every spawn, so it has to go too.
+        self.agent_model = None;
+        // `acp_mode_id` deliberately stays. It is the session's approval
+        // posture, and clearing it does not fall back to "default": the spawn
+        // path's mode gate is `acp_mode_id.is_some() || yolo_mode`, whose
+        // `None` arm resolves the adapter's *bypass* mode id, so dropping an
+        // explicit restrictive mode from a `yolo_mode` row would silently
+        // escalate the new agent to auto-approve. An unrecognized mode id is a
+        // warn-and-continue no-op instead, which is the safe failure. The
+        // structured-view agent switch passes it through for the same reason.
         self.import_pending = None;
         self.fork_pending = None;
         // The pinned structured-view agent belongs to the old tool; clearing it
