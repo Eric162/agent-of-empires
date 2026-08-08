@@ -1,6 +1,6 @@
 //! Session instance definition and operations
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -464,6 +464,28 @@ where
     Ok(opt.filter(|s| !s.trim().is_empty()))
 }
 
+/// The session ids one agent left behind when an engine swap moved a row to a
+/// different `tool`, parked in `Instance::prior_tool_session_ids` under that
+/// agent's name so a swap back can resume where it left off. Both fields are
+/// per-agent namespaces, which is exactly why they cannot travel with the row.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PriorToolSession {
+    /// The tmux-path conversation id, as `Instance::agent_session_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) agent_session_id: Option<String>,
+    /// The structured-view conversation id, as `Instance::acp_session_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) acp_session_id: Option<String>,
+}
+
+impl PriorToolSession {
+    /// Nothing worth parking: an agent that never got a conversation id (never
+    /// launched, or `/clear`ed) leaves no entry behind.
+    fn is_empty(&self) -> bool {
+        self.agent_session_id.is_none() && self.acp_session_id.is_none()
+    }
+}
+
 /// User intent gating `acquire_session_id`, persisted independently of the
 /// poller's observation in `agent_session_id`. CLI/REST/TUI write intent;
 /// the poller writes observation. Disjoint writers, no race.
@@ -829,6 +851,20 @@ pub struct Instance {
         deserialize_with = "deserialize_session_id"
     )]
     pub agent_session_id: Option<String>,
+
+    /// Session ids this row used under a *previous* `tool`, keyed by that
+    /// tool's name, so an engine swap back (`claude` -> `pi` -> `claude`)
+    /// resumes the original conversation instead of starting a third one.
+    /// Written and read only by [`Self::swap_tool`], which parks the outgoing
+    /// agent's ids and consumes the incoming agent's entry, so the map holds at
+    /// most one entry per tool the row has ever run under.
+    ///
+    /// `resume_probe_failed_sid` is deliberately not parked with them: a
+    /// restored sid is worth one fresh probe (the conversation may well still
+    /// be there), and if it is gone the resume-fallback cascade already starts
+    /// a new session instead. Additive: absent in older rows, no migration.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub(crate) prior_tool_session_ids: HashMap<String, PriorToolSession>,
 
     /// Durable loop-breaker for ambiguous resume-probe failures. When this
     /// equals `agent_session_id`, startup recovery skips automatic resume so a
@@ -1440,6 +1476,7 @@ impl Instance {
             #[cfg(feature = "serve")]
             pending_initial_turn_attachments: Vec::new(),
             acp_mode_id: None,
+            prior_tool_session_ids: HashMap::new(),
             scratch: false,
             worktree_info: None,
             workspace_info: None,
@@ -1755,28 +1792,53 @@ impl Instance {
         self.extra_args = src.extra_args.clone();
     }
 
-    /// Drop every piece of session state that is scoped to the agent this
-    /// instance is moving *away* from, for a post-creation `tool` swap (the
-    /// TUI restart dialog's engine swap).
+    /// Move this row to a different `tool` (the TUI restart dialog's engine
+    /// swap), parking the outgoing agent's session ids and picking up the
+    /// incoming agent's, if it has been here before.
     ///
     /// Session ids live in per-agent namespaces: a Claude UUID means nothing
     /// to codex or gemini, but `is_valid_session_id` accepts any shape, so a
     /// carried-over sid makes the next launch emit `--resume <foreign-sid>`
     /// and the new engine starts by failing to resume. #3077 made the swap
-    /// reach disk, which is what exposed this. Mirrors the state the
-    /// structured-view agent switch clears (`POST /api/acp/:id/switch`).
+    /// reach disk, which is what exposed this. The rest of what this clears
+    /// mirrors the structured-view agent switch (`POST /api/acp/:id/switch`).
+    ///
+    /// A no-op when `new_tool` is the current tool, so a caller may apply it
+    /// to a disk row and an in-memory row independently without the second
+    /// call double-stashing.
     ///
     /// Callers must persist the result themselves: `merge_from_tui`
     /// deliberately does not sync these fields (the capture pollers own
-    /// `agent_session_id` through CAS writes), so an in-memory-only reset is
+    /// `agent_session_id` through CAS writes), so an in-memory-only swap is
     /// reverted by `reconcile_from_disk` on the next launch.
-    pub(crate) fn reset_agent_session_for_tool_swap(&mut self) {
-        self.agent_session_id = None;
+    pub(crate) fn swap_tool(&mut self, new_tool: &str) {
+        if new_tool == self.tool {
+            return;
+        }
+        // Park the outgoing agent's conversation under its own name so a swap
+        // back to it resumes there instead of starting a third conversation.
+        let outgoing = PriorToolSession {
+            agent_session_id: self.agent_session_id.take(),
+            acp_session_id: self.acp_session_id.take(),
+        };
+        if !outgoing.is_empty() {
+            self.prior_tool_session_ids
+                .insert(self.tool.clone(), outgoing);
+        }
+        self.tool = new_tool.to_string();
+        // Consumed, not copied: the row owns exactly one live conversation per
+        // agent, and leaving the entry behind would let a later swap restore an
+        // id this session has since replaced.
+        let restored = self
+            .prior_tool_session_ids
+            .remove(new_tool)
+            .unwrap_or_default();
+        self.agent_session_id = restored.agent_session_id;
+        self.acp_session_id = restored.acp_session_id;
         self.resume_probe_failed_sid = None;
         // A pin/clear/fork directive names an id in the old agent's namespace,
         // so it cannot survive the swap either.
         self.resume_intent = ResumeIntent::Default;
-        self.acp_session_id = None;
         // Effort vocabularies are adapter-specific, so the old agent's pick is
         // meaningless to the new one; it falls back to the new agent's default.
         self.acp_effort = None;
@@ -9012,20 +9074,65 @@ mod tests {
         assert_eq!(inst.agent_session_id, deserialized.agent_session_id);
     }
 
-    // Test: agent switch clears session ID
+    /// An engine swap parks the outgoing agent's conversation ids under its own
+    /// name and picks the incoming agent's back up, so claude -> pi -> claude
+    /// lands in the original Claude conversation instead of a third one. The
+    /// per-agent selectors go; the approval posture stays (clearing it resolves
+    /// the adapter's bypass mode on a `yolo_mode` row).
+    ///
+    /// Replaces a test that hand-assigned `agent_session_id = None` and then
+    /// asserted it was None, which could not fail.
     #[test]
-    fn test_agent_switch_clears_session_id() {
+    fn swap_tool_parks_and_restores_per_tool_session_ids() {
         let mut inst = Instance::new("Test", "/home/user/project");
         inst.tool = "claude".to_string();
         inst.agent_session_id = Some("claude-session-123".to_string());
+        inst.acp_session_id = Some("acp-claude-1".to_string());
+        inst.resume_probe_failed_sid = Some("claude-session-123".to_string());
+        inst.acp_effort = Some("high".to_string());
+        inst.agent_model = Some("claude-opus-4-7".to_string());
+        inst.agent_name = Some("claude-code".to_string());
+        inst.acp_mode_id = Some("plan".to_string());
 
-        // Simulate agent switch by clearing session ID
-        inst.agent_session_id = None;
-        inst.tool = "opencode".to_string();
+        inst.swap_tool("pi");
+        assert_eq!(inst.tool, "pi");
+        assert_eq!(
+            inst.agent_session_id, None,
+            "a Claude sid would make pi launch with --resume <foreign-sid>"
+        );
+        assert_eq!(inst.acp_session_id, None);
+        assert_eq!(inst.acp_effort, None);
+        assert_eq!(inst.agent_model, None);
+        assert_eq!(inst.agent_name, None);
+        assert_eq!(inst.resume_probe_failed_sid, None);
+        assert_eq!(inst.acp_mode_id.as_deref(), Some("plan"));
 
-        // Session ID should be None after switch
-        assert!(inst.agent_session_id.is_none());
-        assert_eq!(inst.tool, "opencode");
+        // pi runs and captures a sid of its own, then the user swaps back.
+        inst.agent_session_id = Some("pi-session-9".to_string());
+        inst.swap_tool("claude");
+        assert_eq!(
+            inst.agent_session_id.as_deref(),
+            Some("claude-session-123"),
+            "swapping back must resume the parked Claude conversation"
+        );
+        assert_eq!(inst.acp_session_id.as_deref(), Some("acp-claude-1"));
+        assert_eq!(
+            inst.prior_tool_session_ids["pi"]
+                .agent_session_id
+                .as_deref(),
+            Some("pi-session-9"),
+            "pi's conversation is the parked one now"
+        );
+        assert!(
+            !inst.prior_tool_session_ids.contains_key("claude"),
+            "a restored entry is consumed, so a later swap cannot resurrect it"
+        );
+
+        // Same-tool call is a no-op: the caller applies the swap to the disk row
+        // and the in-memory row independently, and the second must not re-park.
+        inst.swap_tool("claude");
+        assert_eq!(inst.agent_session_id.as_deref(), Some("claude-session-123"));
+        assert!(!inst.prior_tool_session_ids.contains_key("claude"));
     }
 
     #[test]

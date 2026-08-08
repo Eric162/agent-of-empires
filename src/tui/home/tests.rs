@@ -9520,7 +9520,7 @@ fn restart_selected_session_tool_swap_clears_old_agent_session_state() {
         inst.acp_effort = Some("high".to_string());
         inst.agent_model = Some("claude-opus-4-7".to_string());
         // The approval posture is deliberately NOT reset; see the comment in
-        // `reset_agent_session_for_tool_swap`.
+        // `Instance::swap_tool`.
         inst.acp_mode_id = Some("plan".to_string());
     };
     env.view.mutate_instance(&id, seed);
@@ -9570,6 +9570,15 @@ fn restart_selected_session_tool_swap_clears_old_agent_session_state() {
     assert_eq!(row.agent_name, None);
     assert_eq!(row.agent_model, None);
     assert_eq!(row.acp_mode_id.as_deref(), Some("plan"));
+    // Parked, not discarded: the disk row is the one a swap back reads, so this
+    // is what makes claude -> codex -> claude resumable. Round-trip mechanics
+    // are covered by `swap_tool_parks_and_restores_per_tool_session_ids`.
+    let parked = row.prior_tool_session_ids.get("claude").unwrap();
+    assert_eq!(
+        parked.agent_session_id.as_deref(),
+        Some("11111111-2222-3333-4444-555555555555")
+    );
+    assert_eq!(parked.acp_session_id.as_deref(), Some("acp-sess-1"));
 }
 
 #[test]

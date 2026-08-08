@@ -422,14 +422,13 @@ impl HomeView {
                 .map(|i| i.tool.clone())
                 .unwrap_or_default();
             if target_tool != current_tool {
-                self.mutate_instance(&id, |inst| {
-                    inst.tool = target_tool.to_string();
-                    // The old engine's session id (and the rest of its
-                    // per-agent session state) must not follow the row to the
-                    // new engine; see `reset_agent_session_for_tool_swap`.
-                    inst.reset_agent_session_for_tool_swap();
-                });
-                self.persist_tool_swap_reset(&id);
+                // `swap_tool` (not a plain `tool` assignment) because the old
+                // engine's session id must not follow the row to the new
+                // engine: it parks the outgoing ids under the outgoing tool and
+                // restores the incoming tool's, if the row has been there
+                // before.
+                self.mutate_instance(&id, |inst| inst.swap_tool(target_tool));
+                self.persist_tool_swap(&id, target_tool);
             }
         }
 
@@ -538,18 +537,23 @@ impl HomeView {
         Ok(())
     }
 
-    /// Land an engine swap's session reset on the disk row.
+    /// Land an engine swap's session bookkeeping on the disk row.
     ///
     /// `save()` syncs `tool`/`command`/`extra_args` through `merge_from_tui`
     /// but deliberately leaves `agent_session_id` and friends to their CAS
-    /// writers, so the reset needs its own write: without it,
+    /// writers, so the swap needs its own write: without it,
     /// `reconcile_from_disk` restores the old engine's sid on the launch that
     /// follows and the new engine spawns with `--resume <foreign-sid>`.
+    ///
+    /// `swap_tool` runs against the disk row rather than copying the in-memory
+    /// result over it, because the capture pollers may have written a fresher
+    /// sid to disk than this snapshot carries; parking whatever disk holds is
+    /// what makes the swap-back restore the real conversation.
     ///
     /// Best-effort. A failed write leaves the stale sid on disk (the restart
     /// still runs, and its resume-probe fallback recovers by starting fresh),
     /// so it is logged rather than surfaced as a restart failure.
-    fn persist_tool_swap_reset(&self, id: &str) {
+    fn persist_tool_swap(&self, id: &str, new_tool: &str) {
         let Some(profile) = self.instances.get(id).map(|i| i.source_profile.clone()) else {
             return;
         };
@@ -558,22 +562,23 @@ impl HomeView {
                 target: "tui.home",
                 profile = %profile,
                 id = %id,
-                "persist_tool_swap_reset: no storage registered for profile; \
+                "persist_tool_swap: no storage registered for profile; \
                  the old engine's session id stays on disk"
             );
             return;
         };
         let id_owned = id.to_string();
+        let new_tool = new_tool.to_string();
         if let Err(e) = storage.update(|instances, _groups| {
             if let Some(disk) = instances.iter_mut().find(|i| i.id == id_owned) {
-                disk.reset_agent_session_for_tool_swap();
+                disk.swap_tool(&new_tool);
             }
             Ok(())
         }) {
             tracing::error!(
                 target: "tui.home",
                 id = %id,
-                "persist_tool_swap_reset: failed to clear the old engine's session state: {e}"
+                "persist_tool_swap: failed to move the old engine's session state aside: {e}"
             );
         }
     }
