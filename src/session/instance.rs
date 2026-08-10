@@ -2616,31 +2616,27 @@ impl Instance {
         !self.has_command_override() && self.profile_host_environment().is_empty()
     }
 
-    /// Full set of session IDs that retroactive capture must skip for THIS
-    /// instance: the live tmux-discovered set plus any sids the
-    /// resume-fallback cascade has explicitly cleared. Composed of
-    /// `build_exclusion_set` (live tmux scan) and
-    /// `self.retroactive_capture_excludes` (cascade memory) so the caller
-    /// gets the complete picture in one call.
+    /// Full set of session IDs capture must skip for this instance: live tmux
+    /// ownership, cascade-cleared ids, and conversations same-project peers
+    /// parked while running another tool.
     fn retroactive_capture_exclusion_set(&self) -> HashSet<String> {
-        super::capture::compose_exclusion(&self.id, &self.retroactive_capture_excludes)
+        super::capture::compose_exclusion_with_persisted_peers(
+            &self.id,
+            &self.project_path,
+            &self.tool,
+            &self.effective_profile(),
+            &self.retroactive_capture_excludes,
+        )
     }
 
     pub(crate) fn try_retroactive_capture(&self) -> Option<String> {
         let result: Option<String> = match self.tool.as_str() {
             "claude" => {
-                // Claude-only: extend the live-tmux exclusion with stopped,
-                // archived, or pane-less peer sids read from sessions.json so
+                // Claude additionally extends the common live and parked-id
+                // exclusion with stopped, archived, or pane-less peer sids so
                 // the mtime fallback skips peers whose jsonl outlived their
-                // tmux session (#2355). Other tool arms call
-                // `retroactive_capture_exclusion_set()` directly for the
-                // live-only set.
-                let exclusion = super::capture::compose_exclusion_with_stopped_peers(
-                    &self.id,
-                    &self.project_path,
-                    &self.effective_profile(),
-                    &self.retroactive_capture_excludes,
-                );
+                // tmux session (#2355).
+                let exclusion = self.retroactive_capture_exclusion_set();
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
                     capture_claude_session_id_in_container(
@@ -4532,11 +4528,11 @@ impl Instance {
         let mut poller = SessionPoller::new(tmux_session_name.clone());
         let instance_id = self.id.clone();
         let initial_known = self.agent_session_id.clone();
-        // Snapshot per-instance excludes at poller-spawn time. Explicit sid
-        // invalidation inserts into `retroactive_capture_excludes` before any
-        // fresh poller starts, so the first immediate poll won't re-import the
-        // invalidated sid.
-        let extra_excludes = self.retroactive_capture_excludes.clone();
+        // Snapshot persisted peer ownership and per-instance excludes at
+        // poller-spawn time. This keeps storage reads off the hot polling path
+        // while preventing the poller from adopting a conversation another row
+        // parked during a tool swap.
+        let extra_excludes = self.retroactive_capture_exclusion_set();
 
         let poll_fn: Box<dyn Fn() -> Option<String> + Send + 'static> = match tool {
             "claude" => {
@@ -11354,7 +11350,7 @@ mod tests {
             // #2355: when a co-located stopped peer leaves a fresher jsonl in
             // the shared `~/.claude/projects/<encoded-cwd>/` dir, the mtime
             // fallback must skip the peer's sid. `build_exclusion_set` only
-            // sees live tmux peers; `compose_exclusion_with_stopped_peers`
+            // sees live tmux peers; `compose_exclusion_with_persisted_peers`
             // adds the stopped peer's sid from `sessions.json` so this
             // instance's own (older) jsonl wins.
             #[test]
@@ -11405,7 +11401,7 @@ mod tests {
             // Companion to the above for the engine swap: the peer is not a
             // Claude session any more (it swapped to pi), so it no longer
             // passes the `tool` filter in
-            // `compose_exclusion_with_stopped_peers`, and its Claude sid moved
+            // `compose_exclusion_with_persisted_peers`, and its Claude sid moved
             // out of `agent_session_id` into `prior_tool_session_ids`. Unless
             // parked ids are excluded too, the peer's Claude transcript is in no
             // exclusion set at all and the mtime fallback hands it to this
@@ -11446,8 +11442,22 @@ mod tests {
                 // conversation is parked, not the row.
                 peer_inst.status = Status::Running;
                 peer_inst.swap_tool("pi");
-                assert_eq!(peer_inst.tool, "pi");
+                peer_inst.agent_session_id = Some("pi-session-parked".to_string());
+                peer_inst.swap_tool("codex");
+                assert_eq!(peer_inst.tool, "codex");
                 super::seed_disk_for_sidecar_test(profile, &peer_inst);
+
+                let pi_exclusion = crate::session::capture::compose_exclusion_with_persisted_peers(
+                    "other-pi-instance",
+                    project_path,
+                    "pi",
+                    profile,
+                    &std::collections::HashSet::new(),
+                );
+                assert!(
+                    pi_exclusion.contains("pi-session-parked"),
+                    "parked ids must be protected for every resumable tool"
+                );
 
                 let mut inst = Instance::new("verify-parked", project_path);
                 inst.source_profile = profile.to_string();
@@ -11469,7 +11479,7 @@ mod tests {
             // directory (`<parent>/decoy/../wt` vs `<parent>/wt`), as the
             // default `../{repo-name}-worktrees/{branch}` template used to
             // produce. A raw string comparison in
-            // `compose_exclusion_with_stopped_peers` drops the peer from the
+            // `compose_exclusion_with_persisted_peers` drops the peer from the
             // exclusion and re-opens the #2355 steal; the canonicalized
             // comparison must keep it.
             #[test]
@@ -11537,7 +11547,7 @@ mod tests {
 
             // Companion to the above: same setup but the peer is archived
             // instead of stopped, exercising the `is_archived()` branch of
-            // `compose_exclusion_with_stopped_peers`.
+            // `compose_exclusion_with_persisted_peers`.
             #[test]
             #[serial]
             fn mtime_fallback_skips_archived_peer_sid() {

@@ -826,30 +826,27 @@ pub(crate) fn compose_exclusion(
     set
 }
 
-/// Extend [`compose_exclusion`] with the sids of stopped, archived, or
-/// pane-less Claude peers in the same `project_path`, read from
-/// `sessions.json` via `Storage` for the caller's effective profile, plus the
-/// Claude conversations any same-project peer parked when an engine swap moved
-/// it to a different tool.
+/// Extend [`compose_exclusion`] with conversations same-project peers parked
+/// for `current_tool` during an engine swap. For Claude, also include the sids
+/// of stopped, archived, or pane-less peers. Persisted peers are read from
+/// `sessions.json` via `Storage` for the caller's effective profile.
 ///
-/// Used only by the Claude branch of `Instance::try_retroactive_capture`
-/// when the per-instance sidecar is absent or stale: the mtime fallback
-/// over `~/.claude/projects/<encoded-cwd>/` otherwise picks a co-located
-/// stopped peer's jsonl, since [`build_exclusion_set`] only sees live
-/// tmux peers, and the resume binds to the peer's conversation (#2355).
-///
-/// `claude_poll_fn` keeps the live-only exclusion via [`compose_exclusion`]:
-/// it runs on a hot polling path, and live peers already surface in the
-/// tmux env scan.
+/// Used by `Instance::try_retroactive_capture` and snapshotted when its poller
+/// starts. Parked conversations are no longer published in the peer's tmux
+/// environment, so [`build_exclusion_set`] cannot see them. Without this set,
+/// another session can capture the parked conversation before its owner swaps
+/// back. Claude additionally needs stopped peer protection because its mtime
+/// fallback can select a jsonl after the owning tmux pane disappears (#2355).
 ///
 /// Scope: `~/.claude/projects/` is keyed by `$HOME`, not by AoE profile,
 /// but this helper only inspects `sessions.json` for the caller's effective
 /// profile. A stopped peer in a different profile against the same host
 /// `$HOME` will not be excluded; the residual gap is narrower than #2355's
 /// trigger and is left for a follow-up.
-pub(crate) fn compose_exclusion_with_stopped_peers(
+pub(crate) fn compose_exclusion_with_persisted_peers(
     current_instance_id: &str,
     current_project_path: &str,
+    current_tool: &str,
     profile: &str,
     retroactive_capture_excludes: &HashSet<String>,
 ) -> HashSet<String> {
@@ -873,24 +870,19 @@ pub(crate) fn compose_exclusion_with_stopped_peers(
         if canonicalize_or_raw(&inst.project_path) != canonical_current {
             continue;
         }
-        // A peer that swapped away from Claude still owns the Claude
-        // conversation it parked, and intends to resume it on a swap back. It is
-        // excluded regardless of the liveness gate below and regardless of the
-        // peer's current tool: the peer's pane is running some other engine, so
-        // nothing about that pane being alive makes this conversation available.
-        // Without this the parked sid is in no exclusion set at all (it left
-        // `agent_session_id`, and the peer no longer passes the `tool` filter),
-        // and the mtime fallback would hand the peer's transcript to whichever
-        // id-less Claude session in this directory asks next.
+        // A peer that swapped away still owns the conversation it parked and
+        // intends to resume it on a swap back. It is excluded regardless of the
+        // peer's current tool or liveness: its pane is running another engine,
+        // so the live tmux ownership scan cannot discover this id.
         if let Some(parked) = inst
             .prior_tool_session_ids
-            .get("claude")
+            .get(current_tool)
             .and_then(|p| p.agent_session_id.as_deref())
             .filter(|s| !s.is_empty())
         {
             set.insert(parked.to_string());
         }
-        if inst.tool != "claude" {
+        if current_tool != "claude" || inst.tool != "claude" {
             continue;
         }
         let should_exclude = matches!(inst.status, crate::session::Status::Stopped)
