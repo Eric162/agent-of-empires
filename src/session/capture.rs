@@ -828,7 +828,9 @@ pub(crate) fn compose_exclusion(
 
 /// Extend [`compose_exclusion`] with the sids of stopped, archived, or
 /// pane-less Claude peers in the same `project_path`, read from
-/// `sessions.json` via `Storage` for the caller's effective profile.
+/// `sessions.json` via `Storage` for the caller's effective profile, plus the
+/// Claude conversations any same-project peer parked when an engine swap moved
+/// it to a different tool.
 ///
 /// Used only by the Claude branch of `Instance::try_retroactive_capture`
 /// when the per-instance sidecar is absent or stale: the mtime fallback
@@ -868,10 +870,27 @@ pub(crate) fn compose_exclusion_with_stopped_peers(
         if inst.id == current_instance_id {
             continue;
         }
-        if inst.tool != "claude" {
+        if canonicalize_or_raw(&inst.project_path) != canonical_current {
             continue;
         }
-        if canonicalize_or_raw(&inst.project_path) != canonical_current {
+        // A peer that swapped away from Claude still owns the Claude
+        // conversation it parked, and intends to resume it on a swap back. It is
+        // excluded regardless of the liveness gate below and regardless of the
+        // peer's current tool: the peer's pane is running some other engine, so
+        // nothing about that pane being alive makes this conversation available.
+        // Without this the parked sid is in no exclusion set at all (it left
+        // `agent_session_id`, and the peer no longer passes the `tool` filter),
+        // and the mtime fallback would hand the peer's transcript to whichever
+        // id-less Claude session in this directory asks next.
+        if let Some(parked) = inst
+            .prior_tool_session_ids
+            .get("claude")
+            .and_then(|p| p.agent_session_id.as_deref())
+            .filter(|s| !s.is_empty())
+        {
+            set.insert(parked.to_string());
+        }
+        if inst.tool != "claude" {
             continue;
         }
         let should_exclude = matches!(inst.status, crate::session::Status::Stopped)

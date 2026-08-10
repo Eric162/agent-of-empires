@@ -11402,6 +11402,68 @@ mod tests {
                 assert_eq!(inst.agent_session_id.as_deref(), Some(mine));
             }
 
+            // Companion to the above for the engine swap: the peer is not a
+            // Claude session any more (it swapped to pi), so it no longer
+            // passes the `tool` filter in
+            // `compose_exclusion_with_stopped_peers`, and its Claude sid moved
+            // out of `agent_session_id` into `prior_tool_session_ids`. Unless
+            // parked ids are excluded too, the peer's Claude transcript is in no
+            // exclusion set at all and the mtime fallback hands it to this
+            // instance, which both steals the conversation the peer intends to
+            // resume on a swap back and leaks its context.
+            #[test]
+            #[serial]
+            fn mtime_fallback_skips_peer_sid_parked_by_a_tool_swap() {
+                let temp = tempdir().unwrap();
+                let _guard = claude_home_guard(&temp);
+
+                let project_path = "/tmp/aoe-test-parked-peer";
+                let claude_dir = temp
+                    .path()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_claude_project_path(project_path));
+                fs::create_dir_all(&claude_dir).unwrap();
+
+                let mine = "55555555-5555-4555-8555-555555555555";
+                let parked = "66666666-6666-4666-8666-666666666666";
+                let now = SystemTime::now();
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{mine}.jsonl")),
+                    now - Duration::from_secs(120),
+                );
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{parked}.jsonl")),
+                    now - Duration::from_secs(5),
+                );
+
+                let profile = "verify-parked-peer";
+                let mut peer_inst = Instance::new("swapped-peer-id", project_path);
+                peer_inst.source_profile = profile.to_string();
+                peer_inst.tool = "claude".to_string();
+                peer_inst.agent_session_id = Some(parked.to_string());
+                // The peer is mid-life and running: only its Claude
+                // conversation is parked, not the row.
+                peer_inst.status = Status::Running;
+                peer_inst.swap_tool("pi");
+                assert_eq!(peer_inst.tool, "pi");
+                super::seed_disk_for_sidecar_test(profile, &peer_inst);
+
+                let mut inst = Instance::new("verify-parked", project_path);
+                inst.source_profile = profile.to_string();
+                inst.tool = "claude".to_string();
+                inst.agent_session_id = Some(mine.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, _is_existing) = inst.acquire_session_id();
+                assert_eq!(
+                    sid.as_deref(),
+                    Some(mine),
+                    "the parked peer's fresher transcript must not be adopted"
+                );
+                assert_eq!(inst.agent_session_id.as_deref(), Some(mine));
+            }
+
             // Companion to the above for #2858: the stopped peer's stored
             // `project_path` is an UNNORMALIZED spelling of the same
             // directory (`<parent>/decoy/../wt` vs `<parent>/wt`), as the
