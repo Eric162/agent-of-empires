@@ -105,6 +105,10 @@ pub enum Source {
     Env,
     /// Read from `<app_dir>/serve.url`.
     LocalDaemon,
+    /// A `[remotes.<name>]` entry in the user's config. Never eligible for
+    /// the loopback `serve.token` re-read in [`DaemonEndpoint::resolved_token`]:
+    /// a configured remote's credential belongs to another machine's daemon.
+    ConfiguredRemote,
 }
 
 #[derive(Debug, Error)]
@@ -142,6 +146,39 @@ pub fn discover_env() -> Option<DaemonEndpoint> {
         token,
         Source::Env,
     ))
+}
+
+/// Build an endpoint for a `[remotes.<name>]` config entry.
+///
+/// Unlike [`discover`] this never falls back to a local daemon: a remote
+/// row must talk to the box it names or show an error, because silently
+/// resolving to localhost would list the wrong machine's sessions under
+/// the remote's badge.
+pub fn endpoint_for_remote(remote: &crate::session::config::RemoteConfig) -> DaemonEndpoint {
+    // A URL pasted straight out of `serve.url` carries `?token=`. Prefer the
+    // explicit `token` field, falling back to the query so `aoe remote add
+    // <url-with-token>` works before normalization has stripped it.
+    let token = remote
+        .token
+        .clone()
+        .filter(|t| !t.is_empty())
+        .or_else(|| extract_token(&remote.url).map(str::to_string));
+    DaemonEndpoint::new(
+        trim_query(remote.url.trim())
+            .trim_end_matches('/')
+            .to_string(),
+        token,
+        Source::ConfiguredRemote,
+    )
+}
+
+/// Split a user-supplied remote URL into the bare base URL plus any
+/// `?token=` it carried, so the token is stored in its own field instead
+/// of being duplicated inside the URL. Used by `aoe remote add`.
+pub fn split_remote_url(input: &str) -> (String, Option<String>) {
+    let trimmed = input.trim();
+    let token = extract_token(trimmed).map(str::to_string);
+    (trim_query(trimmed).trim_end_matches('/').to_string(), token)
 }
 
 /// Local serve daemon discovery. Returns `Err(NoLocalDaemon)` when no

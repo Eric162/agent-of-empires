@@ -21,6 +21,10 @@ pub mod plugin;
 pub mod profile;
 pub mod project;
 pub mod ps;
+/// Serve-gated: a remote is only useful when this binary can speak to a
+/// daemon, which is the `serve` feature's client half (`acp::client`).
+#[cfg(feature = "serve")]
+pub mod remote;
 pub mod remove;
 pub mod send;
 #[cfg(feature = "serve")]

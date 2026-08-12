@@ -191,6 +191,11 @@ pub struct App {
     /// the sync `execute_action` can't lend out).
     #[cfg(feature = "serve")]
     pending_structured_view_open: Option<String>,
+    /// Set by `Action::OpenRemoteStructuredView`: `(remote name, session id)`
+    /// for a mirrored remote row the user activated. Same stash-for-the-async-
+    /// loop reason as `pending_structured_view_open`.
+    #[cfg(feature = "serve")]
+    pending_remote_structured_open: Option<(String, String)>,
     /// Set by `Action::SwitchSessionView` so the async main loop can run
     /// the daemon switch POST (awaited; the sync handler can't).
     #[cfg(feature = "serve")]
@@ -494,6 +499,8 @@ impl App {
             mosh_active,
             #[cfg(feature = "serve")]
             pending_structured_view_open: None,
+            #[cfg(feature = "serve")]
+            pending_remote_structured_open: None,
             #[cfg(feature = "serve")]
             pending_daemon_start_open: None,
             #[cfg(feature = "serve")]
@@ -1860,6 +1867,15 @@ impl App {
                 needs_full_refresh = true;
             }
 
+            // Remote daemon session lists. Arms its own refresh on an
+            // interval and applies whatever has returned, so a slow or
+            // unreachable remote never blocks the tick.
+            #[cfg(feature = "serve")]
+            if self.home.tick_remotes() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
             // Fade the settings "Settings saved" toast once its window passes,
             // even if the user has stopped typing. Fires at most once per save,
             // so a full refresh here is free.
@@ -2967,6 +2983,11 @@ impl App {
         }
 
         #[cfg(feature = "serve")]
+        if let Some((remote, session_id)) = self.pending_remote_structured_open.take() {
+            self.open_remote_structured_view(&remote, &session_id).await;
+        }
+
+        #[cfg(feature = "serve")]
         if let Some(session_id) = self.pending_smart_rename.take() {
             self.perform_smart_rename(&session_id).await;
         }
@@ -3139,6 +3160,44 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// Mount and enter the embedded structured view against a remote
+    /// daemon.
+    ///
+    /// Shorter than [`Self::open_structured_view`] because the archived /
+    /// trashed and no-local-daemon branches do not apply: the merged list
+    /// only ever holds live structured sessions, and the daemon in question
+    /// is already running on the other machine (that is why we can see the
+    /// row at all). `EmbeddedView::connect` is endpoint-parameterized, so
+    /// the remote case needs no separate view implementation.
+    #[cfg(feature = "serve")]
+    async fn open_remote_structured_view(&mut self, remote: &str, session_id: &str) {
+        // Re-resolve from current config rather than trusting an endpoint
+        // captured at keypress time: the remote may have been removed or
+        // retargeted in between.
+        let config = crate::session::config::load_config()
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let Some(entry) = config.remotes.get(remote).filter(|r| r.enabled) else {
+            self.update_status = Some(UpdateStatus::transient(format!(
+                "remote '{remote}' is no longer configured"
+            )));
+            return;
+        };
+        let endpoint = crate::acp::client::endpoint_for_remote(entry);
+        if self
+            .home
+            .structured_preview
+            .as_ref()
+            .is_some_and(|v| v.session_id() == session_id)
+        {
+            self.activate_embedded();
+            return;
+        }
+        self.connect_embedded_structured(endpoint, session_id).await;
+        self.activate_embedded();
     }
 
     /// Flip the mounted embedded view to interactive mode (exiting
@@ -3530,6 +3589,10 @@ impl App {
                 // lend; the loop picks `pending_structured_view_open` up after
                 // we return.
                 self.pending_structured_view_open = Some(id);
+            }
+            #[cfg(feature = "serve")]
+            Action::OpenRemoteStructuredView { remote, session_id } => {
+                self.pending_remote_structured_open = Some((remote, session_id));
             }
             #[cfg(feature = "serve")]
             Action::SwitchSessionView(id) => {
@@ -4180,6 +4243,17 @@ pub enum Action {
     /// against the borrowed terminal + event stream.
     #[cfg(feature = "serve")]
     OpenStructuredView(String),
+    /// Open the structured view for a session owned by a remote daemon.
+    /// Stashed in `pending_remote_structured_open` and drained beside
+    /// `pending_structured_view_open`. Carries the remote's config name
+    /// rather than a resolved endpoint so the drain re-resolves against
+    /// current config: a `remote remove` between keypress and drain must
+    /// not still connect.
+    #[cfg(feature = "serve")]
+    OpenRemoteStructuredView {
+        remote: String,
+        session_id: String,
+    },
     /// Flip a session's persisted view (structured ↔ terminal) through the
     /// daemon's switch endpoints. Stashed in `pending_view_switch` (the
     /// POST needs the async loop) and drained alongside

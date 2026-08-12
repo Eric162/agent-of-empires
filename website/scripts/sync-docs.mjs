@@ -83,6 +83,13 @@ const PAGES = [
       "Set up Tailscale from scratch to reach your AOE TUI and web dashboard from any device on your tailnet.",
   },
   {
+    source: "docs/guides/remote-sessions.md",
+    dest: "guides/remote-sessions.md",
+    title: "Merged Remote Sessions",
+    description:
+      "Show sessions from another machine's aoe daemon in your local TUI, alongside your own.",
+  },
+  {
     source: "docs/guides/web/dashboard.md",
     dest: "guides/web/dashboard.md",
     title: "Dashboard & Workspaces",
@@ -432,6 +439,7 @@ const URL_MAP = {
   "docs/guides/web/settings.md": "/guides/web/settings/",
   "docs/guides/remote-phone-access.md": "/guides/remote-phone-access/",
   "docs/guides/tailscale.md": "/guides/tailscale/",
+  "docs/guides/remote-sessions.md": "/guides/remote-sessions/",
   "docs/guides/worktrees.md": "/guides/worktrees/",
   "docs/guides/agent-override.md": "/guides/agent-override/",
   "docs/guides/session-resume.md": "/guides/session-resume/",

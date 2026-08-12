@@ -53,6 +53,7 @@ export const docsNav: NavSection[] = [
       { title: "Settings & Profiles", href: "/guides/web/settings/", description: "Manage settings and configuration profiles from the web." },
       { title: "Remote Phone Access", href: "/guides/remote-phone-access/", description: "Expose the dashboard over HTTPS with QR pairing." },
       { title: "Tailscale Setup", href: "/guides/tailscale/", description: "Set up Tailscale from scratch for remote access to your AOE sessions." },
+      { title: "Merged Remote Sessions", href: "/guides/remote-sessions/", description: "See another machine's sessions in your local TUI." },
     ],
   },
   {

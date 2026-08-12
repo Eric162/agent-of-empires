@@ -67,6 +67,12 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe project list`↴](#aoe-project-list)
 * [`aoe project add`↴](#aoe-project-add)
 * [`aoe project remove`↴](#aoe-project-remove)
+* [`aoe remote`↴](#aoe-remote)
+* [`aoe remote list`↴](#aoe-remote-list)
+* [`aoe remote add`↴](#aoe-remote-add)
+* [`aoe remote remove`↴](#aoe-remote-remove)
+* [`aoe remote enable`↴](#aoe-remote-enable)
+* [`aoe remote disable`↴](#aoe-remote-disable)
 * [`aoe worktree`↴](#aoe-worktree)
 * [`aoe worktree list`↴](#aoe-worktree-list)
 * [`aoe worktree info`↴](#aoe-worktree-info)
@@ -148,6 +154,7 @@ Run without arguments to launch the TUI dashboard.
 * `plugin` — Manage plugins (list, info, enable, disable, install, update, uninstall)
 * `profile` — Manage profiles (separate workspaces)
 * `project` — Manage the project registry used by multi-repo session pickers
+* `remote` — Manage remote `aoe serve` daemons whose sessions appear in the local list
 * `worktree` — Manage git worktrees for parallel development
 * `tmux` — tmux integration utilities
 * `sounds` — Manage sound effects for agent state transitions
@@ -1087,6 +1094,88 @@ Remove a project from the registry
 
   Possible values: `global`, `profile`
 
+
+
+
+## `aoe remote`
+
+Manage remote `aoe serve` daemons whose sessions appear in the local list
+
+**Usage:** `aoe remote <COMMAND>`
+
+###### **Subcommands:**
+
+* `list` — List configured remotes
+* `add` — Add a remote daemon whose sessions appear in the local list
+* `remove` — Remove a remote
+* `enable` — Enable a remote without re-entering its URL
+* `disable` — Skip a remote's sessions without deleting its entry
+
+
+
+## `aoe remote list`
+
+List configured remotes
+
+**Usage:** `aoe remote list [OPTIONS]`
+
+###### **Options:**
+
+* `--json` — Output as JSON
+
+
+
+## `aoe remote add`
+
+Add a remote daemon whose sessions appear in the local list
+
+**Usage:** `aoe remote add [OPTIONS] <NAME> <URL>`
+
+###### **Arguments:**
+
+* `<NAME>` — Short label for the remote; badged onto each of its rows
+* `<URL>` — Base URL of the remote daemon, e.g. `http://linuxbox:8080`. A `?token=` copied from the remote's `aoe url` output is accepted and lifted into the stored token
+
+###### **Options:**
+
+* `--token <TOKEN>` — Bearer token for the remote daemon. Omit for a `--no-auth` daemon or when the token is already in the URL
+* `--force` — Replace an existing entry with the same name
+
+
+
+## `aoe remote remove`
+
+Remove a remote
+
+**Usage:** `aoe remote remove <NAME>`
+
+###### **Arguments:**
+
+* `<NAME>` — Name of the remote to remove
+
+
+
+## `aoe remote enable`
+
+Enable a remote without re-entering its URL
+
+**Usage:** `aoe remote enable <NAME>`
+
+###### **Arguments:**
+
+* `<NAME>` — Name of the remote
+
+
+
+## `aoe remote disable`
+
+Skip a remote's sessions without deleting its entry
+
+**Usage:** `aoe remote disable <NAME>`
+
+###### **Arguments:**
+
+* `<NAME>` — Name of the remote
 
 
 

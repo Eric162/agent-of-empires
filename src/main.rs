@@ -437,6 +437,8 @@ async fn run(
         Some(Commands::Project { command }) => {
             cli::project::run(&profile, profile_explicit, command).await
         }
+        #[cfg(feature = "serve")]
+        Some(Commands::Remote { command }) => cli::remote::run(command).await,
         Some(Commands::Worktree { command }) => cli::worktree::run(&profile, command).await,
         // `apply` merges settings and writes the project registry, so it has to
         // run after migrations have brought that data to the current shape.

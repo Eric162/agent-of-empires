@@ -10,7 +10,8 @@ use rattles::presets::prelude as spinners;
 
 use super::{
     get_indent, live_send, HomeView, TerminalMode, ViewMode, ICON_ARCHIVED_SECTION, ICON_COLLAPSED,
-    ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_PINNED, ICON_STOPPED,
+    ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_PINNED,
+    ICON_REMOTE_RUNNING, ICON_REMOTE_SECTION, ICON_REMOTE_WAITING, ICON_STOPPED,
     ICON_TRASH_SECTION, ICON_UNKNOWN, ICON_UNREAD,
 };
 use crate::containers::image_update::ImageUpdate;
@@ -1077,7 +1078,10 @@ impl HomeView {
             );
         }
 
-        if !self.has_instances() && !self.has_any_groups() {
+        // `has_remote_sources` is part of the emptiness test: a user whose only
+        // rows are mirrored from a remote still has a list to show, and the
+        // "Press 'n' to create one" placeholder would hide it entirely.
+        if !self.has_instances() && !self.has_any_groups() && !self.has_remote_sources() {
             let empty_text = vec![
                 Line::from(""),
                 Line::from("No sessions yet").style(Style::default().fg(theme.dimmed)),
@@ -1420,7 +1424,21 @@ impl HomeView {
                 } else {
                     None
                 };
-                let text = if let Some(glyph) = section_glyph {
+                // A remote's header carries its connection state, so an
+                // unreachable box reads as "unreachable" rather than as a
+                // remote that genuinely has no sessions.
+                let remote_subtitle = self.remote_section_subtitle(path);
+                let text = if let Some(subtitle) = remote_subtitle {
+                    Cow::Owned(format!(
+                        "{} {} ({}) {}",
+                        ICON_REMOTE_SECTION, name, session_count, subtitle
+                    ))
+                } else if crate::session::is_remote_section_path(path) {
+                    Cow::Owned(format!(
+                        "{} {} ({})",
+                        ICON_REMOTE_SECTION, name, session_count
+                    ))
+                } else if let Some(glyph) = section_glyph {
                     Cow::Owned(format!("{} {} ({})", glyph, name, session_count))
                 } else if pinned {
                     Cow::Owned(format!("{} ({}) {}", name, session_count, ICON_PINNED))
@@ -1444,6 +1462,48 @@ impl HomeView {
                         .add_modifier(ratatui::style::Modifier::DIM);
                 }
                 (icon, text, style)
+            }
+            // A mirrored remote row. Deliberately quieter than a local row:
+            // static status glyph (no spinner), no activity column, no row
+            // tag. Those all read as "this machine is doing work"; the
+            // animation in particular would claim a liveness this side only
+            // samples every few seconds. The status color still carries over
+            // so Waiting/Error remain scannable.
+            Item::RemoteSession { remote, id, .. } => {
+                match self.remote_row_display(remote, id) {
+                    Some((status, title)) => {
+                        let icon = match status {
+                            Status::Running => ICON_REMOTE_RUNNING,
+                            Status::Waiting => ICON_REMOTE_WAITING,
+                            Status::Idle => ICON_IDLE,
+                            Status::Stopped => ICON_STOPPED,
+                            Status::Error => ICON_ERROR,
+                            Status::Deleting => ICON_DELETING,
+                            Status::Unknown | Status::Starting | Status::Creating => ICON_UNKNOWN,
+                        };
+                        let color = match status {
+                            Status::Running => theme.running,
+                            Status::Waiting => theme.waiting,
+                            Status::Error => theme.error,
+                            Status::Deleting => theme.waiting,
+                            Status::Idle
+                            | Status::Unknown
+                            | Status::Starting
+                            | Status::Creating => theme.idle,
+                            Status::Stopped => theme.dimmed,
+                        };
+                        (icon, Cow::Owned(title), Style::default().fg(color))
+                    }
+                    // The row outlived its snapshot: a refresh landed between
+                    // the tree rebuild and this paint. Render an inert
+                    // placeholder rather than skipping the line, so row count
+                    // and cursor indices stay consistent with `flat_items`.
+                    None => (
+                        ICON_UNKNOWN,
+                        Cow::Borrowed("…"),
+                        Style::default().fg(theme.dimmed),
+                    ),
+                }
             }
             Item::Session { id, .. } => {
                 if let Some(inst) = self.get_instance(id) {
@@ -3729,6 +3789,9 @@ impl HomeView {
                     (Some("Attach"), Some("Live"))
                 }
             }
+            // A remote row has exactly one gesture, and no Tab complement:
+            // live-send drives a local pane.
+            Some(Item::RemoteSession { .. }) => (Some("Open"), None),
             None => (None, None),
         };
         if let Some(enter_action_text) = enter_action_text {

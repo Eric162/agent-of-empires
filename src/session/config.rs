@@ -97,6 +97,14 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tools: HashMap<String, ToolSessionConfig>,
 
+    /// Remote `aoe serve` daemons whose sessions are merged into the local
+    /// session list, keyed by the short label each row is badged with
+    /// (`[remotes.linuxbox]`). Managed by `aoe remote add` / `remove`
+    /// rather than the settings schema: like [`Config::tools`] the entries
+    /// are user-named, so there is no fixed field for a widget to bind to.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub remotes: BTreeMap<String, RemoteConfig>,
+
     /// Per-plugin configuration keyed by plugin id (`[plugins."aoe.web"]`).
     /// An explicit typed map rather than a root-level flatten, so plugin
     /// enable-state survives every save without a root catch-all quietly
@@ -223,6 +231,31 @@ impl Default for PluginConfig {
             dismissed_update: None,
         }
     }
+}
+
+/// A remote `aoe serve` daemon contributing sessions to the local list.
+///
+/// Only structured-view sessions are merged: a remote tmux pane cannot be
+/// attached from this machine without SSH'ing into the host first, so
+/// surfacing those rows would promise an interaction the TUI cannot honor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteConfig {
+    /// Base URL of the remote daemon (`http://linuxbox:8080`). Stored
+    /// without a trailing slash or query string; `aoe remote add`
+    /// normalizes both, and a `?token=` in the pasted URL is lifted into
+    /// [`Self::token`] so the secret is not duplicated on disk.
+    pub url: String,
+
+    /// Bearer token for the remote daemon, or `None` when it runs with
+    /// `--no-auth`. Kept alongside the URL rather than in the URL so it
+    /// never reaches a log line or a `ps` listing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+
+    /// Skip this remote without deleting its entry, so a box that is
+    /// simply off does not paint an error row on every refresh.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 /// Configuration for a user-defined tool session (lazygit, yazi, tig, etc.)

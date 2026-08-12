@@ -2729,6 +2729,14 @@ impl HomeView {
             KeyCode::Char('<') => self.shrink_list(),
             KeyCode::Char('>') => self.grow_list(),
             KeyCode::Enter => {
+                // A remote row is activatable but deliberately leaves
+                // `selected_session` unset (see `update_selected`), so it needs
+                // its own arm here; `activate_selected_session` dispatches on
+                // `selected_remote` first.
+                #[cfg(feature = "serve")]
+                if self.selected_remote.is_some() {
+                    return self.activate_selected_session();
+                }
                 if self.selected_session.is_some() {
                     return self.activate_selected_session();
                 } else if let Some(Item::Group { path, .. }) = self.flat_items.get(self.cursor) {
@@ -3854,6 +3862,23 @@ impl HomeView {
                         payload: PaletteAction::JumpToCursor(idx),
                     });
                 }
+                // Remote rows get a jump entry too, badged with the remote's
+                // name so the palette makes clear which machine owns it.
+                // JumpToCursor only moves the cursor, so the entry commits to
+                // nothing a remote row cannot do.
+                Item::RemoteSession { remote, id, .. } => {
+                    let Some(title) = self.remote_session_title(remote, id) else {
+                        continue;
+                    };
+                    entries.push(PaletteCommand {
+                        id: "jump-remote-session",
+                        title: format!("Jump to remote session: {} ({})", title, remote),
+                        group: PaletteGroup::Sessions,
+                        keywords: vec!["session", "jump", "remote"],
+                        hotkey: String::new(),
+                        payload: PaletteAction::JumpToCursor(idx),
+                    });
+                }
                 Item::Group { name, path, .. } => {
                     // The synthetic Archived section header (and any
                     // sub-folder rendered under it in Project mode) is
@@ -3863,6 +3888,7 @@ impl HomeView {
                     // intentionally disarms.
                     if crate::session::is_within_archived_section(path)
                         || crate::session::is_within_trash_section(path)
+                        || crate::session::is_remote_section_path(path)
                     {
                         continue;
                     }
@@ -3988,7 +4014,11 @@ impl HomeView {
             .iter()
             .filter_map(|item| match item {
                 Item::Session { id, .. } => Some(id.clone()),
-                Item::Group { .. } => None,
+                // Attention cycling walks local status transitions
+                // (Waiting, freshly-idle). A remote row has no local
+                // status history to cycle through, and stopping on one
+                // would strand `w` on a row whose only action is "open".
+                Item::Group { .. } | Item::RemoteSession { .. } => None,
             })
             .collect();
         let current_session = self.selected_session.clone();
@@ -4152,6 +4182,16 @@ impl HomeView {
     /// between the `Enter` keybind and double-click activation so the two
     /// paths can't drift.
     pub(super) fn activate_selected_session(&mut self) -> Option<Action> {
+        // Remote rows are checked first and never fall through: they set
+        // `selected_remote` instead of `selected_session`, so the local
+        // paths below cannot resolve one anyway, but returning here keeps
+        // the "one row, one action" contract obvious.
+        #[cfg(feature = "serve")]
+        if let Some((remote, session_id)) = self.selected_remote.clone() {
+            // Same preview-pane handoff as the local structured path.
+            self.exit_live_send_if_active();
+            return Some(Action::OpenRemoteStructuredView { remote, session_id });
+        }
         let id = self.selected_session.clone()?;
         if let Some(inst) = self.get_instance(&id) {
             if matches!(inst.status, Status::Deleting | Status::Creating) {
@@ -4277,11 +4317,38 @@ impl HomeView {
                     self.selected_session = Some(id.clone());
                     self.selected_group = None;
                     self.selected_group_profile = None;
+                    #[cfg(feature = "serve")]
+                    {
+                        self.selected_remote = None;
+                    }
+                }
+                Item::RemoteSession { remote, id, .. } => {
+                    // Every local selection field stays clear so no local
+                    // keybinding can fire against a row this machine does not
+                    // own; `selected_remote` carries the target for the one
+                    // action that does apply (open the structured view).
+                    #[cfg(feature = "serve")]
+                    {
+                        self.selected_remote = Some((remote.clone(), id.clone()));
+                    }
+                    #[cfg(not(feature = "serve"))]
+                    let _ = (remote, id);
+                    self.selected_session = None;
+                    self.selected_group = None;
+                    self.selected_group_profile = None;
                 }
                 Item::Group { path, .. } => {
                     self.selected_session = None;
+                    #[cfg(feature = "serve")]
+                    {
+                        self.selected_remote = None;
+                    }
                     if crate::session::is_within_archived_section(path)
                         || crate::session::is_within_trash_section(path)
+                        // A remote section header is synthetic in the same way:
+                        // it cannot be renamed, deleted, or moved, so it must
+                        // not arm the group keybindings either.
+                        || crate::session::is_remote_section_path(path)
                     {
                         // The synthetic Archived section (and any
                         // project sub-folder rendered under it in
@@ -4404,6 +4471,16 @@ impl HomeView {
         }
         if crate::session::is_trash_section_path(path) {
             self.toggle_trashed_section();
+            return;
+        }
+        // Same story for a remote section header: not a member of any
+        // GroupTree, and its collapsed state lives on the `RemoteSource`.
+        #[cfg(feature = "serve")]
+        if let Some(name) = crate::session::remote_name_from_section_path(path) {
+            let name = name.to_string();
+            if self.toggle_remote_section(&name) {
+                self.rebuild_flat_items();
+            }
             return;
         }
         if self.group_by == GroupByMode::Project {
@@ -4893,6 +4970,14 @@ impl HomeView {
                     return true;
                 }
             }
+            // A remote row supports exactly one action (open the structured
+            // view), which Enter and double-click already provide. Every entry
+            // the session menu offers acts on local state, so open no menu
+            // rather than one whose rows would silently do nothing. The cursor
+            // move above still happened, so the right-click at least selects.
+            if matches!(self.flat_items[idx], super::Item::RemoteSession { .. }) {
+                return true;
+            }
             let is_group = matches!(self.flat_items[idx], super::Item::Group { .. });
             // A real project header in project view gets the pin menu; the
             // cursor was just moved onto this row, so `project_group_at_cursor`
@@ -4908,7 +4993,9 @@ impl HomeView {
                         .get_instance(id)
                         .map(|inst| (inst.is_archived(), inst.is_snoozed(), inst.is_unread()))
                         .unwrap_or((false, false, false)),
-                    super::Item::Group { .. } => (false, false, false),
+                    super::Item::Group { .. } | super::Item::RemoteSession { .. } => {
+                        (false, false, false)
+                    }
                 };
                 // Snooze is an Attention-sort triage primitive: the `'h'`
                 // keybinding only fires in Attention sort, so the menu omits
@@ -4924,7 +5011,9 @@ impl HomeView {
                 // refuse. Matches the web sidebar's `acp_can_fork` gating.
                 let can_fork = match &self.flat_items[idx] {
                     super::Item::Session { id, .. } => self.session_can_fork(id),
-                    super::Item::Group { .. } => false,
+                    // Forking creates a local session from a local worktree;
+                    // neither exists for a remote row.
+                    super::Item::Group { .. } | super::Item::RemoteSession { .. } => false,
                 };
                 // View switching mirrors the web sidebar's per-session
                 // switch action: offered when a structured session can go
@@ -4933,7 +5022,9 @@ impl HomeView {
                 // the daemon.
                 let switch_view = match &self.flat_items[idx] {
                     super::Item::Session { id, .. } => self.session_switch_view_target(id),
-                    super::Item::Group { .. } => None,
+                    // Flipping a remote session's view would need a write
+                    // against the remote daemon; the merged list is read-only.
+                    super::Item::Group { .. } | super::Item::RemoteSession { .. } => None,
                 };
                 ContextMenuDialog::for_session(
                     anchor,
@@ -5620,7 +5711,7 @@ impl HomeView {
             // which tracks `cursor`, not the click target; and we'd open
             // the wrong session.
             return match item {
-                Item::Session { .. } => {
+                Item::Session { .. } | Item::RemoteSession { .. } => {
                     if self.cursor != abs_idx {
                         self.cursor = abs_idx;
                         self.update_selected();
@@ -5634,6 +5725,17 @@ impl HomeView {
         match item {
             Item::Group { path, .. } => {
                 self.toggle_group_collapsed(&path);
+                None
+            }
+            // A single click selects a remote row and stops there. The
+            // configurable click actions (live-send, attach) all drive a
+            // local pane, so the remote row's only gesture stays the
+            // deliberate one: Enter or double-click.
+            Item::RemoteSession { .. } => {
+                if self.cursor != abs_idx {
+                    self.cursor = abs_idx;
+                    self.update_selected();
+                }
                 None
             }
             Item::Session { id, .. } => {
@@ -6622,6 +6724,16 @@ impl HomeView {
                 Item::Group { name, path, .. } => {
                     format!("{} {}", name, path)
                 }
+                // Remote rows are searchable by title, remote name, and the
+                // remote's project path, so `/linuxbox` gathers that whole
+                // section. Search only moves the cursor, so matching one
+                // commits to nothing a remote row cannot do.
+                Item::RemoteSession { remote, id, .. } => {
+                    match self.remote_search_haystack(remote, id) {
+                        Some(haystack) => haystack,
+                        None => continue,
+                    }
+                }
             };
 
             let haystack_utf32 = Utf32Str::new(&haystack, &mut buf);
@@ -6675,6 +6787,16 @@ impl HomeView {
                 }
                 Item::Group { name, path, .. } => {
                     format!("{} {}", name, path)
+                }
+                // Remote rows are searchable by title, remote name, and the
+                // remote's project path, so `/linuxbox` gathers that whole
+                // section. Search only moves the cursor, so matching one
+                // commits to nothing a remote row cannot do.
+                Item::RemoteSession { remote, id, .. } => {
+                    match self.remote_search_haystack(remote, id) {
+                        Some(haystack) => haystack,
+                        None => continue,
+                    }
                 }
             };
 

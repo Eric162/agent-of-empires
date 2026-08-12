@@ -4,6 +4,13 @@ pub(crate) mod bindings;
 mod input;
 mod live_send;
 mod operations;
+/// Remote-daemon session sources. Serve-gated: the whole module talks to
+/// `acp::client`, which only exists with `serve`. `Item::RemoteSession` and
+/// `append_remote_sections` are deliberately NOT gated, so every match arm
+/// in the view compiles identically in both builds; a TUI-only build simply
+/// never constructs one.
+#[cfg(feature = "serve")]
+pub(crate) mod remotes;
 pub(crate) mod render;
 
 #[cfg(test)]
@@ -409,6 +416,14 @@ pub(super) const ICON_STOPPED: &str = "⠒";
 /// monochrome terminals and for colorblind users. See #2250.
 pub(super) const ICON_DORMANT: &str = "⠶";
 pub(super) const ICON_DELETING: &str = "✕";
+/// Static Running / Waiting glyphs for mirrored remote rows. Local rows
+/// animate those two states with a spinner keyed off `created_at`; a remote
+/// row is re-listed every few seconds, so an animation would imply a
+/// frame-accurate liveness this side does not have. Same single-width
+/// braille family as `ICON_IDLE` so the remote shelf reads as one system,
+/// and distinct in shape from `ICON_DORMANT` for monochrome terminals.
+pub(super) const ICON_REMOTE_RUNNING: &str = "⠿";
+pub(super) const ICON_REMOTE_WAITING: &str = "⠛";
 pub(super) const ICON_COLLAPSED: &str = "▶";
 pub(super) const ICON_EXPANDED: &str = "▼";
 /// Marks a pinned project header in project view. Geometric per DESIGN.md
@@ -420,6 +435,10 @@ pub(super) const ICON_PINNED: &str = "◆";
 /// hit-testing on terminals that render them double-width or as tofu).
 pub(super) const ICON_TRASH_SECTION: &str = "⊘";
 pub(super) const ICON_ARCHIVED_SECTION: &str = "▤";
+/// Type glyph for a remote daemon's section header. Single-width geometric
+/// per DESIGN.md, and distinct from the Trash / Archived shelf glyphs so
+/// the three system shelves are told apart by shape.
+pub(super) const ICON_REMOTE_SECTION: &str = "⇄";
 
 /// Hook progress for a session being created in the background
 pub(super) struct CreatingHookProgress {
@@ -458,9 +477,35 @@ pub struct HomeView {
     pub(super) group_trees: HashMap<String, GroupTree>,
     pub(super) flat_items: Vec<Item>,
 
+    /// Configured remote daemons whose sessions are mirrored into the list,
+    /// one synthetic bottom-shelf section each. Rebuilt from config on
+    /// `refresh_from_config`; refreshed over the network on its own cadence
+    /// (see `tick_remotes`).
+    #[cfg(feature = "serve")]
+    pub(super) remote_sources: Vec<remotes::RemoteSource>,
+    /// Receiver for in-flight remote refreshes. `None` until the first
+    /// refresh is armed (i.e. when at least one remote is configured), so a
+    /// user with no remotes pays nothing.
+    #[cfg(feature = "serve")]
+    remote_rx: Option<std::sync::mpsc::Receiver<remotes::RemoteUpdate>>,
+    #[cfg(feature = "serve")]
+    remote_tx: Option<std::sync::mpsc::Sender<remotes::RemoteUpdate>>,
+    /// When the next remote refresh may be armed. `None` means "arm on the
+    /// next tick", which is the initial state so the sections populate
+    /// without waiting out a full interval.
+    #[cfg(feature = "serve")]
+    remote_next_refresh: Option<Instant>,
+
     // UI state
     pub(super) cursor: usize,
     pub(super) selected_session: Option<String>,
+    /// `(remote name, remote session id)` when the cursor sits on a mirrored
+    /// remote row. Deliberately separate from `selected_session`: every
+    /// local keybinding gates on `selected_session.is_some()`, so keeping
+    /// remote selection in its own field disarms all of them at once
+    /// instead of relying on each one to re-check the row's kind.
+    #[cfg(feature = "serve")]
+    pub(super) selected_remote: Option<(String, String)>,
     pub(super) selected_group: Option<String>,
     /// Which profile the selected group belongs to (for scoped group operations)
     pub(super) selected_group_profile: Option<String>,
@@ -2152,8 +2197,18 @@ impl HomeView {
             pending_added: HashMap::new(),
             group_trees,
             flat_items: Vec::new(),
+            #[cfg(feature = "serve")]
+            remote_sources: remotes::sources_from_config(&resolved.remotes),
+            #[cfg(feature = "serve")]
+            remote_rx: None,
+            #[cfg(feature = "serve")]
+            remote_tx: None,
+            #[cfg(feature = "serve")]
+            remote_next_refresh: None,
             cursor: 0,
             selected_session: None,
+            #[cfg(feature = "serve")]
+            selected_remote: None,
             selected_group: None,
             selected_group_profile: None,
             view_mode,
@@ -3595,6 +3650,264 @@ impl HomeView {
         !outcome.applied.is_empty() || !outcome.rolled_back.is_empty()
     }
 
+    /// Rebuild `remote_sources` from a freshly resolved config, preserving
+    /// the last fetched snapshot for remotes that survived the edit.
+    ///
+    /// Preserving matters because config is re-resolved on every settings
+    /// save and on every watcher-driven reload: rebuilding from scratch
+    /// would blank every remote section back to "connecting…" whenever the
+    /// user changed an unrelated setting.
+    #[cfg(feature = "serve")]
+    fn sync_remote_sources(
+        &mut self,
+        remotes: &std::collections::BTreeMap<String, crate::session::config::RemoteConfig>,
+    ) {
+        let mut rebuilt = remotes::sources_from_config(remotes);
+        for source in &mut rebuilt {
+            if let Some(prev) = self.remote_sources.iter().find(|p| p.name == source.name) {
+                // Only carry the snapshot forward when the endpoint is
+                // unchanged. A retargeted URL must re-fetch, not keep
+                // showing the old box's sessions under the same name.
+                if prev.endpoint.base_url == source.endpoint.base_url {
+                    source.sessions = prev.sessions.clone();
+                    source.last_error = prev.last_error.clone();
+                    source.loaded = prev.loaded;
+                    // Carry the in-flight marker with the endpoint it belongs
+                    // to: the outstanding task still reports under this name,
+                    // and clearing the flag here would let the next tick spawn
+                    // a duplicate. A retargeted URL deliberately resets it, so
+                    // the new endpoint is fetched immediately; the stale reply
+                    // is then absorbed harmlessly by the next drain.
+                    source.in_flight = prev.in_flight;
+                }
+                source.collapsed = prev.collapsed;
+            }
+        }
+        self.remote_sources = rebuilt;
+    }
+
+    /// Arm a refresh when the interval has elapsed, then drain whatever has
+    /// come back. Returns true if any section changed, so the caller can
+    /// rebuild `flat_items`.
+    ///
+    /// Called from the `App::run` tick. Cheap and allocation-free when no
+    /// remotes are configured: the empty-source check returns before any
+    /// channel is created.
+    #[cfg(feature = "serve")]
+    pub fn tick_remotes(&mut self) -> bool {
+        if self.remote_sources.is_empty() {
+            // Drop a channel left over from a config edit that removed the
+            // last remote, so late replies cannot resurrect a stale section.
+            self.remote_rx = None;
+            self.remote_tx = None;
+            return false;
+        }
+
+        let now = Instant::now();
+        if self.remote_next_refresh.is_none_or(|next| now >= next) {
+            if self.remote_tx.is_none() {
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.remote_tx = Some(tx);
+                self.remote_rx = Some(rx);
+            }
+            // Cloned out of the option so `spawn_refresh` can take
+            // `remote_sources` mutably (it marks each source in-flight)
+            // without a second borrow of `self`.
+            if let Some(tx) = self.remote_tx.clone() {
+                remotes::spawn_refresh(&mut self.remote_sources, &tx);
+            }
+            self.remote_next_refresh = Some(now + remotes::REMOTE_REFRESH_INTERVAL);
+        }
+
+        if !self.drain_remote_updates() {
+            return false;
+        }
+        // A changed section adds or removes rows, so `flat_items` has to be
+        // rebuilt; a repaint alone would keep showing the old tree. Done here
+        // rather than in the caller so the rebuild cannot be forgotten at a
+        // future callsite.
+        self.refresh_rows_preserving_selection();
+        true
+    }
+
+    /// Apply completed refreshes. Non-blocking: a remote that has not
+    /// replied yet keeps its previous snapshot.
+    #[cfg(feature = "serve")]
+    fn drain_remote_updates(&mut self) -> bool {
+        let Some(rx) = self.remote_rx.as_ref() else {
+            return false;
+        };
+        let mut updates = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(update) => updates.push(update),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // Every sender clone is gone. Re-arm from scratch on the
+                    // next tick rather than going permanently quiet.
+                    self.remote_rx = None;
+                    self.remote_tx = None;
+                    break;
+                }
+            }
+        }
+        if updates.is_empty() {
+            return false;
+        }
+
+        let mut changed = false;
+        for update in updates {
+            let Some(source) = self
+                .remote_sources
+                .iter_mut()
+                .find(|s| s.name == update.name)
+            else {
+                // The remote was removed from config while its fetch was in
+                // flight. Drop the reply.
+                continue;
+            };
+            source.loaded = true;
+            source.in_flight = false;
+            match update.result {
+                Ok(sessions) => {
+                    // Compare before assigning so an unchanged poll does not
+                    // force a tree rebuild every interval.
+                    let same = source.sessions.len() == sessions.len()
+                        && source.sessions.iter().zip(&sessions).all(|(a, b)| {
+                            a.id == b.id && a.title == b.title && a.status == b.status
+                        });
+                    if !same || source.last_error.is_some() {
+                        source.sessions = sessions;
+                        changed = true;
+                    }
+                    source.last_error = None;
+                }
+                Err(e) => {
+                    if source.last_error.as_deref() != Some(e.as_str()) {
+                        changed = true;
+                    }
+                    tracing::debug!(
+                        target: "tui.remotes",
+                        remote = %source.name,
+                        error = %e,
+                        "remote session list refresh failed",
+                    );
+                    source.last_error = Some(e);
+                }
+            }
+        }
+        changed
+    }
+
+    /// Look up a mirrored remote session by the pair that identifies it.
+    /// Both halves are required: remote ids are only unique per daemon.
+    #[cfg(feature = "serve")]
+    pub(super) fn remote_session(
+        &self,
+        remote: &str,
+        id: &str,
+    ) -> Option<(&remotes::RemoteSource, &remotes::RemoteSession)> {
+        let source = self.remote_sources.iter().find(|s| s.name == remote)?;
+        Some((source, source.session(id)?))
+    }
+
+    /// Status and title for a mirrored remote row, or `None` when the row
+    /// has outlived its snapshot.
+    ///
+    /// Exists in both build configurations so the `Item::RemoteSession`
+    /// render and input arms need no `cfg` of their own. Without `serve`
+    /// there is no remotes module and no way to construct such a row, so
+    /// the stub always returns `None`.
+    #[cfg(feature = "serve")]
+    pub(super) fn remote_row_display(
+        &self,
+        remote: &str,
+        id: &str,
+    ) -> Option<(crate::session::Status, String)> {
+        let (_, session) = self.remote_session(remote, id)?;
+        let title = if session.title.is_empty() {
+            "(untitled)".to_string()
+        } else {
+            session.title.clone()
+        };
+        Some((session.status(), title))
+    }
+
+    #[cfg(not(feature = "serve"))]
+    pub(super) fn remote_row_display(
+        &self,
+        _remote: &str,
+        _id: &str,
+    ) -> Option<(crate::session::Status, String)> {
+        None
+    }
+
+    /// Connection-state suffix for a remote section header, or `None` for a
+    /// non-remote header or a healthy loaded remote. Defined in both build
+    /// configurations for the same reason as `remote_row_display`.
+    #[cfg(feature = "serve")]
+    pub(super) fn remote_section_subtitle(&self, path: &str) -> Option<String> {
+        let name = crate::session::remote_name_from_section_path(path)?;
+        self.remote_sources
+            .iter()
+            .find(|s| s.name == name)?
+            .subtitle()
+    }
+
+    #[cfg(not(feature = "serve"))]
+    pub(super) fn remote_section_subtitle(&self, _path: &str) -> Option<String> {
+        None
+    }
+
+    /// Title of a mirrored remote row, for the command palette.
+    pub(super) fn remote_session_title(&self, remote: &str, id: &str) -> Option<String> {
+        self.remote_row_display(remote, id).map(|(_, title)| title)
+    }
+
+    /// Search haystack for a mirrored remote row: title, remote name, and
+    /// the remote's project path. Includes the path so `/` search matches a
+    /// repo name the same way it does for local rows, and the remote name so
+    /// searching for the machine gathers its whole section.
+    #[cfg(feature = "serve")]
+    pub(super) fn remote_search_haystack(&self, remote: &str, id: &str) -> Option<String> {
+        let (_, session) = self.remote_session(remote, id)?;
+        Some(format!(
+            "{} {} {}",
+            session.title, remote, session.project_path
+        ))
+    }
+
+    #[cfg(not(feature = "serve"))]
+    pub(super) fn remote_search_haystack(&self, _remote: &str, _id: &str) -> Option<String> {
+        None
+    }
+
+    /// Toggle a remote section's collapsed state. Kept in memory rather
+    /// than persisted: unlike Archived/Trash, a remote section's contents
+    /// change with another machine's activity, so a collapse the user set
+    /// days ago is more likely to hide news than to reduce noise.
+    #[cfg(feature = "serve")]
+    pub(super) fn toggle_remote_section(&mut self, remote: &str) -> bool {
+        if let Some(source) = self.remote_sources.iter_mut().find(|s| s.name == remote) {
+            source.collapsed = !source.collapsed;
+            return true;
+        }
+        false
+    }
+
+    /// Borrowed layout views for `append_remote_sections`.
+    #[cfg(feature = "serve")]
+    fn remote_section_views(&self) -> Vec<crate::session::RemoteSectionView<'_>> {
+        self.remote_sources
+            .iter()
+            .map(|s| crate::session::RemoteSectionView {
+                name: &s.name,
+                collapsed: s.collapsed,
+                session_ids: s.sessions.iter().map(|x| x.id.as_str()).collect(),
+            })
+            .collect()
+    }
+
     /// Drain the startup-recovery channel and apply each `RecoveryUpdate`
     /// to the in-memory `Instance` snapshot. Released the recovery lock
     /// (and the receiver) when all workers have completed.
@@ -3700,11 +4013,30 @@ impl HomeView {
     fn refresh_rows_preserving_selection(&mut self) {
         let prev_selected_session = self.selected_session.clone();
         let prev_selected_group = self.selected_group.clone();
+        #[cfg(feature = "serve")]
+        let prev_selected_remote = self.selected_remote.clone();
 
         self.rebuild_flat_items();
 
         let mut restored = false;
-        if let Some(ref sid) = prev_selected_session {
+        // Remote first: a remote row sets neither `selected_session` nor
+        // `selected_group`, so without this the cursor would fall through to
+        // the length clamp and jump on every refresh that added a row above.
+        #[cfg(feature = "serve")]
+        if let Some((ref prev_remote, ref prev_id)) = prev_selected_remote {
+            for (idx, item) in self.flat_items.iter().enumerate() {
+                if let Item::RemoteSession { remote, id, .. } = item {
+                    if remote == prev_remote && id == prev_id {
+                        self.cursor = idx;
+                        restored = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if restored {
+            // Fall through to the search/selection tail below.
+        } else if let Some(ref sid) = prev_selected_session {
             for (idx, item) in self.flat_items.iter().enumerate() {
                 if let Item::Session { id, .. } = item {
                     if id == sid {
@@ -4929,6 +5261,21 @@ impl HomeView {
         !self.instances.is_empty()
     }
 
+    /// Whether any remote is configured and enabled. Distinct from "any
+    /// remote row exists": a configured remote with zero sessions (or an
+    /// unreachable one) still renders a section header, and that header is
+    /// the only place its connection error is reported, so the empty-state
+    /// placeholder must not replace it.
+    #[cfg(feature = "serve")]
+    pub(super) fn has_remote_sources(&self) -> bool {
+        !self.remote_sources.is_empty()
+    }
+
+    #[cfg(not(feature = "serve"))]
+    pub(super) fn has_remote_sources(&self) -> bool {
+        false
+    }
+
     pub fn get_instance(&self, id: &str) -> Option<&Instance> {
         self.instances.get(id)
     }
@@ -5024,8 +5371,18 @@ impl HomeView {
             Item::Group { path, .. } => {
                 crate::session::is_within_archived_section(path)
                     || crate::session::is_within_trash_section(path)
+                    // Remote sections are appended after Archived and Trash,
+                    // so they extend the same contiguous shelf suffix. Without
+                    // this arm a remote section present while both local
+                    // shelves are empty would leave `shelf_start` at `None`
+                    // and the renderer would treat remote rows as workspace
+                    // rows, breaking the sidebar split and shelf hit-testing.
+                    || crate::session::is_remote_section_path(path)
             }
-            Item::Session { .. } => false,
+            // A remote session row only ever appears under its own header,
+            // which the arm above already matches, so the scan has found the
+            // shelf start before reaching one.
+            Item::Session { .. } | Item::RemoteSession { .. } => false,
         })
     }
 
@@ -5054,6 +5411,7 @@ impl HomeView {
             let mut items = flatten_sessions_by_attention(&filtered);
             append_archived_section(&mut items, &filtered, self.archived_section_collapsed);
             append_trash_section(&mut items, &filtered, self.trashed_section_collapsed);
+            self.append_remotes(&mut items);
             return items;
         }
 
@@ -5078,7 +5436,20 @@ impl HomeView {
         append_archived_section(&mut items, &archive_pool, self.archived_section_collapsed);
         // Trash sits below Archived, also pinned to the bottom.
         append_trash_section(&mut items, &archive_pool, self.trashed_section_collapsed);
+        self.append_remotes(&mut items);
         items
+    }
+
+    /// Append the remote-daemon sections below every local shelf.
+    ///
+    /// A no-op in a TUI-only build (no `remotes` module), and a no-op with
+    /// `serve` when nothing is configured, so a user who never adds a remote
+    /// sees an unchanged list.
+    fn append_remotes(&self, items: &mut Vec<Item>) {
+        #[cfg(feature = "serve")]
+        crate::session::append_remote_sections(items, self.remote_section_views());
+        #[cfg(not(feature = "serve"))]
+        let _ = items;
     }
 
     fn build_flat_items_by_project(&self) -> Vec<Item> {
@@ -5144,6 +5515,9 @@ impl HomeView {
         // Trash is a flat shelf even in project mode (recovery list, not a
         // workspace), pinned below the Archived section.
         append_trash_section(&mut items, &grouped, self.trashed_section_collapsed);
+        // Remote sections stay flat in project mode too: a remote row has no
+        // local worktree, so it has no project to be grouped under.
+        self.append_remotes(&mut items);
         items
     }
 
@@ -6392,6 +6766,9 @@ impl HomeView {
                         .get_instance(id.as_str())
                         .map(|i| i.source_profile.clone());
                 }
+                // A remote session belongs to another machine's profile, which
+                // has no meaning for local profile-scoped operations.
+                crate::session::Item::RemoteSession { .. } => return None,
                 crate::session::Item::Group { profile, path, .. } => {
                     if let Some(p) = profile {
                         return Some(p.clone());
@@ -7389,6 +7766,8 @@ impl HomeView {
         crate::session::set_favorites_first(config.session.favorites_first);
         self.tips_unseen = tips_unseen_count(&config);
         self.tool_configs = config.tools;
+        #[cfg(feature = "serve")]
+        self.sync_remote_sources(&config.remotes);
         self.tool_hotkey_cache = input::build_tool_hotkey_cache(&self.tool_configs);
         let hotkey_warnings = input::validate_tool_hotkeys(&self.tool_configs);
         if matches!(origin, ConfigRefreshOrigin::Interactive)

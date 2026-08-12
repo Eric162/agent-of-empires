@@ -153,6 +153,13 @@ pub enum Commands {
         command: ProjectCommands,
     },
 
+    /// Manage remote `aoe serve` daemons whose sessions appear in the local list
+    #[cfg(feature = "serve")]
+    Remote {
+        #[command(subcommand)]
+        command: crate::cli::remote::RemoteCommands,
+    },
+
     /// Manage git worktrees for parallel development
     Worktree {
         #[command(subcommand)]
@@ -275,6 +282,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "plugin",
     "profile",
     "project",
+    "remote",
     "worktree",
     "tmux",
     "sounds",
@@ -323,6 +331,8 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::Plugin { .. } => "plugin",
         Commands::Profile { .. } => "profile",
         Commands::Project { .. } => "project",
+        #[cfg(feature = "serve")]
+        Commands::Remote { .. } => "remote",
         Commands::Worktree { .. } => "worktree",
         Commands::Tmux { .. } => "tmux",
         Commands::Sounds { .. } => "sounds",

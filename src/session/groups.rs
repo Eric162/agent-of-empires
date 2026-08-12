@@ -23,6 +23,32 @@ pub const ARCHIVED_SECTION_NAME: &str = "Archived";
 pub const TRASH_SECTION_PATH: &str = "__aoe_trash_section__";
 pub const TRASH_SECTION_NAME: &str = "Trash";
 
+/// Synthetic group path prefix for a remote daemon's shelf section. Unlike
+/// the Archived and Trash sentinels there is one section per configured
+/// remote, so the remote's name is appended: `<prefix>/<name>`. Shares the
+/// `__aoe_*__` convention so code that already skips synthetic headers
+/// keeps skipping these.
+pub const REMOTE_SECTION_PREFIX: &str = "__aoe_remote_section__";
+
+/// Synthetic group path for one remote's section header.
+pub fn remote_section_path(name: &str) -> String {
+    format!("{}/{}", REMOTE_SECTION_PREFIX, name)
+}
+
+/// True for a remote shelf header path. The bare prefix is not a header;
+/// only `<prefix>/<name>` is.
+#[inline]
+pub fn is_remote_section_path(path: &str) -> bool {
+    remote_name_from_section_path(path).is_some()
+}
+
+/// Recover the remote name from a path built by [`remote_section_path`].
+pub fn remote_name_from_section_path(path: &str) -> Option<&str> {
+    path.strip_prefix(REMOTE_SECTION_PREFIX)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .filter(|n| !n.is_empty())
+}
+
 #[inline]
 pub fn is_archived_section_path(path: &str) -> bool {
     path == ARCHIVED_SECTION_PATH
@@ -368,6 +394,24 @@ pub enum Item {
         id: String,
         depth: usize,
     },
+    /// A session owned by a remote `aoe serve` daemon, mirrored into the
+    /// list read-only.
+    ///
+    /// Deliberately not an `Item::Session`: that variant's `id` is resolved
+    /// against `HomeView::instances` by every local operation, so reusing
+    /// it would make remote rows silently addressable by `stop`, `delete`,
+    /// worktree edits, and tmux attach, all of which act on this machine.
+    /// A distinct variant means an operation reaches a remote row only if
+    /// it explicitly matches this arm.
+    RemoteSession {
+        /// Config key of the owning `[remotes.<name>]` entry.
+        remote: String,
+        /// Session id as the remote daemon knows it. Not unique against
+        /// local ids in principle, so never look one up without the
+        /// `remote` half.
+        id: String,
+        depth: usize,
+    },
 }
 
 impl Item {
@@ -375,6 +419,17 @@ impl Item {
         match self {
             Item::Group { depth, .. } => *depth,
             Item::Session { depth, .. } => *depth,
+            Item::RemoteSession { depth, .. } => *depth,
+        }
+    }
+
+    /// The local session id this row addresses, if any. Remote rows return
+    /// `None`: they have no local `Instance`, and callers that treat an id
+    /// as locally resolvable must skip them.
+    pub fn local_session_id(&self) -> Option<&str> {
+        match self {
+            Item::Session { id, .. } => Some(id),
+            Item::Group { .. } | Item::RemoteSession { .. } => None,
         }
     }
 }
@@ -1060,6 +1115,55 @@ pub fn append_archived_section(items: &mut Vec<Item>, instances: &[Instance], co
             depth: 1,
         });
     }
+}
+
+/// Append one synthetic section per remote daemon, each a depth-0 header
+/// followed by that remote's mirrored session rows.
+///
+/// Unlike Archived and Trash, a remote section is pushed even when it holds
+/// no sessions: an empty section is how a configured-but-idle (or
+/// unreachable) box stays visible. Suppressing it would make a remote that
+/// failed to connect indistinguishable from one that was never configured,
+/// which is the state a user most needs to see.
+///
+/// Sits below Archived and Trash so the local workspace keeps the top of
+/// the list; see `HomeView::build_flat_items`.
+pub fn append_remote_sections<'a, I>(items: &mut Vec<Item>, sources: I)
+where
+    I: IntoIterator<Item = RemoteSectionView<'a>>,
+{
+    for source in sources {
+        items.push(Item::Group {
+            path: remote_section_path(source.name),
+            name: source.name.to_string(),
+            depth: 0,
+            collapsed: source.collapsed,
+            session_count: source.session_ids.len(),
+            profile: None,
+            archived_at: None,
+        });
+
+        if source.collapsed {
+            continue;
+        }
+
+        for id in source.session_ids {
+            items.push(Item::RemoteSession {
+                remote: source.name.to_string(),
+                id: id.to_string(),
+                depth: 1,
+            });
+        }
+    }
+}
+
+/// Borrowed view of a remote source, so `groups` can lay out the section
+/// without depending on the TUI's `RemoteSource` state (which owns network
+/// and endpoint concerns this module has no business knowing about).
+pub struct RemoteSectionView<'a> {
+    pub name: &'a str,
+    pub collapsed: bool,
+    pub session_ids: Vec<&'a str>,
 }
 
 /// Append the synthetic Trash section to `items`: a depth-0 header followed
@@ -2869,5 +2973,148 @@ mod tests {
         let inst: Instance = serde_json::from_str(legacy).unwrap();
         assert!(!inst.is_archived());
         assert!(inst.archived_at.is_none());
+    }
+
+    // --- Remote sections ---
+
+    #[test]
+    fn remote_section_path_roundtrips() {
+        let path = remote_section_path("linuxbox");
+        assert!(is_remote_section_path(&path));
+        assert_eq!(remote_name_from_section_path(&path), Some("linuxbox"));
+    }
+
+    #[test]
+    fn remote_section_path_rejects_other_shelves_and_bare_prefix() {
+        // The Archived / Trash sentinels must not be mistaken for a remote
+        // header, or `update_selected` would disarm the wrong keybindings.
+        assert!(!is_remote_section_path(TRASH_SECTION_PATH));
+        assert!(!is_remote_section_path(ARCHIVED_SECTION_PATH));
+        // The bare prefix is not a header; only `<prefix>/<name>` is.
+        assert!(!is_remote_section_path(REMOTE_SECTION_PREFIX));
+        assert_eq!(remote_name_from_section_path(REMOTE_SECTION_PREFIX), None);
+        assert_eq!(
+            remote_name_from_section_path(&format!("{}/", REMOTE_SECTION_PREFIX)),
+            None
+        );
+    }
+
+    #[test]
+    fn append_remote_sections_emits_header_then_rows() {
+        let mut items = Vec::new();
+        append_remote_sections(
+            &mut items,
+            vec![RemoteSectionView {
+                name: "linuxbox",
+                collapsed: false,
+                session_ids: vec!["a", "b"],
+            }],
+        );
+        assert_eq!(items.len(), 3);
+        match &items[0] {
+            Item::Group {
+                path,
+                name,
+                depth,
+                session_count,
+                ..
+            } => {
+                assert_eq!(path, &remote_section_path("linuxbox"));
+                assert_eq!(name, "linuxbox");
+                assert_eq!(*depth, 0);
+                assert_eq!(*session_count, 2);
+            }
+            other => panic!("expected a group header, got {other:?}"),
+        }
+        match &items[1] {
+            Item::RemoteSession { remote, id, depth } => {
+                assert_eq!(remote, "linuxbox");
+                assert_eq!(id, "a");
+                assert_eq!(*depth, 1);
+            }
+            other => panic!("expected a remote row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn append_remote_sections_collapsed_emits_header_only_but_keeps_count() {
+        let mut items = Vec::new();
+        append_remote_sections(
+            &mut items,
+            vec![RemoteSectionView {
+                name: "box",
+                collapsed: true,
+                session_ids: vec!["a", "b", "c"],
+            }],
+        );
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            // The count still reflects the hidden rows, matching how the
+            // Archived / Trash headers behave when collapsed.
+            Item::Group { session_count, .. } => assert_eq!(*session_count, 3),
+            other => panic!("expected a group header, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn append_remote_sections_keeps_empty_section_visible() {
+        // Unlike Archived / Trash, an empty remote section is still pushed:
+        // it is how a configured-but-idle or unreachable box stays visible.
+        let mut items = Vec::new();
+        append_remote_sections(
+            &mut items,
+            vec![RemoteSectionView {
+                name: "offline",
+                collapsed: false,
+                session_ids: vec![],
+            }],
+        );
+        assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn append_remote_sections_preserves_source_order() {
+        let mut items = Vec::new();
+        append_remote_sections(
+            &mut items,
+            vec![
+                RemoteSectionView {
+                    name: "alpha",
+                    collapsed: false,
+                    session_ids: vec!["a"],
+                },
+                RemoteSectionView {
+                    name: "beta",
+                    collapsed: false,
+                    session_ids: vec!["b"],
+                },
+            ],
+        );
+        let headers: Vec<&str> = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Group { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(headers, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn item_local_session_id_excludes_remote_rows() {
+        // The guarantee the whole design leans on: a remote row never yields
+        // an id that a local lookup would treat as resolvable.
+        let local = Item::Session {
+            id: "local".into(),
+            depth: 0,
+        };
+        let remote = Item::RemoteSession {
+            remote: "box".into(),
+            id: "remote".into(),
+            depth: 1,
+        };
+        assert_eq!(local.local_session_id(), Some("local"));
+        assert_eq!(remote.local_session_id(), None);
+        assert_eq!(remote.depth(), 1);
     }
 }

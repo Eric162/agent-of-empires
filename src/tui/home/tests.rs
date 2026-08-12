@@ -5086,6 +5086,9 @@ fn test_o_key_flat_items_sorted_az() {
                     }
                 }
             }
+            // No remotes are configured in these fixtures, so no remote row
+            // can appear; the arm exists to keep the match exhaustive.
+            Item::RemoteSession { .. } => {}
         }
     }
 
@@ -5121,6 +5124,9 @@ fn test_o_key_flat_items_sorted_za() {
                     }
                 }
             }
+            // No remotes are configured in these fixtures, so no remote row
+            // can appear; the arm exists to keep the match exhaustive.
+            Item::RemoteSession { .. } => {}
         }
     }
 
@@ -5158,6 +5164,9 @@ fn test_o_key_flat_items_newest_preserves_insertion_order() {
                     }
                 }
             }
+            // No remotes are configured in these fixtures, so no remote row
+            // can appear; the arm exists to keep the match exhaustive.
+            Item::RemoteSession { .. } => {}
         }
     }
 
@@ -10085,6 +10094,12 @@ fn build_flat_items_by_org_groups_by_resolved_owner() {
                     membership.insert(inst.title.clone(), current_group.clone().unwrap());
                 }
             }
+            // Org grouping partitions local instances; this fixture configures
+            // no remotes, and a remote row could not be bucketed by owner
+            // anyway since its repo lives on another machine.
+            Item::RemoteSession { remote, id, .. } => {
+                panic!("unexpected remote row {remote}/{id} in an org-grouped tree")
+            }
         }
     }
 
@@ -10276,6 +10291,7 @@ fn project_grouping_sorts_sessions_by_attention_within_group() {
                     }
                 }
             }
+            Item::RemoteSession { .. } => {}
         }
     }
     assert_eq!(
@@ -11219,6 +11235,7 @@ fn group_by_toggle_preserves_selected_session() {
     match cursor_item {
         Item::Session { id, .. } => assert_eq!(id, &target_id),
         Item::Group { .. } => panic!("cursor landed on a group header, not the session"),
+        Item::RemoteSession { .. } => panic!("cursor landed on a remote row, not the session"),
     }
 }
 
@@ -11969,7 +11986,7 @@ fn archived_section_collapsed_hides_project_sub_folders() {
         .iter()
         .filter(|it| match it {
             Item::Group { path, .. } => is_within_archived_section(path),
-            Item::Session { .. } => false,
+            Item::Session { .. } | Item::RemoteSession { .. } => false,
         })
         .collect();
     assert_eq!(
@@ -19225,5 +19242,285 @@ mod daemon_status_apply_tests {
                 "a {label} row is sunk; the daemon overlay must not drive its status (#3201)"
             );
         }
+    }
+}
+
+/// Merged remote-session rows: a remote daemon's sessions mirrored into the
+/// local list. The invariant under test throughout is that a remote row is
+/// activatable but never addressable by a local operation.
+#[cfg(feature = "serve")]
+mod remote_rows_tests {
+    use super::*;
+    use crate::tui::home::remotes::{test_session, test_source};
+
+    fn add_session(view: &mut HomeView, title: &str) -> String {
+        let mut inst = Instance::new(title, "/tmp/test");
+        inst.source_profile = "test".to_string();
+        let id = inst.id.clone();
+        view.add_instance(inst);
+        id
+    }
+
+    /// Install one remote source holding `titles` and rebuild the tree.
+    fn with_remote(env: &mut TestEnv, name: &str, titles: &[(&str, &str, &str)]) {
+        env.view.remote_sources = vec![test_source(
+            name,
+            titles
+                .iter()
+                .map(|(id, title, status)| test_session(id, title, status))
+                .collect(),
+        )];
+        env.view.flat_items = env.view.build_flat_items();
+    }
+
+    fn cursor_to_first_remote_row(env: &mut TestEnv) {
+        let idx = env
+            .view
+            .flat_items
+            .iter()
+            .position(|i| matches!(i, Item::RemoteSession { .. }))
+            .expect("expected a remote row in flat_items");
+        env.view.cursor = idx;
+        env.view.update_selected();
+    }
+
+    #[test]
+    #[serial]
+    fn remote_sections_append_below_local_rows() {
+        let mut env = create_test_env_empty();
+        add_session(&mut env.view, "local-one");
+        with_remote(
+            &mut env,
+            "linuxbox",
+            &[
+                ("r1", "remote-one", "Running"),
+                ("r2", "remote-two", "Idle"),
+            ],
+        );
+
+        // The local row must come first: remote sections are a bottom shelf.
+        let first_local = env
+            .view
+            .flat_items
+            .iter()
+            .position(|i| matches!(i, Item::Session { .. }))
+            .expect("local row missing");
+        let first_remote_header = env
+            .view
+            .flat_items
+            .iter()
+            .position(|i| matches!(i, Item::Group { path, .. } if crate::session::is_remote_section_path(path)))
+            .expect("remote header missing");
+        assert!(
+            first_local < first_remote_header,
+            "remote section must sit below local rows, got {:?}",
+            env.view.flat_items
+        );
+        // Header plus both rows.
+        assert_eq!(
+            env.view
+                .flat_items
+                .iter()
+                .filter(|i| matches!(i, Item::RemoteSession { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn shelf_start_covers_remote_only_list() {
+        // With no local shelves present, the remote header is itself the
+        // start of the pinned bottom shelf. A `None` here would make the
+        // renderer treat remote rows as workspace rows.
+        let mut env = create_test_env_empty();
+        with_remote(&mut env, "box", &[("r1", "remote-one", "Idle")]);
+        assert_eq!(env.view.shelf_start(), Some(0));
+    }
+
+    #[test]
+    #[serial]
+    fn remote_row_selection_leaves_local_selection_unset() {
+        // The core safety property: every local keybinding gates on
+        // `selected_session` / `selected_group`, so both must stay clear.
+        let mut env = create_test_env_empty();
+        with_remote(&mut env, "linuxbox", &[("r1", "remote-one", "Waiting")]);
+        cursor_to_first_remote_row(&mut env);
+
+        assert_eq!(env.view.selected_session, None);
+        assert_eq!(env.view.selected_group, None);
+        assert_eq!(
+            env.view.selected_remote,
+            Some(("linuxbox".to_string(), "r1".to_string()))
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn remote_section_header_does_not_arm_group_actions() {
+        // The synthetic header is not a real group: renaming or deleting it
+        // is meaningless, so `selected_group` must stay unset (same contract
+        // the Archived / Trash headers follow).
+        let mut env = create_test_env_empty();
+        with_remote(&mut env, "linuxbox", &[("r1", "remote-one", "Idle")]);
+        let idx = env
+            .view
+            .flat_items
+            .iter()
+            .position(|i| matches!(i, Item::Group { path, .. } if crate::session::is_remote_section_path(path)))
+            .expect("remote header missing");
+        env.view.cursor = idx;
+        env.view.update_selected();
+
+        assert_eq!(env.view.selected_group, None);
+        assert_eq!(env.view.selected_session, None);
+        assert_eq!(env.view.selected_remote, None);
+    }
+
+    #[test]
+    #[serial]
+    fn enter_on_remote_row_opens_remote_structured_view() {
+        let mut env = create_test_env_empty();
+        with_remote(&mut env, "linuxbox", &[("r1", "remote-one", "Running")]);
+        cursor_to_first_remote_row(&mut env);
+
+        assert_eq!(
+            env.view.activate_selected_session(),
+            Some(Action::OpenRemoteStructuredView {
+                remote: "linuxbox".to_string(),
+                session_id: "r1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn moving_off_a_remote_row_clears_remote_selection() {
+        // Otherwise a stale `selected_remote` would keep Enter routed at the
+        // remote after the cursor moved onto a local row.
+        let mut env = create_test_env_empty();
+        let local_id = add_session(&mut env.view, "local-one");
+        with_remote(&mut env, "linuxbox", &[("r1", "remote-one", "Idle")]);
+        cursor_to_first_remote_row(&mut env);
+        assert!(env.view.selected_remote.is_some());
+
+        let local_idx = env
+            .view
+            .flat_items
+            .iter()
+            .position(|i| matches!(i, Item::Session { .. }))
+            .expect("local row missing");
+        env.view.cursor = local_idx;
+        env.view.update_selected();
+
+        assert_eq!(env.view.selected_remote, None);
+        assert_eq!(env.view.selected_session, Some(local_id));
+    }
+
+    #[test]
+    #[serial]
+    fn collapsing_a_remote_section_hides_its_rows() {
+        let mut env = create_test_env_empty();
+        with_remote(
+            &mut env,
+            "linuxbox",
+            &[("r1", "remote-one", "Idle"), ("r2", "remote-two", "Idle")],
+        );
+        assert!(env.view.toggle_remote_section("linuxbox"));
+        env.view.flat_items = env.view.build_flat_items();
+
+        assert!(!env
+            .view
+            .flat_items
+            .iter()
+            .any(|i| matches!(i, Item::RemoteSession { .. })));
+        // The header survives and keeps reporting the hidden count.
+        match env
+            .view
+            .flat_items
+            .iter()
+            .find(|i| matches!(i, Item::Group { path, .. } if crate::session::is_remote_section_path(path)))
+            .expect("header missing")
+        {
+            Item::Group { session_count, .. } => assert_eq!(*session_count, 2),
+            other => panic!("expected group header, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn empty_remote_section_still_renders_so_the_list_is_not_blank() {
+        // A configured remote with no sessions must keep the list non-empty,
+        // or the "No sessions yet" placeholder replaces the whole sidebar and
+        // hides the section (including its connection error).
+        let mut env = create_test_env_empty();
+        with_remote(&mut env, "offline", &[]);
+        assert!(env.view.has_remote_sources());
+        assert!(!env.view.has_instances());
+        assert_eq!(env.view.flat_items.len(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn remote_row_survives_a_refresh_that_adds_a_row_above() {
+        // `refresh_rows_preserving_selection` restores a remote cursor by
+        // (remote, id). Without that the cursor would drift on every poll
+        // that changed the row count.
+        let mut env = create_test_env_empty();
+        with_remote(
+            &mut env,
+            "linuxbox",
+            &[("r2", "beta", "Idle"), ("r3", "gamma", "Idle")],
+        );
+        cursor_to_first_remote_row(&mut env);
+        let selected = env.view.selected_remote.clone();
+
+        // A new session sorts above the selected one.
+        env.view.remote_sources = vec![test_source(
+            "linuxbox",
+            vec![
+                test_session("r1", "alpha", "Idle"),
+                test_session("r2", "beta", "Idle"),
+                test_session("r3", "gamma", "Idle"),
+            ],
+        )];
+        env.view.refresh_rows_preserving_selection();
+
+        assert_eq!(env.view.selected_remote, selected);
+        match &env.view.flat_items[env.view.cursor] {
+            Item::RemoteSession { id, .. } => assert_eq!(id, "r2"),
+            other => panic!("cursor drifted off the remote row: {other:?}"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn remote_rows_are_searchable_by_remote_name_and_project_path() {
+        let mut env = create_test_env_empty();
+        with_remote(&mut env, "linuxbox", &[("r1", "remote-one", "Idle")]);
+        let haystack = env
+            .view
+            .remote_search_haystack("linuxbox", "r1")
+            .expect("haystack missing");
+        assert!(haystack.contains("remote-one"));
+        assert!(haystack.contains("linuxbox"));
+        assert!(haystack.contains("/remote/repo"));
+    }
+
+    #[test]
+    #[serial]
+    fn profile_for_cursor_is_none_on_a_remote_row() {
+        // A remote session belongs to another machine's profile, so no
+        // profile-scoped local operation may resolve one.
+        let mut env = create_test_env_empty();
+        env.view.active_profile = None;
+        with_remote(&mut env, "linuxbox", &[("r1", "remote-one", "Idle")]);
+        let idx = env
+            .view
+            .flat_items
+            .iter()
+            .position(|i| matches!(i, Item::RemoteSession { .. }))
+            .expect("remote row missing");
+        assert_eq!(env.view.profile_for_cursor(idx), None);
     }
 }
