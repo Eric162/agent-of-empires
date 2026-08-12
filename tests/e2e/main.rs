@@ -55,6 +55,11 @@ mod profile_lazy_creation;
 mod profile_picker;
 mod project_registry;
 mod purge_restore_race;
+/// Serve-gated to match the `aoe remote` subcommand itself, which needs the
+/// `serve` feature's client half to be useful and so is not compiled into a
+/// TUI-only binary.
+#[cfg(feature = "serve")]
+mod remote_cli;
 mod resume_fallback;
 mod sandbox;
 mod serve;
