@@ -28,14 +28,48 @@ impl Instance {
         self.maybe_start_poller_since(None);
     }
 
+    /// Whether the `match tool` below actually builds a poll fn for this
+    /// instance. Narrower than [`Self::supports_session_poller`], which only
+    /// rules out `ResumeStrategy::Unsupported`.
+    ///
+    /// Checked before the budget pre-check so an instance that would never
+    /// have asked for a slot cannot consume the warning window and mask a
+    /// genuinely starved one.
+    ///
+    /// Deliberately a denylist, so an agent added to `AGENTS` without a
+    /// thought for this function defaults to eligible. The two failure
+    /// directions are not symmetric: a wrongly-eligible instance spends a log
+    /// line, while a wrongly-ineligible one silently stops capturing its
+    /// session id and loses resume across a restart. An allowlist here got
+    /// `prime-agent` wrong exactly that way.
+    fn constructs_session_poller(&self) -> bool {
+        match self.tool.as_str() {
+            // No arm in the match, so the `_ => return` catches them.
+            "kiro" | "qwen" => false,
+            // Host stores a sandbox cannot reach; their arms return early.
+            "copilot" | "kimi" | "prime-agent" => !self.is_sandboxed(),
+            _ => true,
+        }
+    }
+
     pub(super) fn maybe_start_poller_since(&mut self, omp_metadata: Option<OmpCaptureMetadata>) {
-        if !self.supports_session_poller() {
+        if !self.supports_session_poller() || !self.constructs_session_poller() {
+            return;
+        }
+        // The exclusion-set build below loads `sessions.json` and canonicalizes
+        // a path per stored peer, and `start_observations` would reject the
+        // spawn anyway. Warns here because this return replaces the acquire's
+        // own warning, which is no longer reached once the budget is full.
+        if !crate::session::poller::session_id_poller_budget_available() {
+            crate::session::poller::warn_budget_exhausted(&self.id);
             return;
         }
         let tool = self.tool.as_str();
 
+        // Agent pane only: seeded with a paired terminal's name the poller
+        // probes that pane as alive and holds its slot for a dead agent.
         let tmux_session_name = self
-            .tmux_env_session_name()
+            .agent_tmux_session_name()
             .or_else(|| self.tmux_session().ok().map(|s| s.name().to_string()))
             .unwrap_or_default();
         let omp_metadata = if tool == "omp" {
@@ -349,9 +383,22 @@ impl Instance {
         // fail and is especially costly from the native TUI's refresh loop.
         if self.is_structured()
             || !self.supports_session_poller()
+            // Same eligibility gate as the spawn path, and for the same
+            // reason: an instance the poll-fn match would never build for
+            // must not reach the budget warning below and spend the window
+            // that names a genuinely starved instance.
+            || !self.constructs_session_poller()
             || self.session_id_poller_is_running()
-            || !self.has_live_tmux_pane_in(snapshot)
+            // Agent pane, not any pane: a terminal outliving the agent is not
+            // something a session-id poller can follow.
+            || !self.has_live_agent_pane_in(snapshot)
         {
+            return false;
+        }
+        // Nothing to repair with. Checked before the handle is cleared so an
+        // exhausted budget is a no-op rather than a downgrade.
+        if !crate::session::poller::session_id_poller_budget_available() {
+            crate::session::poller::warn_budget_exhausted(&self.id);
             return false;
         }
         self.session_id_poller = None;
@@ -419,7 +466,7 @@ impl Instance {
 
 #[cfg(test)]
 mod tests {
-    use crate::session::Instance;
+    use crate::session::{Instance, SandboxInfo};
 
     // Restart, stop, and the sid_persist path all tear down through this
     // helper, so flushing here covers each of them. Restart is the one that
@@ -538,5 +585,121 @@ mod tests {
         let mut claude = Instance::new("claude-poll", "/tmp/pi-poll");
         claude.tool = "claude".to_string();
         assert!(claude.supports_session_poller());
+    }
+
+    /// Repair gates on the same eligibility as the spawn path. A live kiro or
+    /// qwen resumes, so it clears `supports_session_poller`, but the poll-fn
+    /// match has no arm for it; without this gate it reached the budget
+    /// warning and spent the shared window that names a starved instance.
+    ///
+    /// Asserted through the handle rather than the return value, which is
+    /// `false` either way: proceeding past the gate clears the handle before
+    /// the spawn that was never going to happen.
+    #[test]
+    fn repair_declines_a_resume_capable_tool_the_match_cannot_build_for() {
+        for tool in ["kiro", "qwen"] {
+            let mut inst = Instance::new("repair-elig", "/tmp/repair-elig");
+            inst.tool = tool.to_string();
+            assert!(
+                inst.supports_session_poller(),
+                "{tool} resumes, which is why the coarse gate lets it through"
+            );
+            assert!(
+                !inst.constructs_session_poller(),
+                "{tool} has no arm in the poll-fn match"
+            );
+
+            // A live agent pane, so the pane lookup cannot be what declines.
+            let live = inst.tmux_session().unwrap().name().to_string();
+            let snapshot = crate::tmux::LiveSessionSnapshot::from_parts(
+                Some(vec![live]),
+                Some(std::collections::HashMap::new()),
+            );
+            // Present but not running, so the running check does not
+            // short-circuit and the handle stays observable.
+            inst.session_id_poller = Some(std::sync::Arc::new(std::sync::Mutex::new(
+                crate::session::poller::SessionPoller::new("unstarted".to_string()),
+            )));
+
+            assert!(!inst.repair_session_id_poller_if_needed(&snapshot));
+            assert!(
+                inst.session_id_poller.is_some(),
+                "{tool} must be declined before the handle is cleared"
+            );
+        }
+    }
+
+    /// Pins `constructs_session_poller` to the `match tool` it mirrors, and
+    /// checks the property that actually matters: nothing the match CAN build
+    /// for is declined. The predicate is a denylist, so this fails loudly for
+    /// a tool wrongly listed as ineligible rather than for a new agent nobody
+    /// considered.
+    #[test]
+    fn poller_construction_matches_eligibility() {
+        // Every arm in the poll-fn match, and the sandbox split for the three
+        // host-only ones.
+        let eligible = [
+            ("claude", false),
+            ("opencode", false),
+            ("vibe", false),
+            ("pi", false),
+            ("codex", false),
+            ("gemini", false),
+            ("hermes", false),
+            ("omp", false),
+            ("copilot", false),
+            ("kimi", false),
+            ("prime-agent", false),
+        ];
+        for (tool, sandboxed) in eligible {
+            assert!(
+                instance_for(tool, sandboxed).constructs_session_poller(),
+                "{tool} has an arm in the match and must not be declined"
+            );
+        }
+        for tool in ["copilot", "kimi", "prime-agent"] {
+            assert!(
+                !instance_for(tool, true).constructs_session_poller(),
+                "{tool} reads a host store its sandbox cannot"
+            );
+        }
+        // The only tools the match has no arm for.
+        for tool in ["kiro", "qwen"] {
+            assert!(
+                !instance_for(tool, false).constructs_session_poller(),
+                "{tool} resumes but the match returns for it"
+            );
+        }
+        // Anything else defaults to eligible, so a new agent cannot silently
+        // lose session-id capture. `supports_session_poller` still filters the
+        // ones that do not resume at all.
+        for agent in crate::agents::AGENTS {
+            if matches!(agent.name, "kiro" | "qwen") {
+                continue;
+            }
+            assert!(
+                instance_for(agent.name, false).constructs_session_poller(),
+                "{} must default to eligible",
+                agent.name
+            );
+        }
+    }
+
+    fn instance_for(tool: &str, sandboxed: bool) -> Instance {
+        let mut inst = Instance::new("elig", "/tmp/elig");
+        inst.tool = tool.to_string();
+        if sandboxed {
+            inst.sandbox_info = Some(SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: String::new(),
+                container_name: "c".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                container_workdir: None,
+                before_start_env: Vec::new(),
+            });
+        }
+        inst
     }
 }

@@ -14,6 +14,19 @@ pub(super) fn tmux_env_session_name_for_instance_id(instance_id: &str) -> Option
     crate::tmux::live_any_kind_name_for_id(stdout.lines(), instance_id)
 }
 
+/// [`tmux_env_session_name_for_instance_id`] restricted to the agent pane.
+pub(super) fn agent_tmux_session_name_for_instance_id(instance_id: &str) -> Option<String> {
+    let output = crate::tmux::tmux_query_command()
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    crate::tmux::live_agent_name_for_id(stdout.lines(), instance_id)
+}
+
 /// Find another session that owns the exact title and normalized path.
 ///
 /// `exclude_id` lets mutation paths ignore the row being renamed.
@@ -57,6 +70,12 @@ impl Instance {
         tmux_env_session_name_for_instance_id(&self.id)
     }
 
+    /// [`Self::tmux_env_session_name`] restricted to the agent pane, for the
+    /// session-id poller: a terminal name here reads as a live agent.
+    pub(crate) fn agent_tmux_session_name(&self) -> Option<String> {
+        agent_tmux_session_name_for_instance_id(&self.id)
+    }
+
     /// [`Self::tmux_env_session_name`] answered from a snapshot the caller
     /// already holds, for passes that ask once per stored session.
     pub(crate) fn tmux_env_session_name_in(
@@ -89,13 +108,22 @@ impl Instance {
 
     /// Whether this instance has a live tmux pane, answered from a snapshot
     /// the caller already holds. `exists()` alone is insufficient: a pane can
-    /// exist while its agent has died. Used by peer exclusion, poller repair,
-    /// and TUI reload.
+    /// exist while its agent has died. Used by peer exclusion and TUI reload.
     pub(crate) fn has_live_tmux_pane_in(
         &self,
         snapshot: &crate::tmux::LiveSessionSnapshot,
     ) -> bool {
         self.tmux_env_session_name_in(snapshot).is_some()
+    }
+
+    /// Whether the AGENT pane specifically is live. Poller repair gates on
+    /// this: a paired terminal outliving the agent is not something a
+    /// session-id poller can follow.
+    pub(crate) fn has_live_agent_pane_in(
+        &self,
+        snapshot: &crate::tmux::LiveSessionSnapshot,
+    ) -> bool {
+        crate::tmux::live_agent_name_for_id_in(snapshot, &self.id).is_some()
     }
 
     pub(super) fn sandbox_display(&self) -> Option<crate::tmux::status_bar::SandboxDisplay> {
