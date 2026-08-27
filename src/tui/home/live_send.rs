@@ -1545,6 +1545,10 @@ impl LiveCaptureWorker {
     /// Take the newest capture the worker has produced since the last
     /// call, if any. Returns `None` when nothing new has arrived (the
     /// render loop then keeps the current preview).
+    pub(in crate::tui) fn take_latest(&self) -> Option<String> {
+        self.latest.lock().ok().and_then(|mut guard| guard.take())
+    }
+
     /// Snapshot of the worker's cycle counter. Two reads a moment apart that
     /// differ mean the capture loop is running; identical reads across more
     /// than a cycle's worth of time mean it is wedged (or stopped). The render
@@ -1552,10 +1556,6 @@ impl LiveCaptureWorker {
     /// "nothing changed".
     pub(in crate::tui) fn cycles(&self) -> u64 {
         self.cycles.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    pub(in crate::tui) fn take_latest(&self) -> Option<String> {
-        self.latest.lock().ok().and_then(|mut guard| guard.take())
     }
 
     /// The newest cursor for the worker's CURRENT target pane, or `None`
