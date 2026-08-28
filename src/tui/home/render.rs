@@ -2300,8 +2300,9 @@ impl HomeView {
         // `sync_preview_capture_worker` in `render_preview`) keeps fresh
         // content flowing on its own thread; `apply_worker_capture` below
         // just applies the newest it has produced. The synchronous fork via
-        // `refresh_preview_cache_core` remains only as the cold-start /
-        // worker-empty fallback (its 250ms gate still applies there). This
+        // `refresh_preview_cache_core` remains as the cold-start fallback,
+        // plus the wedged-worker and trust-ceiling paths in `idle_poll_due`;
+        // a worker that is merely idle no longer trips it. This
         // moves the per-frame capture cost (~8.5ms on macOS, ~90% of a
         // frame; the `tui.render` `capture_us` trace measures it) off the
         // render thread for every view, not just agent live-send.
@@ -2426,8 +2427,8 @@ impl HomeView {
                 // "session looks gone" signal the non-live path uses).
                 let same_session = s.preview_cache.session_id.as_deref() == Some(id);
                 // Composited in BOTH modes, matching what the worker publishes.
-                // This fallback also runs on every idle refresh (the worker
-                // dedups unchanged frames, so it has nothing to hand over), so a
+                // This fallback still runs behind a live worker (the trust
+                // ceiling, and any stall past `WORKER_PULSE_TIMEOUT`), so a
                 // pane-0-only capture here would clobber the worker's composite
                 // a beat after each keystroke and leave the split visible for
                 // only one frame at a time. On an unsplit window this returns
