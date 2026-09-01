@@ -52,6 +52,29 @@ impl Instance {
         }
     }
 
+    /// The tmux session name to point a new poller at, or `None` when nothing
+    /// this poller could follow resolves.
+    ///
+    /// Agent pane only, and the fallback is filtered rather than trusted:
+    /// `Session::resolve_name`'s fast path returns a live exact derived name
+    /// before applying the agent shape, so for a title sanitizing under an
+    /// auxiliary prefix it hands back the paired terminal's name. Seeding the
+    /// poller with that probes a pane that really is alive and holds a budget
+    /// slot for an agent that is gone.
+    ///
+    /// Keeping the fallback for agent-shaped names preserves the distinction
+    /// that matters: a failed `list-sessions` still starts a poller on the
+    /// derived name, while a genuinely absent agent gets one that reads
+    /// `Missing` and reaps itself.
+    fn poller_target_name(&self) -> Option<String> {
+        self.agent_tmux_session_name().or_else(|| {
+            self.tmux_session()
+                .ok()
+                .map(|s| s.name().to_string())
+                .filter(|name| crate::tmux::agent_session_belongs_to(name, &self.id))
+        })
+    }
+
     pub(super) fn maybe_start_poller_since(&mut self, omp_metadata: Option<OmpCaptureMetadata>) {
         if !self.supports_session_poller() || !self.constructs_session_poller() {
             return;
@@ -66,12 +89,9 @@ impl Instance {
         }
         let tool = self.tool.as_str();
 
-        // Agent pane only: seeded with a paired terminal's name the poller
-        // probes that pane as alive and holds its slot for a dead agent.
-        let tmux_session_name = self
-            .agent_tmux_session_name()
-            .or_else(|| self.tmux_session().ok().map(|s| s.name().to_string()))
-            .unwrap_or_default();
+        let Some(tmux_session_name) = self.poller_target_name() else {
+            return;
+        };
         let omp_metadata = if tool == "omp" {
             let options = match self.omp_capture_options() {
                 Some(options) => options,
@@ -627,6 +647,33 @@ mod tests {
                 "{tool} must be declined before the handle is cleared"
             );
         }
+    }
+
+    /// The title collision that would otherwise hand the poller a terminal.
+    /// `aoe_term_Foo_<id>` is both the agent name for title `term_Foo` and the
+    /// paired-terminal name for title `Foo`, and `Session::resolve_name`
+    /// returns a live exact derived name before applying the agent shape, so
+    /// the fallback has to filter rather than trust it.
+    #[test]
+    fn poller_target_declines_a_terminal_shaped_derived_name() {
+        let mut ordinary = Instance::new("Foo", "/tmp/collide");
+        ordinary.tool = "claude".to_string();
+        let target = ordinary
+            .poller_target_name()
+            .expect("an agent-shaped derived name is a usable target");
+        assert!(
+            crate::tmux::agent_session_belongs_to(&target, &ordinary.id),
+            "got {target:?}"
+        );
+
+        // The persisted title after a smart rename across the boundary.
+        let mut shadowed = Instance::new("term_Foo", "/tmp/collide");
+        shadowed.tool = "claude".to_string();
+        assert_eq!(
+            shadowed.poller_target_name(),
+            None,
+            "a terminal-shaped derived name must not become the poll target"
+        );
     }
 
     /// Pins `constructs_session_poller` to the `match tool` it mirrors, and
