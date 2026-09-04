@@ -14,19 +14,6 @@ pub(super) fn tmux_env_session_name_for_instance_id(instance_id: &str) -> Option
     crate::tmux::live_any_kind_name_for_id(stdout.lines(), instance_id)
 }
 
-/// [`tmux_env_session_name_for_instance_id`] restricted to the agent pane.
-pub(super) fn agent_tmux_session_name_for_instance_id(instance_id: &str) -> Option<String> {
-    let output = crate::tmux::tmux_query_command()
-        .args(["list-sessions", "-F", "#{session_name}"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    crate::tmux::live_agent_name_for_id(stdout.lines(), instance_id)
-}
-
 /// Find another session that owns the exact title and normalized path.
 ///
 /// `exclude_id` lets mutation paths ignore the row being renamed.
@@ -68,12 +55,6 @@ impl Instance {
 
     pub(crate) fn tmux_env_session_name(&self) -> Option<String> {
         tmux_env_session_name_for_instance_id(&self.id)
-    }
-
-    /// [`Self::tmux_env_session_name`] restricted to the agent pane, for the
-    /// session-id poller: a terminal name here reads as a live agent.
-    pub(crate) fn agent_tmux_session_name(&self) -> Option<String> {
-        agent_tmux_session_name_for_instance_id(&self.id)
     }
 
     /// [`Self::tmux_env_session_name`] answered from a snapshot the caller
