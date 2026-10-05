@@ -1729,6 +1729,7 @@ mod tests {
         inst.command = "claude".into();
         inst.source_profile = profile.into();
         inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "fixture".into(),
@@ -2399,6 +2400,7 @@ mod tests {
         inst.first_launch_names_agent = true;
         set_name_agent_session(&inst, true);
         inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
             enabled: true,
             container_id: None,
             image: "fixture".into(),
