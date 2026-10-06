@@ -1386,17 +1386,13 @@ fn empty_trash_escalates_a_row_that_keeps_failing() {
     env.view.reload().unwrap();
     env.view.trash_session_by_id(&id);
 
-    // (checkbox labels offered, checkbox to tick, forced delete expected in flight)
-    let rounds: [(&[&str], Option<usize>, bool); 3] = [
-        (&[], None, false),
-        (&["Force delete 1 that failed before"], Some(0), true),
-        (
-            &["Remove 1 that failed when forced from aoe"],
-            Some(0),
-            false,
-        ),
+    // (checkbox labels offered, forced delete expected in flight); each offered box is ticked.
+    let rounds: [(&[&str], bool); 3] = [
+        (&[], false),
+        (&["Force delete 1 that failed before"], true),
+        (&["Remove 1 that failed when forced from aoe"], false),
     ];
-    for (round, (labels, tick, forced)) in rounds.into_iter().enumerate() {
+    for (round, (labels, forced)) in rounds.into_iter().enumerate() {
         env.view.prompt_empty_trash();
         let dialog = env
             .view
@@ -1404,7 +1400,8 @@ fn empty_trash_escalates_a_row_that_keeps_failing() {
             .as_mut()
             .expect("empty-trash confirm");
         assert_eq!(dialog.checkbox_labels_for_test(), labels, "round {round}");
-        if tick.is_some() {
+        if !labels.is_empty() {
+            dialog.handle_key(key(KeyCode::Down));
             dialog.handle_key(key(KeyCode::Char(' ')));
         }
         env.view.handle_key(key(KeyCode::Char('y')), None);
@@ -1896,7 +1893,8 @@ fn confirm_delete_dont_ask_again_persists_the_opt_out() {
     let id = env.view.selected_session.clone().unwrap();
 
     env.view.handle_key(key(KeyCode::Char('d')), None);
-    // Space ticks the checkbox, the second `d` accepts.
+    // Down focuses the checkbox, Space ticks it, the second `d` accepts.
+    env.view.handle_key(key(KeyCode::Down), None);
     env.view.handle_key(key(KeyCode::Char(' ')), None);
     env.view.handle_key(key(KeyCode::Char('d')), None);
 
