@@ -1361,6 +1361,82 @@ fn trash_header_d_and_palette_open_empty_trash_confirm() {
     }
 }
 
+/// A trashed row whose repo is gone fails every delete, so Empty Trash escalates it one
+/// opt-in step per attempt: plain delete, forced delete, then removal from aoe.
+#[test]
+#[serial]
+fn empty_trash_escalates_a_row_that_keeps_failing() {
+    let mut env = create_test_env_with_sessions(2);
+    let id = env.view.instance_at(0).id.clone();
+    // The deletion worker reads the durable row, so the dead repo goes on disk.
+    Storage::new_unwatched("test")
+        .unwrap()
+        .update(|instances, _| {
+            let inst = instances.iter_mut().find(|i| i.id == id).unwrap();
+            inst.worktree_info = Some(crate::session::WorktreeInfo {
+                branch: "gone".to_string(),
+                main_repo_path: "/nonexistent/aoe-test-repo".to_string(),
+                managed_by_aoe: true,
+                created_at: chrono::Utc::now(),
+                base_branch: None,
+            });
+            Ok(())
+        })
+        .unwrap();
+    env.view.reload().unwrap();
+    env.view.trash_session_by_id(&id);
+
+    // (checkbox labels offered, checkbox to tick, forced delete expected in flight)
+    let rounds: [(&[&str], Option<usize>, bool); 3] = [
+        (&[], None, false),
+        (&["Force delete 1 that failed before"], Some(0), true),
+        (
+            &["Remove 1 that failed when forced from aoe"],
+            Some(0),
+            false,
+        ),
+    ];
+    for (round, (labels, tick, forced)) in rounds.into_iter().enumerate() {
+        env.view.prompt_empty_trash();
+        let dialog = env
+            .view
+            .confirm_dialog
+            .as_mut()
+            .expect("empty-trash confirm");
+        assert_eq!(dialog.checkbox_labels_for_test(), labels, "round {round}");
+        if tick.is_some() {
+            dialog.handle_key(key(KeyCode::Char(' ')));
+        }
+        env.view.handle_key(key(KeyCode::Char('y')), None);
+
+        if round == 2 {
+            assert!(
+                env.view.get_instance(&id).is_none(),
+                "a row whose forced delete failed is removed from aoe"
+            );
+            break;
+        }
+        assert_eq!(
+            env.view.deletes_in_flight.get(&id),
+            Some(&forced),
+            "round {round}"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !env.view.apply_deletion_results() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "round {round}: no result"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            env.view.failed_deletes.get(&id),
+            Some(&forced),
+            "round {round}"
+        );
+    }
+}
+
 /// Shelf bulk actions: "Empty Trash" routes through a destructive confirm and marks every trashed
 /// row Deleting (an empty trash shows an info dialog instead), and "Restore All" un-trashes or
 /// unarchives every row of its section.

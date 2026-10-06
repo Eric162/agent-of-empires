@@ -651,7 +651,7 @@ impl HomeView {
                     detach_hooks: true,
                     keep_scratch: options.keep_scratch,
                 };
-                self.deletion_poller.request_deletion(request);
+                self.request_deletion(request);
             }
         }
         Ok(())
@@ -834,7 +834,7 @@ impl HomeView {
                         .sandbox_info
                         .as_ref()
                         .is_some_and(|sandbox| sandbox.enabled);
-                self.deletion_poller.request_deletion(DeletionRequest {
+                self.request_deletion(DeletionRequest {
                     session_id,
                     instance,
                     delete_worktree,
@@ -853,11 +853,18 @@ impl HomeView {
         Ok(())
     }
 
+    pub(super) fn request_deletion(&mut self, request: DeletionRequest) {
+        self.deletes_in_flight
+            .insert(request.session_id.clone(), request.force_delete);
+        self.deletion_poller.request_deletion(request);
+    }
+
     /// Force-remove a session from storage, for rows stuck in Deleting. Worktree and
     /// branch cleanup are skipped because the original deletion already attempted them;
     /// tmux and sandbox teardown run off-thread so a hung call cannot block input.
     pub(super) fn force_remove_session(&mut self, session_id: &str) -> anyhow::Result<()> {
         let instance = self.instances.get(session_id).cloned();
+        self.failed_deletes.remove(session_id);
         self.remove_instance(session_id);
         self.rebuild_group_trees();
         self.save()?;
@@ -2070,8 +2077,10 @@ impl HomeView {
     /// Permanently purge every trashed session, reached only after the confirm dialog.
     /// Each row runs the same off-thread deletion path as a single permanent delete, with
     /// cleanup options resolved per row from its repo config (mirroring the CLI
-    /// `empty-trash`) and force removal so a dirty worktree cannot pin a row.
-    pub(super) fn empty_trash_all(&mut self) {
+    /// `empty-trash`). A row whose last delete failed is forced when `force_failed`, and
+    /// one whose forced delete failed is removed from aoe without cleanup when
+    /// `drop_failed`; otherwise each retries at its previous level.
+    pub(super) fn empty_trash_all(&mut self, force_failed: bool, drop_failed: bool) {
         let mut trashed: Vec<Instance> = self
             .instances
             .values()
@@ -2089,6 +2098,17 @@ impl HomeView {
             if self.restart_in_flight.contains(&id) {
                 continue;
             }
+            let force_delete = match self.failed_deletes.get(&id) {
+                None => false,
+                Some(false) => force_failed,
+                Some(true) if drop_failed => {
+                    if let Err(e) = self.force_remove_session(&id) {
+                        tracing::error!(target: "tui.home", "empty trash force remove failed: {e}");
+                    }
+                    continue;
+                }
+                Some(true) => true,
+            };
 
             self.set_instance_status(&id, Status::Deleting);
 
@@ -2102,13 +2122,13 @@ impl HomeView {
             let delete_sandbox = inst.sandbox_info.as_ref().is_some_and(|s| s.enabled)
                 && config.sandbox.auto_cleanup;
 
-            self.deletion_poller.request_deletion(DeletionRequest {
+            self.request_deletion(DeletionRequest {
                 session_id: id.clone(),
                 instance: inst.clone(),
                 delete_worktree,
                 delete_branch,
                 delete_sandbox,
-                force_delete: true,
+                force_delete,
                 detach_hooks: true,
                 keep_scratch: false,
             });

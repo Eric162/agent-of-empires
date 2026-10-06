@@ -233,6 +233,8 @@ pub struct HomeView {
     pub(super) pending_stop_terminal: Option<(String, TerminalMode)>,
     pub(super) pending_stop_tool: Option<(String, String)>,
     pub(super) pending_image_pull: Option<String>,
+    /// Checkbox keys the last submitted confirm dialog had checked.
+    pub(super) confirm_checked: Vec<&'static str>,
     pub(super) pending_switch_view_session: Option<String>,
     pub(super) pending_daemon_start_session: Option<String>,
     pub(in crate::tui) structured_preview:
@@ -274,6 +276,12 @@ pub struct HomeView {
     pub(super) structured_approval_poller: super::approval_poller::StructuredApprovalPoller,
 
     pub(super) deletion_poller: DeletionPoller,
+    /// `force_delete` of each in-flight deletion, keyed by session id.
+    pub(super) deletes_in_flight: HashMap<String, bool>,
+    /// Whether each session's last failed deletion was forced, so Empty Trash can
+    /// escalate: a failed delete is offered a forced retry, a failed forced delete
+    /// removal from aoe without cleanup.
+    pub(super) failed_deletes: HashMap<String, bool>,
 
     pub(super) stop_poller: StopPoller,
 

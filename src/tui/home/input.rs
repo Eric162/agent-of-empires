@@ -29,6 +29,10 @@ use crate::tui::diff::{DiffAction, DiffView};
 use crate::tui::responsive;
 use crate::tui::settings::{SettingsAction, SettingsView};
 
+/// Empty Trash checkbox keys.
+const EMPTY_TRASH_FORCE_FAILED: &str = "force_failed";
+const EMPTY_TRASH_DROP_FAILED: &str = "drop_failed";
+
 /// Longest gap between two left-clicks on one row that still counts as a double-click;
 /// 400ms matches most desktop environments.
 const DOUBLE_CLICK_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(400);
@@ -1046,7 +1050,11 @@ impl HomeView {
                 None
             }
             "empty_trash" => {
-                self.empty_trash_all();
+                let checked = std::mem::take(&mut self.confirm_checked);
+                self.empty_trash_all(
+                    checked.contains(&EMPTY_TRASH_FORCE_FAILED),
+                    checked.contains(&EMPTY_TRASH_DROP_FAILED),
+                );
                 None
             }
             "pull_sandbox_image" => self.pending_image_pull.take().map(Action::SpawnImagePull),
@@ -1086,9 +1094,20 @@ impl HomeView {
 
     /// Confirm before permanently purging every trashed session. The purge is
     /// irreversible, so it keeps the destructive red tone; an already-empty trash gets an
-    /// info dialog instead of a confirm that would delete nothing.
+    /// info dialog instead of a confirm that would delete nothing. Rows whose last delete
+    /// failed get an opt-in escalation: forced delete, then removal from aoe.
     pub(super) fn prompt_empty_trash(&mut self) {
-        let count = self.instances.values().filter(|i| i.is_trashed()).count();
+        let mut count = 0;
+        let mut failed = 0;
+        let mut failed_forced = 0;
+        for inst in self.instances.values().filter(|i| i.is_trashed()) {
+            count += 1;
+            match self.failed_deletes.get(&inst.id) {
+                Some(false) => failed += 1,
+                Some(true) => failed_forced += 1,
+                None => {}
+            }
+        }
         if count == 0 {
             self.info_dialog = Some(InfoDialog::new(
                 "Trash is empty",
@@ -1097,11 +1116,27 @@ impl HomeView {
             return;
         }
         let noun = if count == 1 { "session" } else { "sessions" };
-        self.confirm_dialog = Some(ConfirmDialog::new(
-            "Empty Trash",
-            &format!("Permanently delete {count} trashed {noun}? This cannot be undone."),
-            "empty_trash",
-        ));
+        let mut message =
+            format!("Permanently delete {count} trashed {noun}? This cannot be undone.");
+        if failed_forced > 0 {
+            message.push_str(
+                "\n\nRemoving from aoe skips cleanup: worktrees and branches stay on disk.",
+            );
+        }
+        let mut dialog = ConfirmDialog::new("Empty Trash", &message, "empty_trash");
+        if failed > 0 {
+            dialog = dialog.checkbox(
+                EMPTY_TRASH_FORCE_FAILED,
+                &format!("Force delete {failed} that failed before"),
+            );
+        }
+        if failed_forced > 0 {
+            dialog = dialog.checkbox(
+                EMPTY_TRASH_DROP_FAILED,
+                &format!("Remove {failed_forced} that failed when forced from aoe"),
+            );
+        }
+        self.confirm_dialog = Some(dialog);
     }
 
     /// Confirm before archiving every active session under the focused group: a whole
@@ -1350,6 +1385,7 @@ impl HomeView {
                     }
                     DialogResult::Submit(()) => {
                         let dont_ask_again = dialog.dont_ask_again();
+                        self.confirm_checked = dialog.checked_keys();
                         self.confirm_dialog = None;
                         if self.settings_close_confirm {
                             // Discard runs the keyboard path's exact sequence, theme
@@ -2138,6 +2174,7 @@ impl HomeView {
                 DialogResult::Submit(_) => {
                     let action = dialog.action().to_string();
                     let dont_ask_again = dialog.dont_ask_again();
+                    self.confirm_checked = dialog.checked_keys();
                     self.confirm_dialog = None;
                     if dont_ask_again {
                         self.apply_confirm_dont_ask_again(&action);
