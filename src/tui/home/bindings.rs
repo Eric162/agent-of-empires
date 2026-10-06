@@ -86,6 +86,8 @@ pub enum ActionId {
     /// session, even when auto-rename-on-start is off (#3039). Terminal sessions rename
     /// locally; structured sessions go through the daemon.
     AutoName,
+    /// Permanently purge every trashed session after a confirm (palette only; no chord).
+    EmptyTrash,
 }
 
 /// A single chord. `ctrl` requires the Control modifier; Shift is implicit in the
@@ -1042,6 +1044,18 @@ pub static BINDINGS: &[Binding] = &[
             group: PaletteGroup::Actions,
         }),
     },
+    Binding {
+        id: ActionId::EmptyTrash,
+        non_strict: &[],
+        strict: &[],
+        context: Context::Always,
+        help: None,
+        palette: Some(PaletteMeta {
+            title: "Empty trash",
+            keywords: &["trash", "empty", "purge", "delete", "clear"],
+            group: PaletteGroup::Actions,
+        }),
+    },
     // The mnemonic keys (a/A, n/N, r/R, t/T) are taken and the home keyspace is saturated
     // (see Fork), so "Auto-name now" lands on the free v/V pair. Gated to a
     // still-default-named session inside the handler.
@@ -1111,6 +1125,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::Skills => "skills",
         ActionId::Fork => "fork",
         ActionId::AutoName => "auto-name",
+        ActionId::EmptyTrash => "empty-trash",
     }
 }
 

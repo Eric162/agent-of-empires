@@ -2841,6 +2841,7 @@ impl HomeView {
             ActionId::NextWaiting => self.jump_to_next_waiting(),
             ActionId::Tips => self.open_tips_dialog(),
             ActionId::Fork => self.open_fork_from_selection(),
+            ActionId::EmptyTrash => self.prompt_empty_trash(),
             ActionId::AutoName => return self.auto_name_selected(),
         }
         None
@@ -5183,8 +5184,9 @@ impl HomeView {
     /// Open the delete dialog (or a force-remove confirm, or the group delete-options
     /// dialog) for the current selection, mirroring the `'d'` / `'D'` gating: Terminal
     /// view rejects deletion with an info dialog, Creating sessions are inert,
-    /// stuck-Deleting sessions get a force-remove confirm, and Project and organization
-    /// groups can't be deleted. Shared by the keys and the context menu.
+    /// stuck-Deleting sessions get a force-remove confirm, Project and organization
+    /// groups can't be deleted, and the Trash header offers to empty the trash. Shared by
+    /// the keys and the context menu.
     pub(super) fn open_delete_for_selected(&mut self) {
         // Deletion only allowed in Structured View.
         if self.view_mode == ViewMode::Terminal {
@@ -5323,6 +5325,8 @@ impl HomeView {
                 self.confirm_dialog =
                     Some(ConfirmDialog::new("Delete Group", &message, "delete_group"));
             }
+        } else if matches!(self.section_at_cursor(), Some(SidebarSection::Trash)) {
+            self.prompt_empty_trash();
         }
     }
 

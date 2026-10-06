@@ -1314,6 +1314,53 @@ fn right_click_trash_header_shows_bulk_menu() {
     }
 }
 
+/// `d` on the Trash header and the palette's "Empty trash" both open the empty-trash
+/// confirm, which ignores `session.confirm_delete` because the purge is irreversible.
+#[test]
+#[serial]
+fn trash_header_d_and_palette_open_empty_trash_confirm() {
+    for via_palette in [false, true] {
+        let mut env = create_test_env_with_sessions(2);
+        disable_confirm_delete();
+        env.view.trashed_section_collapsed = false;
+        let id = env.view.instance_at(0).id.clone();
+        env.view.trash_session_by_id(&id);
+
+        if via_palette {
+            env.view.handle_key(
+                KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+                None,
+            );
+            for ch in "empty trash".chars() {
+                env.view.handle_key(key(KeyCode::Char(ch)), None);
+            }
+            env.view.handle_key(key(KeyCode::Enter), None);
+        } else {
+            env.view.cursor = env
+                .view
+                .flat_items
+                .iter()
+                .position(|it| {
+                    matches!(it, Item::Group { path, .. }
+                        if crate::session::is_trash_section_path(path))
+                })
+                .expect("Trash header must render");
+            env.view.update_selected();
+            env.view.handle_key(key(KeyCode::Char('d')), None);
+        }
+
+        assert_eq!(
+            env.view.confirm_dialog.as_ref().map(|d| d.action()),
+            Some("empty_trash"),
+            "via_palette={via_palette}"
+        );
+        assert!(
+            env.view.get_instance(&id).unwrap().is_trashed(),
+            "nothing is purged before the confirm, via_palette={via_palette}"
+        );
+    }
+}
+
 /// Shelf bulk actions: "Empty Trash" routes through a destructive confirm and marks every trashed
 /// row Deleting (an empty trash shows an info dialog instead), and "Restore All" un-trashes or
 /// unarchives every row of its section.
