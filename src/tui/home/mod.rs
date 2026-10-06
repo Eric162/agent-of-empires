@@ -83,6 +83,13 @@ pub(super) enum DragKind {
     SettingsScrollbar,
 }
 
+/// A deletion's force level and the trash lifecycle it ran in.
+#[derive(Clone, Copy)]
+pub(super) struct DeleteAttempt {
+    pub(super) forced: bool,
+    pub(super) trashed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 pub(super) struct GroupRenameContext {
     pub(super) old_path: String,
     pub(super) old_profile: String,
@@ -276,12 +283,10 @@ pub struct HomeView {
     pub(super) structured_approval_poller: super::approval_poller::StructuredApprovalPoller,
 
     pub(super) deletion_poller: DeletionPoller,
-    /// `force_delete` of each in-flight deletion, keyed by session id.
-    pub(super) deletes_in_flight: HashMap<String, bool>,
-    /// Whether each session's last failed deletion was forced, so Empty Trash can
-    /// escalate: a failed delete is offered a forced retry, a failed forced delete
-    /// removal from aoe without cleanup.
-    pub(super) failed_deletes: HashMap<String, bool>,
+    pub(super) deletes_in_flight: HashMap<String, DeleteAttempt>,
+    /// Each session's last failed deletion, so Empty Trash can escalate: a failed delete
+    /// is offered a forced retry, a failed forced delete removal from aoe without cleanup.
+    pub(super) failed_deletes: HashMap<String, DeleteAttempt>,
 
     pub(super) stop_poller: StopPoller,
 

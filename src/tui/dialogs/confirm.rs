@@ -243,7 +243,7 @@ impl ConfirmDialog {
         let widest_checkbox = self
             .checkboxes
             .iter()
-            .map(|c| c.label.chars().count() as u16 + 16)
+            .map(|c| unicode_width::UnicodeWidthStr::width(c.label.as_str()) as u16 + 16)
             .max();
         let width: u16 = widest_checkbox.map_or(50, |w| w.max(56)).min(area.width);
         let text_width = width.saturating_sub(4).max(1);
@@ -538,14 +538,19 @@ mod tests {
 
     #[test]
     fn a_long_checkbox_label_widens_the_dialog_instead_of_clipping() {
-        let label = "Remove 1 that failed when forced from aoe";
-        let mut d = dialog().checkbox("drop", label);
-        d.handle_key(key(KeyCode::Down));
-        let (screen, _buf, _theme) = render_to(&mut d, 120, 20);
-        assert!(
-            screen.contains(&format!("{label} (space)")),
-            "label and hint must fit:\n{screen}"
-        );
+        // Wide characters take two cells each, so sizing must use display width.
+        for label in [
+            "Remove 1 from aoe that failed a forced delete",
+            "削除削除削除削除削除削除削除削除削除削除削除削除",
+        ] {
+            let mut d = dialog().checkbox("drop", label);
+            d.handle_key(key(KeyCode::Down));
+            let (screen, _buf, _theme) = render_to(&mut d, 120, 20);
+            assert!(
+                screen.contains("(space)"),
+                "label and hint must fit:\n{screen}"
+            );
+        }
     }
 
     #[test]

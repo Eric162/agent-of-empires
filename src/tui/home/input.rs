@@ -1102,7 +1102,7 @@ impl HomeView {
         let mut failed_forced = 0;
         for inst in self.instances.values().filter(|i| i.is_trashed()) {
             count += 1;
-            match self.failed_deletes.get(&inst.id) {
+            match self.failed_delete_forced(inst) {
                 Some(false) => failed += 1,
                 Some(true) => failed_forced += 1,
                 None => {}
@@ -1133,7 +1133,7 @@ impl HomeView {
         if failed_forced > 0 {
             dialog = dialog.checkbox(
                 EMPTY_TRASH_DROP_FAILED,
-                &format!("Remove {failed_forced} that failed when forced from aoe"),
+                &format!("Remove {failed_forced} from aoe that failed a forced delete"),
             );
         }
         self.confirm_dialog = Some(dialog);

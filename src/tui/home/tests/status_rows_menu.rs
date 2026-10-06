@@ -1362,75 +1362,119 @@ fn trash_header_d_and_palette_open_empty_trash_confirm() {
 }
 
 /// A trashed row whose repo is gone fails every delete, so Empty Trash escalates it one
-/// opt-in step per attempt: plain delete, forced delete, then removal from aoe.
+/// opt-in step per attempt: plain delete, forced delete, then removal from aoe. A peer
+/// restore between the last confirm and its submit keeps the row.
 #[test]
 #[serial]
 fn empty_trash_escalates_a_row_that_keeps_failing() {
-    let mut env = create_test_env_with_sessions(2);
-    let id = env.view.instance_at(0).id.clone();
-    // The deletion worker reads the durable row, so the dead repo goes on disk.
-    Storage::new_unwatched("test")
-        .unwrap()
-        .update(|instances, _| {
-            let inst = instances.iter_mut().find(|i| i.id == id).unwrap();
-            inst.worktree_info = Some(crate::session::WorktreeInfo {
-                branch: "gone".to_string(),
-                main_repo_path: "/nonexistent/aoe-test-repo".to_string(),
-                managed_by_aoe: true,
-                created_at: chrono::Utc::now(),
-                base_branch: None,
-            });
-            Ok(())
-        })
-        .unwrap();
-    env.view.reload().unwrap();
-    env.view.trash_session_by_id(&id);
-
-    // (checkbox labels offered, forced delete expected in flight); each offered box is ticked.
-    let rounds: [(&[&str], bool); 3] = [
-        (&[], false),
-        (&["Force delete 1 that failed before"], true),
-        (&["Remove 1 that failed when forced from aoe"], false),
-    ];
-    for (round, (labels, forced)) in rounds.into_iter().enumerate() {
-        env.view.prompt_empty_trash();
-        let dialog = env
-            .view
-            .confirm_dialog
-            .as_mut()
-            .expect("empty-trash confirm");
-        assert_eq!(dialog.checkbox_labels_for_test(), labels, "round {round}");
-        if !labels.is_empty() {
-            dialog.handle_key(key(KeyCode::Down));
-            dialog.handle_key(key(KeyCode::Char(' ')));
+    use std::time::{Duration, Instant};
+    for peer_restores in [false, true] {
+        let mut env = create_test_env_with_sessions(2);
+        let id = env.view.instance_at(0).id.clone();
+        let storage = Storage::new_unwatched("test").unwrap();
+        let durable = |storage: &Storage| storage.load().unwrap().into_iter().find(|i| i.id == id);
+        // The deletion worker reads the durable row, so the dead repo goes on disk.
+        storage
+            .update(|instances, _| {
+                let inst = instances.iter_mut().find(|i| i.id == id).unwrap();
+                inst.worktree_info = Some(crate::session::WorktreeInfo {
+                    branch: "gone".to_string(),
+                    main_repo_path: "/nonexistent/aoe-test-repo".to_string(),
+                    managed_by_aoe: true,
+                    created_at: chrono::Utc::now(),
+                    base_branch: None,
+                });
+                Ok(())
+            })
+            .unwrap();
+        env.view.reload().unwrap();
+        env.view.trash_session_by_id(&id);
+        // A held Trash reservation would turn the first purge into Busy, not Failed.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while env.view.trash_poller.is_pending(&id) {
+            assert!(Instant::now() < deadline, "trash never finished");
+            env.view.apply_trash_results();
+            std::thread::yield_now();
         }
-        env.view.handle_key(key(KeyCode::Char('y')), None);
-
-        if round == 2 {
-            assert!(
-                env.view.get_instance(&id).is_none(),
-                "a row whose forced delete failed is removed from aoe"
-            );
-            break;
-        }
+        let trashed = durable(&storage).unwrap();
+        assert!(trashed.is_trashed());
         assert_eq!(
-            env.view.deletes_in_flight.get(&id),
-            Some(&forced),
-            "round {round}"
+            trashed.lifecycle_reservation, None,
+            "trash reservation released"
         );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !env.view.apply_deletion_results() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "round {round}: no result"
+
+        // (checkbox labels offered, forced delete expected in flight); each offered box is ticked.
+        let rounds: [(&[&str], bool); 3] = [
+            (&[], false),
+            (&["Force delete 1 that failed before"], true),
+            (&["Remove 1 from aoe that failed a forced delete"], false),
+        ];
+        for (round, (labels, forced)) in rounds.into_iter().enumerate() {
+            env.view.prompt_empty_trash();
+            let dialog = env
+                .view
+                .confirm_dialog
+                .as_mut()
+                .expect("empty-trash confirm");
+            assert_eq!(dialog.checkbox_labels_for_test(), labels, "round {round}");
+            if !labels.is_empty() {
+                dialog.handle_key(key(KeyCode::Down));
+                dialog.handle_key(key(KeyCode::Char(' ')));
+            }
+            if round == 2 && peer_restores {
+                storage
+                    .update(|instances, _| {
+                        instances
+                            .iter_mut()
+                            .find(|i| i.id == id)
+                            .unwrap()
+                            .trashed_at = None;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            env.view.handle_key(key(KeyCode::Char('y')), None);
+
+            if round == 2 {
+                assert_eq!(
+                    durable(&storage).is_some(),
+                    peer_restores,
+                    "only a peer restore keeps the durable row"
+                );
+                assert_eq!(env.view.get_instance(&id).is_some(), peer_restores);
+                break;
+            }
+            assert_eq!(
+                env.view.deletes_in_flight.get(&id).map(|a| a.forced),
+                Some(forced),
+                "round {round}"
             );
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            // Emptying again mid-flight neither offers escalation nor re-requests the row.
+            env.view.prompt_empty_trash();
+            assert!(env
+                .view
+                .confirm_dialog
+                .as_ref()
+                .unwrap()
+                .checkbox_labels_for_test()
+                .is_empty());
+            env.view.handle_key(key(KeyCode::Char('y')), None);
+            assert_eq!(
+                env.view.deletes_in_flight.get(&id).map(|a| a.forced),
+                Some(forced),
+                "round {round}: in-flight force level kept"
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !env.view.apply_deletion_results() {
+                assert!(Instant::now() < deadline, "round {round}: no result");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(
+                env.view.failed_deletes.get(&id).map(|a| a.forced),
+                Some(forced),
+                "round {round}"
+            );
         }
-        assert_eq!(
-            env.view.failed_deletes.get(&id),
-            Some(&forced),
-            "round {round}"
-        );
     }
 }
 
