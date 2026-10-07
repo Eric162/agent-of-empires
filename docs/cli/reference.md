@@ -159,7 +159,7 @@ Run without arguments to launch the TUI dashboard.
 * `killall` — Force-stop everything aoe is running: the serve daemon, all agent workers, and all aoe tmux sessions. Destructive and unprompted
 * `session` — Manage session lifecycle (start, stop, attach, etc.)
 * `group` — Manage groups for organizing sessions
-* `orchestrated-group` — Run an OrchestratedGroup: a Chief of Staff session coordinating worker sessions
+* `orchestrated-group` — Run an OrchestratedGroup: an Orchestrator Agent session coordinating worker sessions
 * `plugin` — Manage plugins (list, info, enable, disable, install, update, uninstall)
 * `profile` — Manage profiles (separate workspaces)
 * `project` — Manage the project registry used by multi-repo session pickers
@@ -834,37 +834,37 @@ Move session to group
 
 ## `aoe orchestrated-group`
 
-Run an OrchestratedGroup: a Chief of Staff session coordinating worker sessions
+Run an OrchestratedGroup: an Orchestrator Agent session coordinating worker sessions
 
 **Usage:** `aoe orchestrated-group <COMMAND>`
 
 ###### **Subcommands:**
 
-* `init` — Turn a group into an OrchestratedGroup and start its Chief of Staff session
-* `spawn` — Start a worker session with a task (run by the chief)
+* `init` — Turn a group into an OrchestratedGroup and start its Orchestrator Agent session
+* `spawn` — Start a worker session with a task (run by the orchestrator)
 * `post` — Post a message to the board
 * `board` — Read the board
-* `status` — Show the chief, workers and board state
+* `status` — Show the orchestrator, workers and board state
 * `memory` — Print the memory directory
 
 
 
 ## `aoe orchestrated-group init`
 
-Turn a group into an OrchestratedGroup and start its Chief of Staff session
+Turn a group into an OrchestratedGroup and start its Orchestrator Agent session
 
 **Usage:** `aoe orchestrated-group init [OPTIONS] <GROUP> [PATH]`
 
 ###### **Arguments:**
 
 * `<GROUP>` — Group path to turn into an OrchestratedGroup (created if missing)
-* `<PATH>` — Repository the chief and its workers operate on (defaults to current directory)
+* `<PATH>` — Repository the orchestrator and its workers operate on (defaults to current directory)
 
 ###### **Options:**
 
 * `--brief <BRIEF>` — What this project is for
-* `-t`, `--title <TITLE>` — Chief session title
-* `-w`, `--worktree <WORKTREE>` — Run the chief in a worktree on this integration branch (created if missing); workers then branch from it
+* `-t`, `--title <TITLE>` — Orchestrator session title
+* `-w`, `--worktree <WORKTREE>` — Run the orchestrator in a worktree on this integration branch (created if missing); workers then branch from it
 * `--base-branch <BASE_BRANCH>` — Base for a newly created --worktree branch (defaults to the repo's default branch)
 * `--tool <TOOL>` — Named agent to run (defaults to your aoe default)
 * `--structured-view` — Use the structured (ACP) view instead of a terminal session
@@ -876,7 +876,7 @@ Turn a group into an OrchestratedGroup and start its Chief of Staff session
 
 ## `aoe orchestrated-group spawn`
 
-Start a worker session with a task (run by the chief)
+Start a worker session with a task (run by the orchestrator)
 
 **Usage:** `aoe orchestrated-group spawn [OPTIONS] --title <TITLE> <TASK>`
 
@@ -888,7 +888,7 @@ Start a worker session with a task (run by the chief)
 
 * `-t`, `--title <TITLE>` — Worker session title
 * `-b`, `--branch <BRANCH>` — Worktree branch (defaults to og/<title>)
-* `--no-worktree` — Run in the chief's checkout instead of a new worktree
+* `--no-worktree` — Run in the orchestrator's checkout instead of a new worktree
 * `--tool <TOOL>` — Named agent to run (defaults to your aoe default)
 * `--structured-view` — Use the structured (ACP) view instead of a terminal session
 * `--agent <AGENT>` — ACP agent for the structured view
@@ -917,7 +917,7 @@ Post a message to the board
 
   Possible values: `task`, `status`, `question`, `answer`, `result`, `learning`, `note`, `system`
 
-* `--to <TO>` — Recipient session (id or title), `all` for every worker; defaults to the chief
+* `--to <TO>` — Recipient session (id or title), `all` for every worker; defaults to the orchestrator
 * `-g`, `--group <GROUP>` — OrchestratedGroup path; defaults to the group of the session this runs in
 * `--as <AS_SESSION>` — Act as this session (id or title) instead of detecting the current one
 
@@ -943,7 +943,7 @@ Read the board
 
 ## `aoe orchestrated-group status`
 
-Show the chief, workers and board state
+Show the orchestrator, workers and board state
 
 **Usage:** `aoe orchestrated-group status [OPTIONS]`
 

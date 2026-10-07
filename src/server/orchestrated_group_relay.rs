@@ -119,7 +119,7 @@ fn plan(instances: &[Instance], edges: &[StatusChange]) -> Result<Vec<Delivery>>
                 .orchestration
                 .as_ref()
                 .expect("filtered on orchestration");
-            if info.chief_session_id.as_deref() == Some(inst.id.as_str()) {
+            if info.orchestrator_session_id.as_deref() == Some(inst.id.as_str()) {
                 continue;
             }
             let hint = match inst.status {
@@ -148,11 +148,11 @@ fn plan(instances: &[Instance], edges: &[StatusChange]) -> Result<Vec<Delivery>>
                 .orchestration
                 .as_ref()
                 .expect("filtered on orchestration");
-            let Some(chief) = info.chief_session_id.as_deref() else {
+            let Some(orchestrator) = info.orchestrator_session_id.as_deref() else {
                 continue;
             };
             for member in orchestrated_group::members(group, members) {
-                let (msgs, through_seq) = board.pending_for(&info.id, &member.id, chief)?;
+                let (msgs, through_seq) = board.pending_for(&info.id, &member.id, orchestrator)?;
                 if msgs.is_empty() {
                     board.advance_cursor(&info.id, &member.id, through_seq)?;
                     continue;

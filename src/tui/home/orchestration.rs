@@ -159,7 +159,7 @@ impl HomeView {
         } else if self.selected_orchestration().is_some() {
             self.orchestration_panel = Some(OrchestrationPanel::new());
         } else {
-            self.flash_status("Not an orchestrated group; start one with n and tick Orchestrate");
+            self.flash_status("Not an orchestrated group; create one with n and tick Orchestrator");
         }
     }
 
@@ -279,7 +279,7 @@ impl HomeView {
         true
     }
 
-    /// Compose a board post: to the selected worker, otherwise to the chief.
+    /// Compose a board post: to the selected worker, otherwise to the orchestrator.
     pub(super) fn open_board_post_dialog(&mut self) {
         let Some((_, group)) = self.selected_orchestration() else {
             self.flash_status("Not an orchestrated group");
@@ -293,10 +293,10 @@ impl HomeView {
             .selected_session
             .as_deref()
             .and_then(|id| self.get_instance(id))
-            .filter(|i| info.chief_session_id.as_deref() != Some(i.id.as_str()));
+            .filter(|i| info.orchestrator_session_id.as_deref() != Some(i.id.as_str()));
         let label = match worker {
             Some(w) => format!("#{} → {}", group.path, w.title),
-            None => format!("#{} → chief", group.path),
+            None => format!("#{} → orchestrator", group.path),
         };
         self.pending_board_post = Some(BoardPostTarget {
             topic: info.id.clone(),
@@ -327,7 +327,7 @@ impl HomeView {
         }
     }
 
-    /// Start `og init` off the UI thread; the new chief appears through the usual reload.
+    /// Start `og init` off the UI thread; the new orchestrator appears through the usual reload.
     pub(super) fn start_orchestrated_group(&mut self, data: NewSessionData) {
         let group = data.group.trim().trim_matches('/').to_string();
         let mut args: Vec<String> = Vec::new();
@@ -448,29 +448,78 @@ impl HomeView {
         render_panel(frame, panel_area, theme, panel, &group.path);
     }
 
-    /// Chief id per orchestrated group across loaded profiles.
-    fn chief_ids(&self) -> HashSet<String> {
+    /// Orchestrator id per orchestrated group across loaded profiles.
+    fn orchestrator_ids(&self) -> HashSet<String> {
         self.group_trees
             .values()
             .flat_map(|t| t.get_all_groups())
-            .filter_map(|g| g.orchestration?.chief_session_id)
+            .filter_map(|g| g.orchestration?.orchestrator_session_id)
             .collect()
     }
 
-    /// Workers of `chief_id`: sessions it spawned, trashed or not.
-    pub(super) fn worker_ids_of(&self, chief_id: &str) -> Vec<String> {
-        if !self.chief_ids().contains(chief_id) {
+    /// Drop the group `orchestrator_id` leads, once it and its workers are going away.
+    pub(super) fn remove_group_of_orchestrator(&mut self, orchestrator_id: &str) {
+        let found = self.group_trees.iter().find_map(|(profile, tree)| {
+            tree.get_all_groups()
+                .into_iter()
+                .find(|g| {
+                    g.orchestration
+                        .as_ref()
+                        .and_then(|o| o.orchestrator_session_id.as_deref())
+                        == Some(orchestrator_id)
+                })
+                .map(|g| (profile.clone(), g.path))
+        });
+        let Some((profile, path)) = found else {
+            return;
+        };
+        self.delete_group_in_profile(&profile, &path);
+        if let Err(error) = self.save() {
+            tracing::warn!(target: "tui.session", %error, "removing orchestrated group failed");
+        }
+        self.orchestration_panel = None;
+    }
+
+    /// The live orchestrator a group header stands in for.
+    pub(super) fn orchestrator_of_group(
+        &self,
+        path: &str,
+        profile: Option<&str>,
+    ) -> Option<String> {
+        let trees: Vec<&GroupTree> = match profile {
+            Some(p) => self.group_trees.get(p).into_iter().collect(),
+            None => self.group_trees.values().collect(),
+        };
+        trees
+            .into_iter()
+            .flat_map(|t| t.get_all_groups())
+            .find(|g| g.path == path)?
+            .orchestration?
+            .orchestrator_session_id
+            .filter(|id| {
+                self.get_instance(id)
+                    .is_some_and(|i| !i.is_trashed() && !i.is_archived())
+            })
+    }
+
+    pub(super) fn is_orchestrator(&self, id: &str) -> bool {
+        self.orchestrator_ids().contains(id)
+    }
+
+    /// Workers of `orchestrator_id`: sessions it spawned, trashed or not.
+    pub(super) fn worker_ids_of(&self, orchestrator_id: &str) -> Vec<String> {
+        if !self.is_orchestrator(orchestrator_id) {
             return Vec::new();
         }
         self.instances()
-            .filter(|i| i.parent_session_id.as_deref() == Some(chief_id))
+            .filter(|i| i.parent_session_id.as_deref() == Some(orchestrator_id))
             .map(|i| i.id.clone())
             .collect()
     }
 
     /// Workers not already in the trash.
-    pub(super) fn live_worker_ids_of(&self, chief_id: &str) -> Vec<String> {
-        self.worker_ids_of(chief_id)
+    pub(super) fn live_worker_ids_of(&self, orchestrator_id: &str) -> Vec<String> {
+        self.worker_ids_of(orchestrator_id)
             .into_iter()
             .filter(|id| self.get_instance(id).is_some_and(|i| !i.is_trashed()))
             .collect()
@@ -478,10 +527,10 @@ impl HomeView {
 
     pub(super) fn compute_worker_titles(&self) -> HashMap<String, String> {
         let mut out = HashMap::new();
-        for chief in self.chief_ids() {
+        for orchestrator in self.orchestrator_ids() {
             let workers: Vec<(&str, &str)> = self
                 .instances()
-                .filter(|i| i.parent_session_id.as_deref() == Some(chief.as_str()))
+                .filter(|i| i.parent_session_id.as_deref() == Some(orchestrator.as_str()))
                 .map(|i| (i.id.as_str(), i.title.as_str()))
                 .collect();
             out.extend(worker_nicks(&workers));
@@ -490,15 +539,15 @@ impl HomeView {
     }
 
     fn nicks_for(&self, group: &Group, info: &OrchestrationInfo) -> HashMap<String, String> {
-        let chief = info.chief_session_id.as_deref();
+        let orchestrator = info.orchestrator_session_id.as_deref();
         let workers: Vec<(&str, &str)> = self
             .instances()
-            .filter(|i| i.group_path == group.path && Some(i.id.as_str()) != chief)
+            .filter(|i| i.group_path == group.path && Some(i.id.as_str()) != orchestrator)
             .map(|i| (i.id.as_str(), i.title.as_str()))
             .collect();
         let mut nicks = worker_nicks(&workers);
-        if let Some(chief) = chief {
-            nicks.insert(chief.to_string(), "chief".into());
+        if let Some(orchestrator) = orchestrator {
+            nicks.insert(orchestrator.to_string(), "orchestrator".into());
         }
         nicks.insert(USER_AUTHOR.into(), "you".into());
         nicks.insert(ALL_WORKERS.into(), "all".into());

@@ -15,15 +15,15 @@ use crate::session::{Group, GroupTree, Instance, Storage};
 
 #[derive(Subcommand)]
 pub enum OrchestratedGroupCommands {
-    /// Turn a group into an OrchestratedGroup and start its Chief of Staff session
+    /// Turn a group into an OrchestratedGroup and start its Orchestrator Agent session
     Init(InitArgs),
-    /// Start a worker session with a task (run by the chief)
+    /// Start a worker session with a task (run by the orchestrator)
     Spawn(SpawnArgs),
     /// Post a message to the board
     Post(PostArgs),
     /// Read the board
     Board(BoardArgs),
-    /// Show the chief, workers and board state
+    /// Show the orchestrator, workers and board state
     Status(TargetArgs),
     /// Print the memory directory
     Memory(TargetArgs),
@@ -62,15 +62,15 @@ pub struct AgentArgs {
 pub struct InitArgs {
     /// Group path to turn into an OrchestratedGroup (created if missing)
     group: String,
-    /// Repository the chief and its workers operate on (defaults to current directory)
+    /// Repository the orchestrator and its workers operate on (defaults to current directory)
     path: Option<PathBuf>,
     /// What this project is for
     #[arg(long)]
     brief: Option<String>,
-    /// Chief session title
+    /// Orchestrator session title
     #[arg(long, short = 't')]
     title: Option<String>,
-    /// Run the chief in a worktree on this integration branch (created if missing);
+    /// Run the orchestrator in a worktree on this integration branch (created if missing);
     /// workers then branch from it
     #[arg(long, short = 'w')]
     worktree: Option<String>,
@@ -91,7 +91,7 @@ pub struct SpawnArgs {
     /// Worktree branch (defaults to og/<title>)
     #[arg(long, short = 'b')]
     branch: Option<String>,
-    /// Run in the chief's checkout instead of a new worktree
+    /// Run in the orchestrator's checkout instead of a new worktree
     #[arg(long = "no-worktree", conflicts_with = "branch")]
     no_worktree: bool,
     #[command(flatten)]
@@ -106,7 +106,7 @@ pub struct PostArgs {
     body: String,
     #[arg(long, short = 'k', value_enum, default_value = "note")]
     kind: MessageKind,
-    /// Recipient session (id or title), `all` for every worker; defaults to the chief
+    /// Recipient session (id or title), `all` for every worker; defaults to the orchestrator
     #[arg(long)]
     to: Option<String>,
     #[command(flatten)]
@@ -189,12 +189,17 @@ impl Ctx {
         })
     }
 
-    fn chief_id(&self) -> &str {
-        self.info.chief_session_id.as_deref().unwrap_or_default()
+    fn orchestrator_id(&self) -> &str {
+        self.info
+            .orchestrator_session_id
+            .as_deref()
+            .unwrap_or_default()
     }
 
-    fn chief(&self) -> Option<&Instance> {
-        self.instances.iter().find(|i| i.id == self.chief_id())
+    fn orchestrator(&self) -> Option<&Instance> {
+        self.instances
+            .iter()
+            .find(|i| i.id == self.orchestrator_id())
     }
 
     fn author(&self) -> (String, String) {
@@ -350,14 +355,14 @@ async fn init(profile: &str, args: InitArgs) -> Result<()> {
         Ok(info.clone())
     })?;
 
-    if let Some(chief) = info.chief_session_id.as_deref() {
+    if let Some(orchestrator) = info.orchestrator_session_id.as_deref() {
         let instances = storage.load()?;
         if let Some(existing) = instances
             .iter()
-            .find(|i| i.id == chief && !i.is_trashed() && !i.is_archived())
+            .find(|i| i.id == orchestrator && !i.is_trashed() && !i.is_archived())
         {
             bail!(
-                "'{group_path}' already has a Chief of Staff: '{}' ({})",
+                "'{group_path}' already has an Orchestrator Agent: '{}' ({})",
                 existing.title,
                 existing.id
             );
@@ -367,7 +372,7 @@ async fn init(profile: &str, args: InitArgs) -> Result<()> {
     let memory = orchestrated_group::ensure_memory(&info, &group_path)?;
     let title = args.title.unwrap_or_else(|| {
         format!(
-            "{} chief",
+            "{} orchestrator",
             group_path.rsplit('/').next().unwrap_or(&group_path)
         )
     });
@@ -393,9 +398,9 @@ async fn init(profile: &str, args: InitArgs) -> Result<()> {
     }
     add.extend(agent_flags(&args.agent));
     add_session(profile, add).await?;
-    let chief = newest_session(profile, &title, &group_path)?;
+    let orchestrator = newest_session(profile, &title, &group_path)?;
     update_info(profile, &group_path, |i| {
-        i.chief_session_id = Some(chief.id.clone())
+        i.orchestrator_session_id = Some(orchestrator.id.clone())
     })?;
 
     let mut board = Board::open()?;
@@ -405,22 +410,22 @@ async fn init(profile: &str, args: InitArgs) -> Result<()> {
             kind: MessageKind::System,
             from: orchestrated_group::SYSTEM_AUTHOR.into(),
             from_title: orchestrated_group::SYSTEM_AUTHOR.into(),
-            to: Some(chief.id.clone()),
-            body: format!("OrchestratedGroup '{group_path}' started with chief '{title}'"),
+            to: Some(orchestrator.id.clone()),
+            body: format!("OrchestratedGroup '{group_path}' started with orchestrator '{title}'"),
             at: Utc::now(),
         },
     )?;
-    board.advance_cursor(&info.id, &chief.id, board.highest_seq(&info.id))?;
+    board.advance_cursor(&info.id, &orchestrator.id, board.highest_seq(&info.id))?;
 
     let prompt = format!(
         "{}\n\n{}",
-        orchestrated_group::chief_bootstrap_prompt(&group_path, &info, &memory),
-        orchestrated_group::identity_footer(&chief.id)
+        orchestrated_group::orchestrator_bootstrap_prompt(&group_path, &info, &memory),
+        orchestrated_group::identity_footer(&orchestrator.id)
     );
-    send_to(profile, &chief.id, &prompt).await?;
+    send_to(profile, &orchestrator.id, &prompt).await?;
 
     println!("OrchestratedGroup '{group_path}' ready");
-    println!("  Chief:  {title} ({})", chief.id);
+    println!("  Orchestrator:  {title} ({})", orchestrator.id);
     println!("  Memory: {}", memory.display());
     warn_without_daemon().await;
     warn_without_pre_trust(profile);
@@ -446,27 +451,31 @@ fn slug(s: &str) -> String {
 
 async fn spawn(profile: &str, args: SpawnArgs) -> Result<()> {
     let ctx = Ctx::resolve(profile, &args.target)?;
-    let chief = ctx
-        .chief()
-        .cloned()
-        .ok_or_else(|| anyhow!("OrchestratedGroup '{}' has no live chief", ctx.group.path))?;
+    let orchestrator = ctx.orchestrator().cloned().ok_or_else(|| {
+        anyhow!(
+            "OrchestratedGroup '{}' has no live orchestrator",
+            ctx.group.path
+        )
+    })?;
     if let Some(me) = &ctx.me {
-        if me.id != chief.id {
-            bail!("only the Chief of Staff spawns workers; post a `question` to ask for one");
+        if me.id != orchestrator.id {
+            bail!("only the Orchestrator Agent spawns workers; post a `question` to ask for one");
         }
     }
 
-    // From the main checkout so worker worktrees sit beside the chief's, not inside it.
-    let repo_path = chief
+    // From the main checkout so worker worktrees sit beside the orchestrator's, not inside it.
+    let repo_path = orchestrator
         .worktree_info
         .as_ref()
-        .map_or(chief.project_path.clone(), |wt| wt.main_repo_path.clone());
+        .map_or(orchestrator.project_path.clone(), |wt| {
+            wt.main_repo_path.clone()
+        });
     let mut add = vec![
         repo_path,
         "-t".into(),
         args.title.clone(),
         "-P".into(),
-        chief.id.clone(),
+        orchestrator.id.clone(),
         "-l".into(),
     ];
     if !args.no_worktree {
@@ -475,21 +484,21 @@ async fn spawn(profile: &str, args: SpawnArgs) -> Result<()> {
             .clone()
             .unwrap_or_else(|| format!("og/{}", slug(&args.title)));
         add.extend(["-w".into(), branch, "-b".into()]);
-        if let Some(wt) = &chief.worktree_info {
+        if let Some(wt) = &orchestrator.worktree_info {
             add.extend(["--base-branch".into(), wt.branch.clone()]);
         }
     }
     add.extend(agent_flags(&args.agent));
     add_session(&ctx.profile, add).await?;
-    let worker = newest_session(&ctx.profile, &args.title, &chief.group_path)?;
+    let worker = newest_session(&ctx.profile, &args.title, &orchestrator.group_path)?;
 
     let mut board = Board::open()?;
     let seq = board.post(
         &ctx.info.id,
         &BoardMessage {
             kind: MessageKind::Task,
-            from: chief.id.clone(),
-            from_title: chief.title.clone(),
+            from: orchestrator.id.clone(),
+            from_title: orchestrator.title.clone(),
             to: Some(worker.id.clone()),
             body: args.task.clone(),
             at: Utc::now(),
@@ -500,7 +509,7 @@ async fn spawn(profile: &str, args: SpawnArgs) -> Result<()> {
 
     let prompt = format!(
         "{}\n\n{}",
-        orchestrated_group::worker_task_prompt(&ctx.group.path, &chief.title, &args.task),
+        orchestrated_group::worker_task_prompt(&ctx.group.path, &orchestrator.title, &args.task),
         orchestrated_group::identity_footer(&worker.id)
     );
     send_to(&ctx.profile, &worker.id, &prompt).await?;
@@ -514,7 +523,7 @@ async fn spawn(profile: &str, args: SpawnArgs) -> Result<()> {
 fn post(profile: &str, args: PostArgs) -> Result<()> {
     let ctx = Ctx::resolve(profile, &args.target)?;
     let to = match args.to.as_deref() {
-        None | Some("chief") => None,
+        None | Some("orchestrator") => None,
         Some(ALL_WORKERS) => Some(ALL_WORKERS.to_string()),
         Some(who) => {
             let members: Vec<Instance> = orchestrated_group::members(&ctx.group, &ctx.instances)
@@ -522,7 +531,7 @@ fn post(profile: &str, args: PostArgs) -> Result<()> {
                 .cloned()
                 .collect();
             let target = super::resolve_session(who, &members)?;
-            (target.id != ctx.chief_id()).then(|| target.id.clone())
+            (target.id != ctx.orchestrator_id()).then(|| target.id.clone())
         }
     };
     let (from, from_title) = ctx.author();
@@ -582,13 +591,13 @@ fn status(profile: &str, args: TargetArgs) -> Result<()> {
         orchestrated_group::memory_dir(&ctx.info)?.display()
     );
     println!("Board:        {} messages", board.highest_seq(&ctx.info.id));
-    match ctx.chief() {
-        Some(c) => println!("Chief:        {} ({}) {:?}", c.title, c.id, c.status),
-        None => println!("Chief:        (none)"),
+    match ctx.orchestrator() {
+        Some(c) => println!("Orchestrator:        {} ({}) {:?}", c.title, c.id, c.status),
+        None => println!("Orchestrator:        (none)"),
     }
     let workers: Vec<&Instance> = orchestrated_group::members(&ctx.group, &ctx.instances)
         .into_iter()
-        .filter(|i| i.id != ctx.chief_id())
+        .filter(|i| i.id != ctx.orchestrator_id())
         .collect();
     println!("Workers:      {}", workers.len());
     for w in workers {

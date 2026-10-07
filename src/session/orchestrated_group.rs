@@ -1,4 +1,4 @@
-//! OrchestratedGroups: a group run by a Chief of Staff session that delegates to worker
+//! OrchestratedGroups: a group run by an Orchestrator Agent session that delegates to worker
 //! sessions and coordinates through a durable message board.
 
 use std::path::{Path, PathBuf};
@@ -28,7 +28,7 @@ pub struct OrchestrationInfo {
     /// Stable board topic and memory directory name; survives group renames.
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chief_session_id: Option<String>,
+    pub orchestrator_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub brief: Option<String>,
 }
@@ -37,7 +37,7 @@ impl OrchestrationInfo {
     pub fn new(brief: Option<String>) -> Self {
         Self {
             id: uuid::Uuid::new_v4().simple().to_string(),
-            chief_session_id: None,
+            orchestrator_session_id: None,
             brief,
         }
     }
@@ -77,7 +77,7 @@ pub struct BoardMessage {
     /// Session id, [`SYSTEM_AUTHOR`] or [`USER_AUTHOR`].
     pub from: String,
     pub from_title: String,
-    /// Session id or [`ALL_WORKERS`]; `None` addresses the chief.
+    /// Session id or [`ALL_WORKERS`]; `None` addresses the orchestrator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
     pub body: String,
@@ -85,15 +85,15 @@ pub struct BoardMessage {
 }
 
 impl BoardMessage {
-    /// Whether `reader` should receive this message. The chief gets everything
+    /// Whether `reader` should receive this message. The orchestrator gets everything
     /// addressed to it or to nobody; workers get direct and broadcast messages.
-    pub fn is_for(&self, reader: &str, chief: &str) -> bool {
+    pub fn is_for(&self, reader: &str, orchestrator: &str) -> bool {
         if self.from == reader {
             return false;
         }
         match self.to.as_deref() {
-            None => reader == chief,
-            Some(ALL_WORKERS) => reader != chief,
+            None => reader == orchestrator,
+            Some(ALL_WORKERS) => reader != orchestrator,
             Some(to) => to == reader,
         }
     }
@@ -155,7 +155,7 @@ pub fn ensure_memory(info: &OrchestrationInfo, group_path: &str) -> Result<PathB
         std::fs::write(
             &index,
             format!(
-                "# {group_path} memory\n\nCurated by the Chief of Staff. Keep this file a short index; \
+                "# {group_path} memory\n\nCurated by the Orchestrator Agent. Keep this file a short index; \
                  put detail in sibling topic files.\n\n## Brief\n\n{brief}\n\n## Index\n"
             ),
         )?;
@@ -188,17 +188,17 @@ pub fn find_for_path<'a>(groups: &'a [Group], group_path: &str) -> Option<&'a Gr
     }
 }
 
-/// Sessions taking part in `group`'s board: its chief plus everything under the group.
+/// Sessions taking part in `group`'s board: its orchestrator plus everything under the group.
 pub fn members<'a>(group: &Group, instances: &'a [Instance]) -> Vec<&'a Instance> {
     let prefix = format!("{}/", group.path);
-    let chief = group
+    let orchestrator = group
         .orchestration
         .as_ref()
-        .and_then(|p| p.chief_session_id.as_deref());
+        .and_then(|p| p.orchestrator_session_id.as_deref());
     instances
         .iter()
         .filter(|i| {
-            Some(i.id.as_str()) == chief
+            Some(i.id.as_str()) == orchestrator
                 || i.group_path == group.path
                 || i.group_path.starts_with(&prefix)
         })
@@ -289,14 +289,14 @@ impl Board {
         &self,
         topic: &str,
         reader: &str,
-        chief: &str,
+        orchestrator: &str,
     ) -> Result<(Vec<(u64, BoardMessage)>, u64)> {
         let after = self.cursor(topic, reader)?;
         let all = self.read(topic, after, None);
         let high = all.last().map(|(s, _)| *s).unwrap_or(after);
         let mine = all
             .into_iter()
-            .filter(|(_, m)| m.is_for(reader, chief))
+            .filter(|(_, m)| m.is_for(reader, orchestrator))
             .collect();
         Ok((mine, high))
     }
@@ -329,13 +329,17 @@ fn identity_line(aoe: &str, session_id: &str) -> String {
     )
 }
 
-pub fn chief_bootstrap_prompt(group_path: &str, info: &OrchestrationInfo, memory: &Path) -> String {
+pub fn orchestrator_bootstrap_prompt(
+    group_path: &str,
+    info: &OrchestrationInfo,
+    memory: &Path,
+) -> String {
     let brief = info
         .brief
         .as_deref()
         .unwrap_or("(no brief yet; ask the user)");
     format!(
-        "You are the Chief of Staff for the aoe OrchestratedGroup '{group_path}'. Use the \
+        "You are the Orchestrator Agent for the aoe OrchestratedGroup '{group_path}'. Use the \
          `{SKILL_DIR}` skill. You plan, delegate to worker sessions with `aoe og spawn`, \
          review their results and keep project memory. Do not write code yourself.\n\n\
          Brief: {brief}\n\n\
@@ -346,10 +350,10 @@ pub fn chief_bootstrap_prompt(group_path: &str, info: &OrchestrationInfo, memory
     )
 }
 
-pub fn worker_task_prompt(group_path: &str, chief_title: &str, task: &str) -> String {
+pub fn worker_task_prompt(group_path: &str, orchestrator_title: &str, task: &str) -> String {
     format!(
-        "You are a worker in the aoe OrchestratedGroup '{group_path}', managed by the Chief of \
-         Staff session '{chief_title}'. Use the `{SKILL_DIR}` skill.\n\n\
+        "You are a worker in the aoe OrchestratedGroup '{group_path}', managed by the Orchestrator of \
+         Staff session '{orchestrator_title}'. Use the `{SKILL_DIR}` skill.\n\n\
          Task:\n{task}\n\n\
          When blocked, `aoe og post --kind question \"...\"` and end your turn; the answer will be \
          delivered to you. When done, `aoe og post --kind result \"<summary, branch, test status>\"` \
@@ -377,32 +381,36 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut board = Board::open_at(&tmp.path().join("b.db")).unwrap();
         let t = "topic";
-        // (message, chief receives, w1 receives, w2 receives)
+        // (message, orchestrator receives, w1 receives, w2 receives)
         let cases = [
             (msg("w1", None), true, false, false),
-            (msg("chief", Some("w1")), false, true, false),
-            (msg("chief", Some(ALL_WORKERS)), false, true, true),
+            (msg("orchestrator", Some("w1")), false, true, false),
+            (msg("orchestrator", Some(ALL_WORKERS)), false, true, true),
             (msg("user", None), true, false, false),
             (msg("w2", Some(ALL_WORKERS)), false, true, false),
         ];
         for (m, ..) in &cases {
             board.post(t, m).unwrap();
         }
-        for (reader, col) in [("chief", 0), ("w1", 1), ("w2", 2)] {
+        for (reader, col) in [("orchestrator", 0), ("w1", 1), ("w2", 2)] {
             let want: Vec<u64> = cases
                 .iter()
                 .enumerate()
                 .filter(|(_, c)| [c.1, c.2, c.3][col])
                 .map(|(i, _)| i as u64 + 1)
                 .collect();
-            let (got, high) = board.pending_for(t, reader, "chief").unwrap();
+            let (got, high) = board.pending_for(t, reader, "orchestrator").unwrap();
             assert_eq!(
                 got.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
                 want,
                 "{reader}"
             );
             board.advance_cursor(t, reader, high).unwrap();
-            assert!(board.pending_for(t, reader, "chief").unwrap().0.is_empty());
+            assert!(board
+                .pending_for(t, reader, "orchestrator")
+                .unwrap()
+                .0
+                .is_empty());
         }
         board.advance_cursor(t, "w1", 1).unwrap();
         assert_eq!(board.cursor(t, "w1").unwrap(), 5);

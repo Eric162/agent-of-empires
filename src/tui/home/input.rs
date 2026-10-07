@@ -1053,6 +1053,9 @@ impl HomeView {
                         }
                     }
                     self.trash_session_by_id(&session_id);
+                    if cascade {
+                        self.remove_group_of_orchestrator(&session_id);
+                    }
                 }
                 None
             }
@@ -4205,6 +4208,10 @@ impl HomeView {
                     } else {
                         self.selected_group = Some(path.clone());
                         self.selected_group_profile = self.profile_for_cursor(self.cursor);
+                        // An orchestrated header selects its orchestrator too, so Enter,
+                        // the preview and delete act on it.
+                        self.selected_session = self
+                            .orchestrator_of_group(path, self.selected_group_profile.as_deref());
                     }
                 }
             }
@@ -4233,12 +4240,18 @@ impl HomeView {
     pub(super) fn reseat_cursor_after_rebuild(&mut self) {
         if let Some(sid) = self.selected_session.clone() {
             for (idx, item) in self.flat_items.iter().enumerate() {
-                if let Item::Session { id, .. } = item {
-                    if *id == sid {
-                        self.cursor = idx;
-                        self.update_selected();
-                        return;
+                let hit = match item {
+                    Item::Session { id, .. } => *id == sid,
+                    Item::Group { path, profile, .. } => {
+                        self.orchestrator_of_group(path, profile.as_deref())
+                            .as_deref()
+                            == Some(sid.as_str())
                     }
+                };
+                if hit {
+                    self.cursor = idx;
+                    self.update_selected();
+                    return;
                 }
             }
             if let Some(header) = self.header_row_for_hidden_session(&sid) {
@@ -5301,6 +5314,7 @@ impl HomeView {
                 let delete_to_trash = session_cfg.delete_to_trash;
                 if delete_to_trash && !already_trashed {
                     let sid = session_id.clone();
+                    let orchestrator = self.is_orchestrator(&sid);
                     let workers = self.live_worker_ids_of(&sid).len();
                     // With session.confirm_delete on (the default), guard the trash with
                     // a confirmation instead of trashing on the keystroke. The delete key
@@ -5322,10 +5336,10 @@ impl HomeView {
                                 "trash_session",
                             )
                             .buttons("Delete", "Cancel");
-                        if workers > 0 {
+                        if orchestrator {
                             dialog = dialog.checkbox_checked(
                                 CASCADE_WORKERS,
-                                &format!("Also trash its {workers} worker session(s)"),
+                                &crate::tui::dialogs::cascade_label("Trash", workers),
                             );
                         }
                         self.confirm_dialog = Some(dialog.offering_dont_ask_again());
@@ -5335,6 +5349,7 @@ impl HomeView {
                         self.trash_session_by_id(&worker);
                     }
                     self.trash_session_by_id(&sid);
+                    self.remove_group_of_orchestrator(&sid);
                     return;
                 }
 
@@ -5348,7 +5363,9 @@ impl HomeView {
                     has_sandbox: inst.sandbox_info.as_ref().is_some_and(|s| s.enabled),
                     project_path: Some(inst.project_path.clone()),
                     is_scratch: inst.scratch,
-                    worker_count: self.worker_ids_of(session_id).len(),
+                    orchestrator_workers: self
+                        .is_orchestrator(session_id)
+                        .then(|| self.worker_ids_of(session_id).len()),
                 };
 
                 let profile = self.config_profile();

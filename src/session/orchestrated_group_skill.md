@@ -1,13 +1,15 @@
 ---
 name: aoe-orchestrated-group
-description: Coordinate an aoe OrchestratedGroup. Use when you are the Chief of Staff or a worker session in an aoe OrchestratedGroup, or when asked to delegate work to aoe worker sessions, post to or read the project board, or manage project groups.
+description: Coordinate an aoe OrchestratedGroup. Use when you are the Orchestrator Agent or a worker session in an aoe OrchestratedGroup, or when asked to delegate work to aoe worker sessions, post to or read the project board, or manage project groups.
 ---
 
 # aoe OrchestratedGroup
 
-A OrchestratedGroup is an aoe group with one Chief of Staff session and any number of
-worker sessions. They coordinate through a durable message board. `aoe og`
-commands infer your group and identity from the session you run them in.
+An OrchestratedGroup is an aoe group with one Orchestrator Agent session and any number of
+worker sessions. The orchestrator is the project's chief of staff: it plans,
+delegates, reviews and keeps memory, while workers do the hands-on work. They
+coordinate through a durable message board. `aoe og` commands infer your group
+and identity from the session you run them in.
 
 Board messages addressed to you and worker completions are delivered into your
 session automatically once you are idle, as lines starting with `[board]`. Reply
@@ -18,10 +20,10 @@ them: end your turn.
 
 | Command | Use |
 |---|---|
-| `aoe og status` | Group, chief, workers and their status, board size |
+| `aoe og status` | Group, orchestrator, workers and their status, board size |
 | `aoe og board [--after N] [--limit N]` | Read the board |
-| `aoe og post --kind <kind> [--to <session or all>] "<text>"` | Post; no `--to` means the chief |
-| `aoe og spawn --title <t> [--branch <b>] [--no-worktree] [--tool <agent>] [--structured-view] "<task>"` | Chief only: start a worker with a task |
+| `aoe og post --kind <kind> [--to <session or all>] "<text>"` | Post; no `--to` means the orchestrator |
+| `aoe og spawn --title <t> [--branch <b>] [--no-worktree] [--tool <agent>] [--structured-view] "<task>"` | Orchestrator only: start a worker with a task |
 | `aoe og memory` | Print the memory directory |
 | `aoe session capture <worker>` | Read a worker's recent terminal output |
 | `aoe group list`, `aoe group move <session> <group>` | Group management |
@@ -29,14 +31,15 @@ them: end your turn.
 
 Kinds: `task`, `status`, `question`, `answer`, `result`, `learning`, `note`.
 
-## Chief of Staff
+## Orchestrator Agent
 
 1. Read `MEMORY.md` in the memory directory at start and after long gaps.
 2. Split work into independent tasks a worker can finish alone. Each task brief
    states the goal, acceptance criteria, relevant files and how to test. Workers
    do not see your conversation.
-3. `aoe og spawn` one worker per task. Workers get their own worktree branch by
-   default; keep parallel tasks off the same files.
+3. `aoe og spawn` one worker per task, titled by what it does (`Country model`,
+   not `lint-fix Country model`); aoe already shows workers under you. Workers get
+   their own worktree branch by default; keep parallel tasks off the same files.
 4. End your turn. You will receive `[system]` messages when a worker goes idle,
    needs input or errors, plus any `question` or `result` posts.
 5. Answer questions with `aoe og post --kind answer --to <worker> "..."`.

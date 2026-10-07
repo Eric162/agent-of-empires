@@ -18,7 +18,7 @@ pub struct DeleteOptions {
     pub delete_sandbox: bool,
     /// Keep the scratch directory on disk. Only read when `is_scratch`.
     pub keep_scratch: bool,
-    /// Also delete an orchestrator's worker sessions. Only read when `worker_count > 0`.
+    /// Also delete an orchestrator's group and worker sessions. Only read for an orchestrator.
     pub delete_workers: bool,
 }
 
@@ -30,8 +30,18 @@ pub struct DeleteDialogConfig {
     /// Surfaces the "Keep scratch directory" opt-in, off by default so the
     /// normal flow stays one keystroke.
     pub is_scratch: bool,
-    /// Worker sessions of an orchestrator; surfaces a default-on cascade option.
-    pub worker_count: usize,
+    /// Worker count of an orchestrator, `None` for any other session; surfaces a
+    /// default-on option to remove the group and its workers.
+    pub orchestrator_workers: Option<usize>,
+}
+
+/// Label for the orchestrator cascade option, e.g. "Delete the group and its 3 workers".
+pub fn cascade_label(verb: &str, workers: usize) -> String {
+    match workers {
+        0 => format!("{verb} the orchestrated group too"),
+        1 => format!("{verb} the group and its worker"),
+        n => format!("{verb} the group and its {n} workers"),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,10 +89,10 @@ impl UnifiedDeleteDialog {
                 && user_config.worktree.delete_branch_on_cleanup,
             delete_sandbox: config.has_sandbox && user_config.sandbox.auto_cleanup,
             keep_scratch: false,
-            delete_workers: config.worker_count > 0,
+            delete_workers: config.orchestrator_workers.is_some(),
         };
 
-        let initial_focus = if config.worker_count > 0 {
+        let initial_focus = if config.orchestrator_workers.is_some() {
             FocusElement::WorkersCheckbox
         } else if config.worktree_branch.is_some() {
             FocusElement::WorktreeCheckbox
@@ -183,7 +193,7 @@ impl UnifiedDeleteDialog {
         options: &DeleteOptions,
     ) -> Vec<FocusElement> {
         let mut elements = Vec::new();
-        if config.worker_count > 0 {
+        if config.orchestrator_workers.is_some() {
             elements.push(FocusElement::WorkersCheckbox);
         }
         if config.worktree_branch.is_some() {
@@ -304,7 +314,7 @@ impl UnifiedDeleteDialog {
         let has_worktree = self.config.worktree_branch.is_some();
         let has_sandbox = self.config.has_sandbox;
         let is_scratch = self.config.is_scratch;
-        let has_workers = self.config.worker_count > 0;
+        let has_workers = self.config.orchestrator_workers.is_some();
         let show_force = has_worktree && self.options.delete_worktree;
         // Count checkbox rows: worktree + force (if worktree checked) +
         // branch (if worktree exists) + sandbox + keep-scratch (if scratch).
@@ -362,7 +372,7 @@ impl UnifiedDeleteDialog {
             if has_workers {
                 let area = chunks[chunk_idx];
                 let focused = self.focus == FocusElement::WorkersCheckbox;
-                let label = format!("Delete its {} worker session(s)", self.config.worker_count);
+                let label = cascade_label("Delete", self.config.orchestrator_workers.unwrap_or(0));
                 self.render_checkbox(
                     frame,
                     area,
@@ -590,7 +600,7 @@ mod tests {
                 has_sandbox: true,
                 project_path: None,
                 is_scratch: false,
-                worker_count: 0,
+                orchestrator_workers: None,
             },
             "default",
         )
@@ -604,7 +614,7 @@ mod tests {
                 has_sandbox: false,
                 project_path: None,
                 is_scratch: true,
-                worker_count: 0,
+                orchestrator_workers: None,
             },
             "default",
         )
@@ -637,9 +647,9 @@ mod tests {
     #[test]
     fn worker_cascade_starts_checked_focused_and_toggles() {
         let mut dialog = UnifiedDeleteDialog::new(
-            "Chief".to_string(),
+            "Orchestrator".to_string(),
             DeleteDialogConfig {
-                worker_count: 3,
+                orchestrator_workers: Some(3),
                 ..DeleteDialogConfig::default()
             },
             "default",

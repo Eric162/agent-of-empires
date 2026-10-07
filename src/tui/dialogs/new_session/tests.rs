@@ -72,7 +72,7 @@ fn draw(dialog: &mut NewSessionDialog) -> ratatui::buffer::Buffer {
 #[test]
 fn orchestrate_requires_a_group_and_marks_the_submit() {
     let mut dialog = single_tool_dialog();
-    dialog.title = Input::new("chief".to_string());
+    dialog.title = Input::new("orchestrator".to_string());
     let fields = dialog.field_indices();
     dialog.focused_field = fields.orchestrated;
     dialog.handle_key(key(KeyCode::Char(' ')));

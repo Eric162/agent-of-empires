@@ -1088,7 +1088,14 @@ pub static BINDINGS: &[Binding] = &[
         }),
         palette: Some(PaletteMeta {
             title: "Orchestration panel (board / memory)",
-            keywords: &["orchestrated", "chief", "board", "memory", "panel", "side"],
+            keywords: &[
+                "orchestrated",
+                "orchestrator",
+                "board",
+                "memory",
+                "panel",
+                "side",
+            ],
             group: PaletteGroup::Views,
         }),
     },
@@ -1103,7 +1110,7 @@ pub static BINDINGS: &[Binding] = &[
         }),
         palette: Some(PaletteMeta {
             title: "Post to orchestration board",
-            keywords: &["orchestrated", "chief", "board", "post", "message"],
+            keywords: &["orchestrated", "orchestrator", "board", "post", "message"],
             group: PaletteGroup::Actions,
         }),
     },

@@ -657,6 +657,7 @@ impl HomeView {
                 for worker in self.worker_ids_of(&id) {
                     self.delete_worker_with_defaults(&worker);
                 }
+                self.remove_group_of_orchestrator(&id);
             }
         }
         Ok(())

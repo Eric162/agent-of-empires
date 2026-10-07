@@ -136,7 +136,7 @@ pub enum Commands {
         command: GroupCommands,
     },
 
-    /// Run an OrchestratedGroup: a Chief of Staff session coordinating worker sessions
+    /// Run an OrchestratedGroup: an Orchestrator Agent session coordinating worker sessions
     #[command(name = "orchestrated-group", alias = "og")]
     OrchestratedGroup {
         #[command(subcommand)]

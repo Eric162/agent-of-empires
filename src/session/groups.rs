@@ -84,7 +84,7 @@ pub struct Group {
     pub collapsed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<DateTime<Utc>>,
-    /// Set when this group is an OrchestratedGroup run by a Chief of Staff session.
+    /// Set when this group is an OrchestratedGroup run by an Orchestrator Agent session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestration: Option<super::orchestrated_group::OrchestrationInfo>,
     #[serde(skip)]
@@ -924,28 +924,17 @@ fn flatten_group(
         .collect();
 
     sort_sessions(&mut group_sessions, sort_order);
-    // The Chief of Staff leads its group in every sort mode.
-    let chief = group
+    // An orchestrated group's header stands in for its orchestrator, so the orchestrator
+    // gets no row of its own and its workers lead the group.
+    let orchestrator = group
         .orchestration
         .as_ref()
-        .and_then(|o| o.chief_session_id.as_deref());
-    if let Some(pos) = group_sessions
-        .iter()
-        .position(|i| Some(i.id.as_str()) == chief)
-    {
-        let chief = group_sessions.remove(pos);
-        group_sessions.insert(0, chief);
-    }
-    // Its workers follow it, one level deeper.
-    let is_worker = |i: &Instance| chief.is_some() && i.parent_session_id.as_deref() == chief;
-    let (workers, others): (Vec<&Instance>, Vec<&Instance>) =
-        group_sessions.into_iter().partition(|i| is_worker(i));
-    let chief_rows = usize::from(chief.is_some() && others.first().map(|i| i.id.as_str()) == chief);
-    let rows = others[..chief_rows]
-        .iter()
-        .map(|i| (*i, depth + 1))
-        .chain(workers.iter().map(|i| (*i, depth + 2)))
-        .chain(others[chief_rows..].iter().map(|i| (*i, depth + 1)));
+        .and_then(|o| o.orchestrator_session_id.as_deref());
+    group_sessions.retain(|i| Some(i.id.as_str()) != orchestrator);
+    let (workers, others): (Vec<&Instance>, Vec<&Instance>) = group_sessions
+        .into_iter()
+        .partition(|i| orchestrator.is_some() && i.parent_session_id.as_deref() == orchestrator);
+    let rows = workers.into_iter().chain(others).map(|i| (i, depth + 1));
     for (inst, depth) in rows {
         items.push(Item::Session {
             id: inst.id.clone(),
@@ -1282,41 +1271,28 @@ mod tests {
     }
 
     #[test]
-    fn orchestrated_group_chief_leads_in_every_sort_order() {
+    fn orchestrated_group_header_replaces_the_orchestrator_row() {
         let mut instances = vec![inst("a", "crew"), inst("b", "crew"), inst("z", "crew")];
-        let chief = instances[2].id.clone();
-        instances[1].parent_session_id = Some(chief.clone());
+        let orchestrator = instances[2].id.clone();
+        instances[1].parent_session_id = Some(orchestrator.clone());
         let worker = instances[1].id.clone();
         let mut group = Group::new("crew", "crew");
         group.orchestration = Some(super::super::orchestrated_group::OrchestrationInfo {
-            chief_session_id: Some(chief.clone()),
+            orchestrator_session_id: Some(orchestrator.clone()),
             ..super::super::orchestrated_group::OrchestrationInfo::new(None)
         });
         let tree = GroupTree::new_with_groups(&instances, &[group]);
-        for order in [
-            SortOrder::AZ,
-            SortOrder::Oldest,
-            SortOrder::Newest,
-            SortOrder::Custom,
-        ] {
-            let items = flatten_tree(&tree, &instances, order);
-            let first = items.iter().find_map(|i| match i {
-                Item::Session { id, .. } => Some(id.as_str()),
-                _ => None,
-            });
-            assert_eq!(first, Some(chief.as_str()), "{order:?}");
-            let rows: Vec<(&str, usize)> = items
-                .iter()
+        for order in [SortOrder::AZ, SortOrder::Oldest, SortOrder::Newest] {
+            let rows: Vec<String> = flatten_tree(&tree, &instances, order)
+                .into_iter()
                 .filter_map(|i| match i {
-                    Item::Session { id, depth } => Some((id.as_str(), *depth)),
+                    Item::Session { id, depth: 1 } => Some(id),
                     _ => None,
                 })
                 .collect();
-            assert_eq!(
-                rows[1],
-                (worker.as_str(), 2),
-                "{order:?}: worker nests under chief"
-            );
+            assert_eq!(rows.len(), 2, "{order:?}: orchestrator has no row");
+            assert_eq!(rows[0], worker, "{order:?}: workers lead");
+            assert!(!rows.contains(&orchestrator));
         }
     }
 

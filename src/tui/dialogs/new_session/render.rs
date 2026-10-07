@@ -123,7 +123,7 @@ impl NewSessionDialog {
         }
         constraints.push(Constraint::Length(2)); // Group
         if !self.scratch {
-            constraints.push(Constraint::Length(2)); // Orchestrate checkbox
+            constraints.push(Constraint::Length(2)); // Orchestrator checkbox
         }
 
         // Inner width is 76: dialog width less borders and margin. The hint
@@ -435,7 +435,7 @@ impl NewSessionDialog {
             };
             let line = Line::from(vec![
                 Span::styled(
-                    "Orchestrate:",
+                    "Orchestrator:",
                     if focused {
                         Style::default().fg(theme.accent).underlined()
                     } else {
@@ -444,7 +444,7 @@ impl NewSessionDialog {
                 ),
                 Span::raw(" "),
                 Span::styled(if on { "[x]" } else { "[ ]" }, accent_if_on(on).bold()),
-                Span::styled(" Chief of Staff for this group", accent_if_on(on)),
+                Span::styled(" Create as orchestrator agent", accent_if_on(on)),
             ]);
             let area = chunks[ci];
             frame.render_widget(Paragraph::new(line), area);

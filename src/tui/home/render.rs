@@ -342,6 +342,18 @@ fn clamp_scroll_to_capture(
     scroll_offset.min(real_max)
 }
 
+/// Status glyph and color for an orchestrator shown as its group's header.
+fn orchestrator_glyph(inst: &crate::session::Instance, theme: &Theme) -> (&'static str, Color) {
+    match inst.status {
+        Status::Running => (spinner_running(&inst.created_at), theme.running),
+        Status::Waiting => (spinner_waiting(&inst.created_at), theme.waiting),
+        Status::Error => (ICON_ERROR, theme.error),
+        Status::Stopped => (ICON_STOPPED, theme.dimmed),
+        Status::Starting | Status::Creating => (spinner_starting(&inst.created_at), theme.dimmed),
+        _ => (ICON_IDLE, theme.idle),
+    }
+}
+
 fn spinner_running(created_at: &DateTime<Utc>) -> &'static str {
     spinners::dots()
         .set_interval(Duration::from_millis(220))
@@ -1600,6 +1612,7 @@ impl HomeView {
 
         use std::borrow::Cow;
 
+        let mut return_header: Option<(&str, Cow<str>, Style)> = None;
         let (icon, text, style): (&str, Cow<str>, Style) = match item {
             Item::Group {
                 path,
@@ -1645,6 +1658,20 @@ impl HomeView {
                 } else {
                     Cow::Owned(format!("{} ({})", name, session_count))
                 };
+                // An orchestrated group's header stands in for its orchestrator: its status
+                // glyph and color, with the collapse state moved to a trailing marker.
+                if let Some(orchestrator) = self
+                    .orchestrator_of_group(path, profile.as_deref())
+                    .and_then(|id| self.get_instance(&id))
+                {
+                    let (glyph, color) = orchestrator_glyph(orchestrator, theme);
+                    let marker = if *collapsed { " ▸" } else { "" };
+                    return_header = Some((
+                        glyph,
+                        Cow::Owned(format!("{name} ({session_count}){marker}")),
+                        Style::default().fg(color).bold(),
+                    ));
+                }
                 let mut style = Style::default().fg(theme.group).bold();
                 // Shelf headers and their nested project sub-folders sit below the sort
                 // divider, so their placement already reads as shelved; render them like
@@ -1655,7 +1682,7 @@ impl HomeView {
                         .add_modifier(ratatui::style::Modifier::ITALIC)
                         .add_modifier(ratatui::style::Modifier::DIM);
                 }
-                (icon, text, style)
+                return_header.unwrap_or((icon, text, style))
             }
             Item::Session { id, .. } => {
                 if let Some(inst) = self.get_instance(id) {

@@ -94,8 +94,8 @@ pub(super) const FIELD_HELP: &[FieldHelp] = &[
         description: "Optional grouping for organization (Ctrl+P to browse existing groups)",
     },
     FieldHelp {
-        name: "Orchestrate",
-        description: "Start a Chief of Staff that delegates to worker sessions in this group",
+        name: "Orchestrator",
+        description: "Start an Orchestrator Agent that delegates to worker sessions in this group",
     },
 ];
 
@@ -129,7 +129,7 @@ pub struct NewSessionData {
     /// Create in the structured (ACP) view instead of a tmux terminal. Only
     /// true for ACP-capable tools; `validate_structured_choice` enforces it.
     pub structured: bool,
-    /// Start a Chief of Staff for `group` instead of a plain session.
+    /// Start an Orchestrator Agent for `group` instead of a plain session.
     pub orchestrated: bool,
 }
 
@@ -2038,7 +2038,7 @@ impl NewSessionDialog {
     /// An orchestrated group needs a group to run and a repository for its workers.
     fn validate_orchestrated(&mut self) -> bool {
         if self.orchestrated && !self.scratch && self.group.value().trim().is_empty() {
-            self.error_message = Some("Orchestrate needs a group name".to_string());
+            self.error_message = Some("An orchestrator agent needs a group name".to_string());
             self.focused_field = self.field_indices().group;
             return false;
         }
