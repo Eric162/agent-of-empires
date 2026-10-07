@@ -67,6 +67,13 @@ pub struct InitArgs {
     /// Chief session title
     #[arg(long, short = 't')]
     title: Option<String>,
+    /// Run the chief in a worktree on this integration branch (created if missing);
+    /// workers then branch from it
+    #[arg(long, short = 'w')]
+    worktree: Option<String>,
+    /// Base for a newly created --worktree branch (defaults to the repo's default branch)
+    #[arg(long = "base-branch", requires = "worktree")]
+    base_branch: Option<String>,
     #[command(flatten)]
     agent: AgentArgs,
 }
@@ -366,6 +373,16 @@ async fn init(profile: &str, args: InitArgs) -> Result<()> {
         group_path.clone(),
         "-l".into(),
     ];
+    if let Some(branch) = &args.worktree {
+        let repo = crate::git::GitWorktree::new(path.canonicalize()?)?;
+        add.extend(["-w".into(), branch.clone()]);
+        if !repo.branch_exists(branch)? {
+            add.push("-b".into());
+            if let Some(base) = &args.base_branch {
+                add.extend(["--base-branch".into(), base.clone()]);
+            }
+        }
+    }
     add.extend(agent_flags(&args.agent));
     add_session(profile, add).await?;
     let chief = newest_session(profile, &title, &group_path)?;
@@ -431,8 +448,13 @@ async fn spawn(profile: &str, args: SpawnArgs) -> Result<()> {
         }
     }
 
+    // From the main checkout so worker worktrees sit beside the chief's, not inside it.
+    let repo_path = chief
+        .worktree_info
+        .as_ref()
+        .map_or(chief.project_path.clone(), |wt| wt.main_repo_path.clone());
     let mut add = vec![
-        chief.project_path.clone(),
+        repo_path,
         "-t".into(),
         args.title.clone(),
         "-P".into(),
@@ -445,6 +467,9 @@ async fn spawn(profile: &str, args: SpawnArgs) -> Result<()> {
             .clone()
             .unwrap_or_else(|| format!("pg/{}", slug(&args.title)));
         add.extend(["-w".into(), branch, "-b".into()]);
+        if let Some(wt) = &chief.worktree_info {
+            add.extend(["--base-branch".into(), wt.branch.clone()]);
+        }
     }
     add.extend(agent_flags(&args.agent));
     add_session(&ctx.profile, add).await?;
