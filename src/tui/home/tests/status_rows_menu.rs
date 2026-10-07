@@ -1363,12 +1363,19 @@ fn trash_header_d_and_palette_open_empty_trash_confirm() {
 
 /// A trashed row whose repo is gone fails every delete, so Empty Trash escalates it one
 /// opt-in step per attempt: plain delete, forced delete, then removal from aoe. A peer
-/// restore between the last confirm and its submit keeps the row.
+/// restore between the last confirm and its submit keeps the row, and a peer holding the
+/// lifecycle lock delays the removal without blocking input.
 #[test]
 #[serial]
 fn empty_trash_escalates_a_row_that_keeps_failing() {
     use std::time::{Duration, Instant};
-    for peer_restores in [false, true] {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Peer {
+        Idle,
+        Restores,
+        HoldsLock,
+    }
+    for peer in [Peer::Idle, Peer::Restores, Peer::HoldsLock] {
         let mut env = create_test_env_with_sessions(2);
         let id = env.view.instance_at(0).id.clone();
         let storage = Storage::new_unwatched("test").unwrap();
@@ -1421,7 +1428,9 @@ fn empty_trash_escalates_a_row_that_keeps_failing() {
                 dialog.handle_key(key(KeyCode::Down));
                 dialog.handle_key(key(KeyCode::Char(' ')));
             }
-            if round == 2 && peer_restores {
+            let peer_lock = (round == 2 && peer == Peer::HoldsLock)
+                .then(|| storage.acquire_instance_lifecycle_lock(&id).unwrap());
+            if round == 2 && peer == Peer::Restores {
                 storage
                     .update(|instances, _| {
                         instances
@@ -1436,12 +1445,18 @@ fn empty_trash_escalates_a_row_that_keeps_failing() {
             env.view.handle_key(key(KeyCode::Char('y')), None);
 
             if round == 2 {
-                assert_eq!(
-                    durable(&storage).is_some(),
-                    peer_restores,
-                    "only a peer restore keeps the durable row"
-                );
-                assert_eq!(env.view.get_instance(&id).is_some(), peer_restores);
+                // The submit returned with the lock still held; the row leaves only when
+                // the drop worker's result lands.
+                assert!(env.view.get_instance(&id).is_some(), "{peer:?}");
+                drop(peer_lock);
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !env.view.apply_drop_results() {
+                    assert!(Instant::now() < deadline, "{peer:?}: no drop result");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                let kept = peer == Peer::Restores;
+                assert_eq!(durable(&storage).is_some(), kept, "{peer:?}");
+                assert_eq!(env.view.get_instance(&id).is_some(), kept, "{peer:?}");
                 break;
             }
             assert_eq!(

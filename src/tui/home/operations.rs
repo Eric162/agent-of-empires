@@ -894,46 +894,40 @@ impl HomeView {
     }
 
     /// Remove a trashed row whose forced delete failed, skipping worktree and branch
-    /// cleanup. The durable row is removed under its lifecycle lock and purge claim, and
-    /// only while it is still in the trash lifecycle the failure was recorded in, so a
-    /// peer restore between confirm and submit keeps the row and its processes.
+    /// cleanup. The guarded transaction runs on the drop worker, since a peer purge can
+    /// hold the lifecycle lock for its whole teardown; `apply_drop_results` lands it.
     fn drop_failed_trashed_session(&mut self, inst: &Instance) {
-        let id = inst.id.as_str();
-        let dropped = (|| -> anyhow::Result<bool> {
-            let storage = Storage::open_unwatched(&inst.source_profile)?;
-            let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(id)?;
-            let mut dropped = false;
-            storage.update(|instances, _groups| {
-                let same_lifecycle = instances
-                    .iter()
-                    .any(|stored| stored.id == id && stored.trashed_at == inst.trashed_at);
-                if same_lifecycle
-                    && matches!(
-                        crate::session::claim::decide_purge_claim(
-                            instances,
-                            id,
-                            true,
-                            chrono::Utc::now()
-                        )?,
-                        crate::session::claim::PurgeClaimDecision::Claimed(_)
-                    )
-                {
-                    instances.retain(|stored| stored.id != id);
-                    dropped = true;
-                }
-                Ok(())
-            })?;
-            Ok(dropped)
-        })();
-        match dropped {
+        self.deletes_in_flight.insert(
+            inst.id.clone(),
+            super::DeleteAttempt {
+                forced: true,
+                trashed_at: inst.trashed_at,
+            },
+        );
+        self.set_instance_status(&inst.id, Status::Deleting);
+        self.drop_poller.request(
+            inst.id.clone(),
+            DropRequest {
+                instance: inst.clone(),
+            },
+        );
+    }
+
+    pub fn apply_drop_results(&mut self) -> bool {
+        let Ok(result) = self.drop_poller.try_recv() else {
+            return false;
+        };
+        let inst = result.instance;
+        self.deletes_in_flight.remove(&inst.id);
+        self.failed_deletes.remove(&inst.id);
+        match result.dropped {
             Ok(true) => {
-                self.failed_deletes.remove(id);
-                self.instances.shift_remove(id);
+                self.instances.shift_remove(&inst.id);
                 self.rebuild_group_trees();
-                spawn_force_teardown(inst.clone());
+                spawn_force_teardown(inst);
             }
             Ok(false) => {
-                self.failed_deletes.remove(id);
+                self.set_instance_status(&inst.id, inst.status);
                 self.info_dialog = Some(InfoDialog::new(
                     "Session not removed",
                     &format!(
@@ -943,9 +937,12 @@ impl HomeView {
                 ));
             }
             Err(e) => {
-                tracing::error!(target: "tui.home", session = %id, "empty trash drop failed: {e}");
+                self.set_instance_status(&inst.id, inst.status);
+                tracing::error!(target: "tui.home", session = %inst.id, "empty trash drop failed: {e}");
             }
         }
+        self.rebuild_flat_items();
+        true
     }
 
     pub(super) fn group_has_managed_worktrees(
@@ -2415,6 +2412,59 @@ fn restore_from_trash_with_storage(
             tracing::warn!(target: "tui.home", id = %id, "restore commit failed: {error}");
             RestoreFromTrash::PersistFailed
         }
+    }
+}
+
+pub(in crate::tui) struct DropRequest {
+    instance: Instance,
+}
+
+pub(in crate::tui) struct DropResult {
+    instance: Instance,
+    dropped: anyhow::Result<bool>,
+}
+
+impl crate::tui::worker::SessionScoped for DropResult {
+    fn session_id(&self) -> &str {
+        &self.instance.id
+    }
+}
+
+/// Remove the durable row under its lifecycle lock and purge claim, and only while it is
+/// still in the trash lifecycle the failure was recorded in, so a peer restore between
+/// confirm and submit keeps the row and its processes.
+pub(super) fn perform_drop(request: DropRequest) -> DropResult {
+    let inst = request.instance;
+    let id = inst.id.as_str();
+    let dropped = (|| -> anyhow::Result<bool> {
+        let storage = Storage::open_unwatched(&inst.source_profile)?;
+        let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(id)?;
+        let mut dropped = false;
+        storage.update(|instances, _groups| {
+            let same_lifecycle = instances
+                .iter()
+                .any(|stored| stored.id == id && stored.trashed_at == inst.trashed_at);
+            if same_lifecycle
+                && matches!(
+                    crate::session::claim::decide_purge_claim(
+                        instances,
+                        id,
+                        true,
+                        chrono::Utc::now()
+                    )?,
+                    crate::session::claim::PurgeClaimDecision::Claimed(_)
+                )
+            {
+                instances.retain(|stored| stored.id != id);
+                dropped = true;
+            }
+            Ok(())
+        })?;
+        Ok(dropped)
+    })();
+    DropResult {
+        instance: inst,
+        dropped,
     }
 }
 

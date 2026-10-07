@@ -373,6 +373,10 @@ impl HomeView {
             failed_deletes: HashMap::new(),
             stop_poller: StopPoller::new(),
             trash_poller: crate::tui::trash_poller::TrashPoller::new(),
+            drop_poller: crate::tui::worker::TrackedWorker::spawn(
+                "aoe-drop-poller",
+                super::operations::perform_drop,
+            ),
             reconcile_poller: make_reconcile(),
             startup_recovery_gate: None,
             pending_reconcile_reload: false,

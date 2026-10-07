@@ -291,6 +291,8 @@ pub struct HomeView {
     pub(super) stop_poller: StopPoller,
 
     pub(super) trash_poller: crate::tui::trash_poller::TrashPoller,
+    pub(super) drop_poller:
+        crate::tui::worker::TrackedWorker<operations::DropRequest, operations::DropResult>,
     pub(super) reconcile_poller: crate::tui::reconcile_poller::ReconcilePoller,
     pub(super) startup_recovery_gate: Option<std::time::Instant>,
     pub(super) pending_reconcile_reload: bool,
