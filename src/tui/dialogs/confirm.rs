@@ -5,7 +5,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use super::DialogResult;
-use crate::tui::components::buttons::render_buttons;
+use crate::tui::components::buttons::{render_buttons_with_focus, ButtonFocus};
 use crate::tui::components::checkbox::{checkbox_line, CheckboxStyle};
 use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::styles::Theme;
@@ -312,12 +312,17 @@ impl ConfirmDialog {
                 paint_hover_bg(frame, rect, theme.selection);
             }
         }
-        let (yes, no) = render_buttons(
+        let button_focus = match self.focus {
+            Focus::Yes => ButtonFocus::Yes,
+            Focus::No => ButtonFocus::No,
+            Focus::Checkbox(_) => ButtonFocus::Neither,
+        };
+        let (yes, no) = render_buttons_with_focus(
             frame,
             chunks[chunks.len() - 1],
             theme,
             (&self.buttons.0, &self.buttons.1),
-            self.focus == Focus::Yes,
+            button_focus,
             self.hover.current(),
         );
         self.yes_button_area = yes;
@@ -534,6 +539,23 @@ mod tests {
         d.handle_key(key(KeyCode::Up));
         d.handle_key(key(KeyCode::Char(' ')));
         assert_eq!(d.checked_keys(), vec!["b"]);
+    }
+
+    #[test]
+    fn only_the_focused_button_renders_focused() {
+        // (focus, Yes emphasized, No emphasized)
+        for (focus, yes_lit, no_lit) in [
+            (Focus::Checkbox(0), false, false),
+            (Focus::Yes, true, false),
+            (Focus::No, false, true),
+        ] {
+            let mut d = dialog().checkbox("a", "A");
+            d.focus = focus;
+            let (_screen, buf, theme) = render_to(&mut d, 70, 14);
+            let fg = |rect: Rect| buf[(rect.x, rect.y)].fg;
+            assert_eq!(fg(d.yes_button_area) == theme.error, yes_lit, "{focus:?}");
+            assert_eq!(fg(d.no_button_area) == theme.running, no_lit, "{focus:?}");
+        }
     }
 
     #[test]
