@@ -52,6 +52,12 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe orchestrated-group board`↴](#aoe-orchestrated-group-board)
 * [`aoe orchestrated-group status`↴](#aoe-orchestrated-group-status)
 * [`aoe orchestrated-group memory`↴](#aoe-orchestrated-group-memory)
+* [`aoe orchestrated-group channel`↴](#aoe-orchestrated-group-channel)
+* [`aoe orchestrated-group channel create`↴](#aoe-orchestrated-group-channel-create)
+* [`aoe orchestrated-group channel list`↴](#aoe-orchestrated-group-channel-list)
+* [`aoe orchestrated-group channel close`↴](#aoe-orchestrated-group-channel-close)
+* [`aoe orchestrated-group floor`↴](#aoe-orchestrated-group-floor)
+* [`aoe orchestrated-group pass`↴](#aoe-orchestrated-group-pass)
 * [`aoe plugin`↴](#aoe-plugin)
 * [`aoe plugin list`↴](#aoe-plugin-list)
 * [`aoe plugin info`↴](#aoe-plugin-info)
@@ -846,6 +852,9 @@ Run an OrchestratedGroup: an Orchestrator Agent session coordinating worker sess
 * `board` — Read the board
 * `status` — Show the orchestrator, workers and board state
 * `memory` — Print the memory directory
+* `channel` — Side conversations whose members share one worker's worktree
+* `floor` — Show or take a channel's floor; only the holder edits files
+* `pass` — Hand a channel's floor to another member with a message
 
 
 
@@ -889,6 +898,8 @@ Start a worker session with a task (run by the orchestrator)
 * `-t`, `--title <TITLE>` — Worker session title
 * `-b`, `--branch <BRANCH>` — Worktree branch (defaults to og/<title>)
 * `--no-worktree` — Run in the orchestrator's checkout instead of a new worktree
+* `--join <JOIN>` — Join this channel, working in its owner's worktree instead of a new one
+* `--scratch` — Run in a fresh scratch directory with no repository
 * `--tool <TOOL>` — Named agent to run (defaults to your aoe default)
 * `--structured-view` — Use the structured (ACP) view instead of a terminal session
 * `--agent <AGENT>` — ACP agent for the structured view
@@ -918,6 +929,7 @@ Post a message to the board
   Possible values: `task`, `status`, `question`, `answer`, `result`, `learning`, `note`, `system`
 
 * `--to <TO>` — Recipient session (id or title), `all` for every worker; defaults to the orchestrator
+* `--channel <CHANNEL>` — Channel to post in, or `general`; defaults to the channel you were spawned into
 * `-g`, `--group <GROUP>` — OrchestratedGroup path; defaults to the group of the session this runs in
 * `--as <AS_SESSION>` — Act as this session (id or title) instead of detecting the current one
 
@@ -962,6 +974,103 @@ Print the memory directory
 
 ###### **Options:**
 
+* `-g`, `--group <GROUP>` — OrchestratedGroup path; defaults to the group of the session this runs in
+* `--as <AS_SESSION>` — Act as this session (id or title) instead of detecting the current one
+
+
+
+## `aoe orchestrated-group channel`
+
+Side conversations whose members share one worker's worktree
+
+**Usage:** `aoe orchestrated-group channel <COMMAND>`
+
+###### **Subcommands:**
+
+* `create` — Open a channel in a worker's worktree; helpers join with `og spawn --join`
+* `list` — List open channels with their members and floor holder
+* `close` — Close a channel, posting an optional summary to the general board
+
+
+
+## `aoe orchestrated-group channel create`
+
+Open a channel in a worker's worktree; helpers join with `og spawn --join`
+
+**Usage:** `aoe orchestrated-group channel create [OPTIONS] --owner <OWNER> <NAME>`
+
+###### **Arguments:**
+
+* `<NAME>` — Channel name, e.g. review-country
+
+###### **Options:**
+
+* `--owner <OWNER>` — Worker whose worktree the channel works in
+* `-g`, `--group <GROUP>` — OrchestratedGroup path; defaults to the group of the session this runs in
+* `--as <AS_SESSION>` — Act as this session (id or title) instead of detecting the current one
+
+
+
+## `aoe orchestrated-group channel list`
+
+List open channels with their members and floor holder
+
+**Usage:** `aoe orchestrated-group channel list [OPTIONS]`
+
+###### **Options:**
+
+* `-g`, `--group <GROUP>` — OrchestratedGroup path; defaults to the group of the session this runs in
+* `--as <AS_SESSION>` — Act as this session (id or title) instead of detecting the current one
+
+
+
+## `aoe orchestrated-group channel close`
+
+Close a channel, posting an optional summary to the general board
+
+**Usage:** `aoe orchestrated-group channel close [OPTIONS] <NAME>`
+
+###### **Arguments:**
+
+* `<NAME>`
+
+###### **Options:**
+
+* `--summary <SUMMARY>` — Posted to the general board as a result
+* `-g`, `--group <GROUP>` — OrchestratedGroup path; defaults to the group of the session this runs in
+* `--as <AS_SESSION>` — Act as this session (id or title) instead of detecting the current one
+
+
+
+## `aoe orchestrated-group floor`
+
+Show or take a channel's floor; only the holder edits files
+
+**Usage:** `aoe orchestrated-group floor [OPTIONS]`
+
+###### **Options:**
+
+* `--take` — Take the floor (when it is free or its holder is not working)
+* `--channel <CHANNEL>` — Channel; defaults to the one you were spawned into
+* `-g`, `--group <GROUP>` — OrchestratedGroup path; defaults to the group of the session this runs in
+* `--as <AS_SESSION>` — Act as this session (id or title) instead of detecting the current one
+
+
+
+## `aoe orchestrated-group pass`
+
+Hand a channel's floor to another member with a message
+
+**Usage:** `aoe orchestrated-group pass [OPTIONS] <MEMBER> <BODY>`
+
+###### **Arguments:**
+
+* `<MEMBER>` — Member (id or title) to hand the floor to
+* `<BODY>` — What they should do next
+
+###### **Options:**
+
+* `--channel <CHANNEL>`
 * `-g`, `--group <GROUP>` — OrchestratedGroup path; defaults to the group of the session this runs in
 * `--as <AS_SESSION>` — Act as this session (id or title) instead of detecting the current one
 

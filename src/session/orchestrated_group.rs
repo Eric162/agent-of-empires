@@ -31,6 +31,8 @@ pub struct OrchestrationInfo {
     pub orchestrator_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub brief: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channels: Vec<Channel>,
 }
 
 impl OrchestrationInfo {
@@ -39,7 +41,70 @@ impl OrchestrationInfo {
             id: uuid::Uuid::new_v4().simple().to_string(),
             orchestrator_session_id: None,
             brief,
+            channels: Vec::new(),
         }
+    }
+
+    pub fn open_channel(&self, name: &str) -> Option<&Channel> {
+        self.channels.iter().find(|c| c.name == name && !c.closed)
+    }
+
+    pub fn open_channel_mut(&mut self, name: &str) -> Option<&mut Channel> {
+        self.channels
+            .iter_mut()
+            .find(|c| c.name == name && !c.closed)
+    }
+
+    /// The open channel a session was spawned into, which its posts default to.
+    pub fn home_channel(&self, session: &str) -> Option<&Channel> {
+        self.channels
+            .iter()
+            .rev()
+            .find(|c| !c.closed && c.joiners.iter().any(|j| j == session))
+    }
+
+    /// Open channels `session` takes part in.
+    pub fn channels_of<'a>(&'a self, session: &'a str) -> impl Iterator<Item = &'a Channel> {
+        self.channels
+            .iter()
+            .filter(move |c| !c.closed && c.has(session))
+    }
+}
+
+/// A side conversation inside an orchestrated group whose members share the owner's
+/// worktree. Members take turns editing: only the floor holder writes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Channel {
+    pub name: String,
+    /// Worker whose worktree the channel works in.
+    pub owner: String,
+    /// Sessions spawned into the owner's worktree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub joiners: Vec<String>,
+    /// The member allowed to edit; `None` means free for any member to take.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub closed: bool,
+}
+
+impl Channel {
+    pub fn new(name: &str, owner: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            owner: owner.to_string(),
+            joiners: Vec::new(),
+            floor: Some(owner.to_string()),
+            closed: false,
+        }
+    }
+
+    pub fn has(&self, session: &str) -> bool {
+        self.owner == session || self.joiners.iter().any(|j| j == session)
+    }
+
+    pub fn members(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.owner.as_str()).chain(self.joiners.iter().map(String::as_str))
     }
 }
 
@@ -82,14 +147,29 @@ pub struct BoardMessage {
     pub to: Option<String>,
     pub body: String,
     pub at: DateTime<Utc>,
+    /// Channel name; `None` is the group's general board.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
 }
 
 impl BoardMessage {
-    /// Whether `reader` should receive this message. The orchestrator gets everything
-    /// addressed to it or to nobody; workers get direct and broadcast messages.
-    pub fn is_for(&self, reader: &str, orchestrator: &str) -> bool {
+    /// Whether `reader` should receive this message. On the general board the
+    /// orchestrator gets everything addressed to it or to nobody and workers get direct
+    /// and broadcast messages; in a channel, its members get everything not aimed at
+    /// someone else.
+    pub fn is_for(&self, reader: &str, info: &OrchestrationInfo) -> bool {
         if self.from == reader {
             return false;
+        }
+        let orchestrator = info.orchestrator_session_id.as_deref().unwrap_or_default();
+        if let Some(channel) = self.channel.as_deref() {
+            return match self.to.as_deref() {
+                Some(to) => to == reader,
+                None => info
+                    .channels
+                    .iter()
+                    .any(|c| c.name == channel && c.has(reader)),
+            };
         }
         match self.to.as_deref() {
             None => reader == orchestrator,
@@ -104,8 +184,13 @@ impl BoardMessage {
             .as_deref()
             .map(|t| format!(" -> {t}"))
             .unwrap_or_default();
+        let channel = self
+            .channel
+            .as_deref()
+            .map(|c| format!(" #{c}"))
+            .unwrap_or_default();
         format!(
-            "#{seq} [{}] {} ({}){to}: {}",
+            "#{seq}{channel} [{}] {} ({}){to}: {}",
             self.kind.as_str(),
             self.from_title,
             self.from,
@@ -122,7 +207,16 @@ pub fn delivery_text(msgs: &[(u64, BoardMessage)]) -> String {
             MessageKind::Note => String::new(),
             k => format!(" {}", k.as_str()),
         };
-        format!("#{seq}{kind} from {}: {}", m.from_title, m.body.trim())
+        let channel = m
+            .channel
+            .as_deref()
+            .map(|c| format!(" in #{c}"))
+            .unwrap_or_default();
+        format!(
+            "#{seq}{kind}{channel} from {}: {}",
+            m.from_title,
+            m.body.trim()
+        )
     };
     match msgs {
         [(seq, m)] => format!("[board] {}", line(*seq, m)),
@@ -289,14 +383,14 @@ impl Board {
         &self,
         topic: &str,
         reader: &str,
-        orchestrator: &str,
+        info: &OrchestrationInfo,
     ) -> Result<(Vec<(u64, BoardMessage)>, u64)> {
         let after = self.cursor(topic, reader)?;
         let all = self.read(topic, after, None);
         let high = all.last().map(|(s, _)| *s).unwrap_or(after);
         let mine = all
             .into_iter()
-            .filter(|(_, m)| m.is_for(reader, orchestrator))
+            .filter(|(_, m)| m.is_for(reader, info))
             .collect();
         Ok((mine, high))
     }
@@ -352,12 +446,22 @@ pub fn orchestrator_bootstrap_prompt(
 
 pub fn worker_task_prompt(group_path: &str, orchestrator_title: &str, task: &str) -> String {
     format!(
-        "You are a worker in the aoe OrchestratedGroup '{group_path}', managed by the Orchestrator of \
-         Staff session '{orchestrator_title}'. Use the `{SKILL_DIR}` skill.\n\n\
+        "You are a worker in the aoe OrchestratedGroup '{group_path}', managed by the Orchestrator \
+         Agent session '{orchestrator_title}'. Use the `{SKILL_DIR}` skill.\n\n\
          Task:\n{task}\n\n\
          When blocked, `aoe og post --kind question \"...\"` and end your turn; the answer will be \
          delivered to you. When done, `aoe og post --kind result \"<summary, branch, test status>\"` \
          exactly once, then end your turn."
+    )
+}
+
+/// Appended to a worker's task when it joins a channel in someone else's worktree.
+pub fn channel_join_prompt(channel: &str, owner_title: &str) -> String {
+    format!(
+        "\n\nYou share the worktree of '{owner_title}' in channel #{channel}. You hold the floor \
+         now: only the floor holder edits files. Talk in the channel with `aoe og post` (it \
+         defaults to #{channel}); when you want the owner to continue, `aoe og pass \
+         \"{owner_title}\" \"<what to do>\"` and end your turn."
     )
 }
 
@@ -373,7 +477,17 @@ mod tests {
             to: to.map(Into::into),
             body: "hi".into(),
             at: Utc::now(),
+            channel: None,
         }
+    }
+
+    fn info_with_channel() -> OrchestrationInfo {
+        let mut info = OrchestrationInfo::new(None);
+        info.orchestrator_session_id = Some("orchestrator".into());
+        let mut review = Channel::new("review", "w1");
+        review.joiners.push("rev".into());
+        info.channels.push(review);
+        info
     }
 
     #[test]
@@ -381,39 +495,61 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut board = Board::open_at(&tmp.path().join("b.db")).unwrap();
         let t = "topic";
-        // (message, orchestrator receives, w1 receives, w2 receives)
+        let info = info_with_channel();
+        let in_review = |from: &str, to: Option<&str>| BoardMessage {
+            channel: Some("review".into()),
+            ..msg(from, to)
+        };
+        // (message, orchestrator, w1, w2, rev receive)
         let cases = [
-            (msg("w1", None), true, false, false),
-            (msg("orchestrator", Some("w1")), false, true, false),
-            (msg("orchestrator", Some(ALL_WORKERS)), false, true, true),
-            (msg("user", None), true, false, false),
-            (msg("w2", Some(ALL_WORKERS)), false, true, false),
+            (msg("w1", None), true, false, false, false),
+            (msg("orchestrator", Some("w1")), false, true, false, false),
+            (
+                msg("orchestrator", Some(ALL_WORKERS)),
+                false,
+                true,
+                true,
+                true,
+            ),
+            (msg("user", None), true, false, false, false),
+            (msg("w2", Some(ALL_WORKERS)), false, true, false, true),
+            (in_review("rev", None), false, true, false, false),
+            (in_review("w1", None), false, false, false, true),
+            (
+                in_review("orchestrator", Some("rev")),
+                false,
+                false,
+                false,
+                true,
+            ),
         ];
         for (m, ..) in &cases {
             board.post(t, m).unwrap();
         }
-        for (reader, col) in [("orchestrator", 0), ("w1", 1), ("w2", 2)] {
+        for (reader, col) in [("orchestrator", 0), ("w1", 1), ("w2", 2), ("rev", 3)] {
             let want: Vec<u64> = cases
                 .iter()
                 .enumerate()
-                .filter(|(_, c)| [c.1, c.2, c.3][col])
+                .filter(|(_, c)| [c.1, c.2, c.3, c.4][col])
                 .map(|(i, _)| i as u64 + 1)
                 .collect();
-            let (got, high) = board.pending_for(t, reader, "orchestrator").unwrap();
+            let (got, high) = board.pending_for(t, reader, &info).unwrap();
             assert_eq!(
                 got.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
                 want,
                 "{reader}"
             );
             board.advance_cursor(t, reader, high).unwrap();
-            assert!(board
-                .pending_for(t, reader, "orchestrator")
-                .unwrap()
-                .0
-                .is_empty());
+            assert!(board.pending_for(t, reader, &info).unwrap().0.is_empty());
         }
         board.advance_cursor(t, "w1", 1).unwrap();
-        assert_eq!(board.cursor(t, "w1").unwrap(), 5);
+        assert_eq!(board.cursor(t, "w1").unwrap(), 8);
+
+        assert_eq!(
+            info.home_channel("rev").map(|c| c.name.as_str()),
+            Some("review")
+        );
+        assert!(info.home_channel("w1").is_none());
     }
 
     #[test]

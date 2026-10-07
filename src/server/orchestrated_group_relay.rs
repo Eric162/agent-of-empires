@@ -104,7 +104,7 @@ fn plan(instances: &[Instance], edges: &[StatusChange]) -> Result<Vec<Delivery>>
     let mut board = Board::open()?;
 
     for edge in edges {
-        for (_, profile_groups, members) in &groups {
+        for (profile, profile_groups, members) in &groups {
             let Some(inst) = members.iter().find(|i| i.id == edge.instance_id) else {
                 continue;
             };
@@ -136,8 +136,12 @@ fn plan(instances: &[Instance], edges: &[StatusChange]) -> Result<Vec<Delivery>>
                     to: None,
                     body: format!("worker '{}' ({}) {hint}", inst.title, inst.id),
                     at: Utc::now(),
+                    channel: None,
                 },
             )?;
+            if inst.status == Status::Idle {
+                release_floor_after_turn(profile, &group.path, info, inst)?;
+            }
         }
     }
 
@@ -148,11 +152,11 @@ fn plan(instances: &[Instance], edges: &[StatusChange]) -> Result<Vec<Delivery>>
                 .orchestration
                 .as_ref()
                 .expect("filtered on orchestration");
-            let Some(orchestrator) = info.orchestrator_session_id.as_deref() else {
+            if info.orchestrator_session_id.is_none() {
                 continue;
-            };
+            }
             for member in orchestrated_group::members(group, members) {
-                let (msgs, through_seq) = board.pending_for(&info.id, &member.id, orchestrator)?;
+                let (msgs, through_seq) = board.pending_for(&info.id, &member.id, info)?;
                 if msgs.is_empty() {
                     board.advance_cursor(&info.id, &member.id, through_seq)?;
                     continue;
@@ -172,6 +176,39 @@ fn plan(instances: &[Instance], edges: &[StatusChange]) -> Result<Vec<Delivery>>
         }
     }
     Ok(out)
+}
+
+/// A floor holder that ends its turn releases the floor so another member can take it.
+/// Silent on purpose: announcing it would start the other agent's turn, and a pair
+/// would then alternate forever.
+fn release_floor_after_turn(
+    profile: &str,
+    group_path: &str,
+    info: &orchestrated_group::OrchestrationInfo,
+    inst: &Instance,
+) -> Result<()> {
+    let held: Vec<String> = info
+        .channels_of(&inst.id)
+        .filter(|c| c.floor.as_deref() == Some(inst.id.as_str()))
+        .map(|c| c.name.clone())
+        .collect();
+    if held.is_empty() {
+        return Ok(());
+    }
+    Storage::open_unwatched(profile)?.update(|_, groups| {
+        if let Some(info) = groups
+            .iter_mut()
+            .find(|g| g.path == group_path)
+            .and_then(|g| g.orchestration.as_mut())
+        {
+            for name in &held {
+                if let Some(c) = info.open_channel_mut(name) {
+                    c.floor = None;
+                }
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Reuses `aoe send` so terminal and structured sessions take the same path as the CLI.
