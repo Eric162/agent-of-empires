@@ -338,8 +338,8 @@ async fn run(
         Some(Commands::Killall(args)) => cli::killall::run(args).await,
         Some(Commands::Session { command }) => cli::session::run(&profile, command).await,
         Some(Commands::Group { command }) => cli::group::run(&profile, command).await,
-        Some(Commands::ProjectGroup { command }) => {
-            cli::project_group::run(&profile, command).await
+        Some(Commands::OrchestratedGroup { command }) => {
+            cli::orchestrated_group::run(&profile, command).await
         }
         Some(Commands::Plugin { command }) => cli::plugin::run(command).await,
         Some(Commands::Profile { command }) => cli::profile::run(&profile, command).await,

@@ -17,7 +17,7 @@ use super::access::{host_from_url, resolve_access_policy};
 use super::acp_events::{acp_event_listener, seed_acp_statuses};
 use super::disk_watch::{disk_watcher_consumer, init_disk_watch_subscriptions};
 use super::ip_discovery::{discover_tagged_ips, IpKind};
-use super::project_group_relay;
+use super::orchestrated_group_relay;
 use super::reload::load_all_instances;
 use super::router::build_router;
 use super::serve_snapshot::{
@@ -868,7 +868,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // Per-session dispatcher callback consumer.
     callback::spawn_consumer(state.clone());
 
-    project_group_relay::spawn(state.clone());
+    orchestrated_group_relay::spawn(state.clone());
 
     // Launch plugin workers for every active plugin that declares a runtime.
     if let Some(host) = state.plugin_host.clone() {

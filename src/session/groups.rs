@@ -84,9 +84,9 @@ pub struct Group {
     pub collapsed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<DateTime<Utc>>,
-    /// Set when this group is a ProjectGroup run by a Chief of Staff session.
+    /// Set when this group is an OrchestratedGroup run by a Chief of Staff session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project: Option<super::project_group::ProjectGroupInfo>,
+    pub orchestration: Option<super::orchestrated_group::OrchestrationInfo>,
     #[serde(skip)]
     pub children: Vec<Group>,
 }
@@ -98,7 +98,7 @@ impl Group {
             path: path.to_string(),
             collapsed: false,
             archived_at: None,
-            project: None,
+            orchestration: None,
             children: Vec::new(),
         }
     }
@@ -924,6 +924,18 @@ fn flatten_group(
         .collect();
 
     sort_sessions(&mut group_sessions, sort_order);
+    // The Chief of Staff leads its group in every sort mode.
+    let chief = group
+        .orchestration
+        .as_ref()
+        .and_then(|o| o.chief_session_id.as_deref());
+    if let Some(pos) = group_sessions
+        .iter()
+        .position(|i| Some(i.id.as_str()) == chief)
+    {
+        let chief = group_sessions.remove(pos);
+        group_sessions.insert(0, chief);
+    }
 
     for inst in group_sessions {
         items.push(Item::Session {
@@ -1258,6 +1270,31 @@ mod tests {
             names(&GroupTree::new_with_groups(&[], &existing)),
             ["gamma", "alpha"]
         );
+    }
+
+    #[test]
+    fn orchestrated_group_chief_leads_in_every_sort_order() {
+        let instances = vec![inst("a", "crew"), inst("b", "crew"), inst("z", "crew")];
+        let chief = instances[2].id.clone();
+        let mut group = Group::new("crew", "crew");
+        group.orchestration = Some(super::super::orchestrated_group::OrchestrationInfo {
+            chief_session_id: Some(chief.clone()),
+            ..super::super::orchestrated_group::OrchestrationInfo::new(None)
+        });
+        let tree = GroupTree::new_with_groups(&instances, &[group]);
+        for order in [
+            SortOrder::AZ,
+            SortOrder::Oldest,
+            SortOrder::Newest,
+            SortOrder::Custom,
+        ] {
+            let items = flatten_tree(&tree, &instances, order);
+            let first = items.iter().find_map(|i| match i {
+                Item::Session { id, .. } => Some(id.as_str()),
+                _ => None,
+            });
+            assert_eq!(first, Some(chief.as_str()), "{order:?}");
+        }
     }
 
     #[test]

@@ -54,7 +54,7 @@
                 ./acp-worker/test-shim/shim.mjs
                 ./assets
                 ./docker
-                ./src/session/project_group_skill.md
+                ./src/session/orchestrated_group_skill.md
                 ./web/tests/helpers/fakeAcpAgent.mjs
               ];
             };

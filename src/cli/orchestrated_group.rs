@@ -1,4 +1,4 @@
-//! `aoe project-group` (`aoe pg`): ProjectGroup setup, worker spawning and the message board.
+//! `aoe orchestrated-group` (`aoe og`): OrchestratedGroup setup, worker spawning and the message board.
 
 use std::path::PathBuf;
 
@@ -8,14 +8,14 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use super::definition::{Cli, Commands};
-use crate::session::project_group::{
-    self, Board, BoardMessage, MessageKind, ProjectGroupInfo, ALL_WORKERS, USER_AUTHOR,
+use crate::session::orchestrated_group::{
+    self, Board, BoardMessage, MessageKind, OrchestrationInfo, ALL_WORKERS, USER_AUTHOR,
 };
 use crate::session::{Group, GroupTree, Instance, Storage};
 
 #[derive(Subcommand)]
-pub enum ProjectGroupCommands {
-    /// Turn a group into a ProjectGroup and start its Chief of Staff session
+pub enum OrchestratedGroupCommands {
+    /// Turn a group into an OrchestratedGroup and start its Chief of Staff session
     Init(InitArgs),
     /// Start a worker session with a task (run by the chief)
     Spawn(SpawnArgs),
@@ -31,7 +31,7 @@ pub enum ProjectGroupCommands {
 
 #[derive(Args, Clone)]
 pub struct TargetArgs {
-    /// ProjectGroup path; defaults to the group of the session this runs in
+    /// OrchestratedGroup path; defaults to the group of the session this runs in
     #[arg(long, short = 'g')]
     group: Option<String>,
     /// Act as this session (id or title) instead of detecting the current one
@@ -57,7 +57,7 @@ pub struct AgentArgs {
 
 #[derive(Args)]
 pub struct InitArgs {
-    /// Group path to turn into a ProjectGroup (created if missing)
+    /// Group path to turn into an OrchestratedGroup (created if missing)
     group: String,
     /// Repository the chief and its workers operate on (defaults to current directory)
     path: Option<PathBuf>,
@@ -85,7 +85,7 @@ pub struct SpawnArgs {
     /// Worker session title
     #[arg(long, short = 't')]
     title: String,
-    /// Worktree branch (defaults to pg/<title>)
+    /// Worktree branch (defaults to og/<title>)
     #[arg(long, short = 'b')]
     branch: Option<String>,
     /// Run in the chief's checkout instead of a new worktree
@@ -125,26 +125,26 @@ pub struct BoardArgs {
 }
 
 #[tracing::instrument(target = "cli.session", skip_all, fields(profile = %profile))]
-pub async fn run(profile: &str, command: ProjectGroupCommands) -> Result<()> {
+pub async fn run(profile: &str, command: OrchestratedGroupCommands) -> Result<()> {
     match command {
-        ProjectGroupCommands::Init(args) => init(profile, args).await,
-        ProjectGroupCommands::Spawn(args) => spawn(profile, args).await,
-        ProjectGroupCommands::Post(args) => post(profile, args),
-        ProjectGroupCommands::Board(args) => board(profile, args),
-        ProjectGroupCommands::Status(args) => status(profile, args),
-        ProjectGroupCommands::Memory(args) => {
+        OrchestratedGroupCommands::Init(args) => init(profile, args).await,
+        OrchestratedGroupCommands::Spawn(args) => spawn(profile, args).await,
+        OrchestratedGroupCommands::Post(args) => post(profile, args),
+        OrchestratedGroupCommands::Board(args) => board(profile, args),
+        OrchestratedGroupCommands::Status(args) => status(profile, args),
+        OrchestratedGroupCommands::Memory(args) => {
             let ctx = Ctx::resolve(profile, &args)?;
-            println!("{}", project_group::memory_dir(&ctx.info)?.display());
+            println!("{}", orchestrated_group::memory_dir(&ctx.info)?.display());
             Ok(())
         }
     }
 }
 
-/// The ProjectGroup a command acts on, and who is acting.
+/// The OrchestratedGroup a command acts on, and who is acting.
 struct Ctx {
     profile: String,
     group: Group,
-    info: ProjectGroupInfo,
+    info: OrchestrationInfo,
     instances: Vec<Instance>,
     me: Option<Instance>,
 }
@@ -166,15 +166,17 @@ impl Ctx {
             (None, Some(me)) => me.group_path.clone(),
             (None, None) => unreachable!("detect_current_session returns a session"),
         };
-        let group = project_group::find_for_path(&groups, &group_path)
+        let group = orchestrated_group::find_for_path(&groups, &group_path)
             .cloned()
             .ok_or_else(|| {
-                anyhow!("'{group_path}' is not in a ProjectGroup; run `aoe pg init <group>` first")
+                anyhow!(
+                    "'{group_path}' is not in an OrchestratedGroup; run `aoe og init <group>` first"
+                )
             })?;
         let info = group
-            .project
+            .orchestration
             .clone()
-            .expect("find_for_path filters on project");
+            .expect("find_for_path filters on orchestration");
         Ok(Self {
             profile,
             group,
@@ -283,16 +285,16 @@ fn newest_session(profile: &str, title: &str, group_path: &str) -> Result<Instan
 fn update_info(
     profile: &str,
     group_path: &str,
-    f: impl FnOnce(&mut ProjectGroupInfo),
+    f: impl FnOnce(&mut OrchestrationInfo),
 ) -> Result<()> {
     Storage::open_unwatched(profile)?.update(|_, groups| {
         let g = groups
             .iter_mut()
             .find(|g| g.path == group_path)
             .ok_or_else(|| anyhow!("group '{group_path}' disappeared"))?;
-        f(g.project
+        f(g.orchestration
             .as_mut()
-            .ok_or_else(|| anyhow!("not a ProjectGroup"))?);
+            .ok_or_else(|| anyhow!("not an OrchestratedGroup"))?);
         Ok(())
     })
 }
@@ -322,7 +324,7 @@ async fn init(profile: &str, args: InitArgs) -> Result<()> {
     if group_path.is_empty() {
         bail!("group path cannot be empty");
     }
-    project_group::install_skill().context("install the aoe-project-group skill")?;
+    orchestrated_group::install_skill().context("install the aoe-orchestrated-group skill")?;
 
     let storage = Storage::open_unwatched(profile)?;
     let info = storage.update(|instances, groups| {
@@ -334,8 +336,8 @@ async fn init(profile: &str, args: InitArgs) -> Result<()> {
             .find(|g| g.path == group_path)
             .expect("just created");
         let info = g
-            .project
-            .get_or_insert_with(|| ProjectGroupInfo::new(args.brief.clone()));
+            .orchestration
+            .get_or_insert_with(|| OrchestrationInfo::new(args.brief.clone()));
         if args.brief.is_some() {
             info.brief = args.brief.clone();
         }
@@ -356,7 +358,7 @@ async fn init(profile: &str, args: InitArgs) -> Result<()> {
         }
     }
 
-    let memory = project_group::ensure_memory(&info, &group_path)?;
+    let memory = orchestrated_group::ensure_memory(&info, &group_path)?;
     let title = args.title.unwrap_or_else(|| {
         format!(
             "{} chief",
@@ -395,10 +397,10 @@ async fn init(profile: &str, args: InitArgs) -> Result<()> {
         &info.id,
         &BoardMessage {
             kind: MessageKind::System,
-            from: project_group::SYSTEM_AUTHOR.into(),
-            from_title: project_group::SYSTEM_AUTHOR.into(),
+            from: orchestrated_group::SYSTEM_AUTHOR.into(),
+            from_title: orchestrated_group::SYSTEM_AUTHOR.into(),
             to: Some(chief.id.clone()),
-            body: format!("ProjectGroup '{group_path}' started with chief '{title}'"),
+            body: format!("OrchestratedGroup '{group_path}' started with chief '{title}'"),
             at: Utc::now(),
         },
     )?;
@@ -406,12 +408,12 @@ async fn init(profile: &str, args: InitArgs) -> Result<()> {
 
     let prompt = format!(
         "{}\n\n{}",
-        project_group::chief_bootstrap_prompt(&group_path, &info, &memory),
-        project_group::identity_footer(&chief.id)
+        orchestrated_group::chief_bootstrap_prompt(&group_path, &info, &memory),
+        orchestrated_group::identity_footer(&chief.id)
     );
     send_to(profile, &chief.id, &prompt).await?;
 
-    println!("ProjectGroup '{group_path}' ready");
+    println!("OrchestratedGroup '{group_path}' ready");
     println!("  Chief:  {title} ({})", chief.id);
     println!("  Memory: {}", memory.display());
     warn_without_daemon().await;
@@ -441,7 +443,7 @@ async fn spawn(profile: &str, args: SpawnArgs) -> Result<()> {
     let chief = ctx
         .chief()
         .cloned()
-        .ok_or_else(|| anyhow!("ProjectGroup '{}' has no live chief", ctx.group.path))?;
+        .ok_or_else(|| anyhow!("OrchestratedGroup '{}' has no live chief", ctx.group.path))?;
     if let Some(me) = &ctx.me {
         if me.id != chief.id {
             bail!("only the Chief of Staff spawns workers; post a `question` to ask for one");
@@ -465,7 +467,7 @@ async fn spawn(profile: &str, args: SpawnArgs) -> Result<()> {
         let branch = args
             .branch
             .clone()
-            .unwrap_or_else(|| format!("pg/{}", slug(&args.title)));
+            .unwrap_or_else(|| format!("og/{}", slug(&args.title)));
         add.extend(["-w".into(), branch, "-b".into()]);
         if let Some(wt) = &chief.worktree_info {
             add.extend(["--base-branch".into(), wt.branch.clone()]);
@@ -492,8 +494,8 @@ async fn spawn(profile: &str, args: SpawnArgs) -> Result<()> {
 
     let prompt = format!(
         "{}\n\n{}",
-        project_group::worker_task_prompt(&ctx.group.path, &chief.title, &args.task),
-        project_group::identity_footer(&worker.id)
+        orchestrated_group::worker_task_prompt(&ctx.group.path, &chief.title, &args.task),
+        orchestrated_group::identity_footer(&worker.id)
     );
     send_to(&ctx.profile, &worker.id, &prompt).await?;
     println!(
@@ -509,7 +511,7 @@ fn post(profile: &str, args: PostArgs) -> Result<()> {
         None | Some("chief") => None,
         Some(ALL_WORKERS) => Some(ALL_WORKERS.to_string()),
         Some(who) => {
-            let members: Vec<Instance> = project_group::members(&ctx.group, &ctx.instances)
+            let members: Vec<Instance> = orchestrated_group::members(&ctx.group, &ctx.instances)
                 .into_iter()
                 .cloned()
                 .collect();
@@ -565,20 +567,20 @@ fn board(profile: &str, args: BoardArgs) -> Result<()> {
 fn status(profile: &str, args: TargetArgs) -> Result<()> {
     let ctx = Ctx::resolve(profile, &args)?;
     let board = Board::open()?;
-    println!("ProjectGroup: {}", ctx.group.path);
+    println!("OrchestratedGroup: {}", ctx.group.path);
     if let Some(brief) = &ctx.info.brief {
         println!("Brief:        {brief}");
     }
     println!(
         "Memory:       {}",
-        project_group::memory_dir(&ctx.info)?.display()
+        orchestrated_group::memory_dir(&ctx.info)?.display()
     );
     println!("Board:        {} messages", board.highest_seq(&ctx.info.id));
     match ctx.chief() {
         Some(c) => println!("Chief:        {} ({}) {:?}", c.title, c.id, c.status),
         None => println!("Chief:        (none)"),
     }
-    let workers: Vec<&Instance> = project_group::members(&ctx.group, &ctx.instances)
+    let workers: Vec<&Instance> = orchestrated_group::members(&ctx.group, &ctx.instances)
         .into_iter()
         .filter(|i| i.id != ctx.chief_id())
         .collect();

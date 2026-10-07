@@ -1,4 +1,4 @@
-//! ProjectGroups: a group run by a Chief of Staff session that delegates to worker
+//! OrchestratedGroups: a group run by a Chief of Staff session that delegates to worker
 //! sessions and coordinates through a durable message board.
 
 use std::path::{Path, PathBuf};
@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use super::{Group, Instance};
 use crate::events::{self, Order, Schema, SeqBound};
 
-pub const SKILL_DIR: &str = "aoe-project-group";
-pub const SKILL_MD: &str = include_str!("project_group_skill.md");
+pub const SKILL_DIR: &str = "aoe-orchestrated-group";
+pub const SKILL_MD: &str = include_str!("orchestrated_group_skill.md");
 
 /// Board author for messages the relay writes.
 pub const SYSTEM_AUTHOR: &str = "aoe";
@@ -24,7 +24,7 @@ pub const ALL_WORKERS: &str = "all";
 const SCHEMA_PREFIX: &str = "board";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ProjectGroupInfo {
+pub struct OrchestrationInfo {
     /// Stable board topic and memory directory name; survives group renames.
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -33,7 +33,7 @@ pub struct ProjectGroupInfo {
     pub brief: Option<String>,
 }
 
-impl ProjectGroupInfo {
+impl OrchestrationInfo {
     pub fn new(brief: Option<String>) -> Self {
         Self {
             id: uuid::Uuid::new_v4().simple().to_string(),
@@ -115,15 +115,15 @@ impl BoardMessage {
 }
 
 pub fn root_dir() -> Result<PathBuf> {
-    Ok(super::get_app_dir()?.join("project_groups"))
+    Ok(super::get_app_dir()?.join("orchestrated_groups"))
 }
 
-pub fn memory_dir(info: &ProjectGroupInfo) -> Result<PathBuf> {
+pub fn memory_dir(info: &OrchestrationInfo) -> Result<PathBuf> {
     Ok(root_dir()?.join(&info.id))
 }
 
 /// Create the memory directory with a seed `MEMORY.md` if it is missing.
-pub fn ensure_memory(info: &ProjectGroupInfo, group_path: &str) -> Result<PathBuf> {
+pub fn ensure_memory(info: &OrchestrationInfo, group_path: &str) -> Result<PathBuf> {
     let dir = memory_dir(info)?;
     std::fs::create_dir_all(&dir)?;
     let index = dir.join("MEMORY.md");
@@ -151,13 +151,13 @@ pub fn install_skill() -> Result<()> {
     Ok(())
 }
 
-/// The nearest group at or above `group_path` that is a ProjectGroup.
+/// The nearest group at or above `group_path` that is an OrchestratedGroup.
 pub fn find_for_path<'a>(groups: &'a [Group], group_path: &str) -> Option<&'a Group> {
     let mut path = group_path;
     loop {
         if let Some(g) = groups
             .iter()
-            .find(|g| g.path == path && g.project.is_some())
+            .find(|g| g.path == path && g.orchestration.is_some())
         {
             return Some(g);
         }
@@ -169,7 +169,7 @@ pub fn find_for_path<'a>(groups: &'a [Group], group_path: &str) -> Option<&'a Gr
 pub fn members<'a>(group: &Group, instances: &'a [Instance]) -> Vec<&'a Instance> {
     let prefix = format!("{}/", group.path);
     let chief = group
-        .project
+        .orchestration
         .as_ref()
         .and_then(|p| p.chief_session_id.as_deref());
     instances
@@ -302,21 +302,21 @@ pub fn identity_footer(session_id: &str) -> String {
 fn identity_line(aoe: &str, session_id: &str) -> String {
     format!(
         "Run every `aoe` command, including those in the skill, as `{aoe}`. Your aoe session \
-         id is {session_id}; if `aoe pg` cannot detect you, pass `--as {session_id}`."
+         id is {session_id}; if `aoe og` cannot detect you, pass `--as {session_id}`."
     )
 }
 
-pub fn chief_bootstrap_prompt(group_path: &str, info: &ProjectGroupInfo, memory: &Path) -> String {
+pub fn chief_bootstrap_prompt(group_path: &str, info: &OrchestrationInfo, memory: &Path) -> String {
     let brief = info
         .brief
         .as_deref()
         .unwrap_or("(no brief yet; ask the user)");
     format!(
-        "You are the Chief of Staff for the aoe ProjectGroup '{group_path}'. Use the \
-         `{SKILL_DIR}` skill. You plan, delegate to worker sessions with `aoe pg spawn`, \
+        "You are the Chief of Staff for the aoe OrchestratedGroup '{group_path}'. Use the \
+         `{SKILL_DIR}` skill. You plan, delegate to worker sessions with `aoe og spawn`, \
          review their results and keep project memory. Do not write code yourself.\n\n\
          Brief: {brief}\n\n\
-         Memory directory: {}\nRead MEMORY.md there now. Then run `aoe pg status` and \
+         Memory directory: {}\nRead MEMORY.md there now. Then run `aoe og status` and \
          ask the user what to work on if the brief is not actionable. Board messages and \
          worker completions are delivered to you automatically; end your turn instead of polling.",
         memory.display()
@@ -325,11 +325,11 @@ pub fn chief_bootstrap_prompt(group_path: &str, info: &ProjectGroupInfo, memory:
 
 pub fn worker_task_prompt(group_path: &str, chief_title: &str, task: &str) -> String {
     format!(
-        "You are a worker in the aoe ProjectGroup '{group_path}', managed by the Chief of \
+        "You are a worker in the aoe OrchestratedGroup '{group_path}', managed by the Chief of \
          Staff session '{chief_title}'. Use the `{SKILL_DIR}` skill.\n\n\
          Task:\n{task}\n\n\
-         When blocked, `aoe pg post --kind question \"...\"` and end your turn; the answer will be \
-         delivered to you. When done, `aoe pg post --kind result \"<summary, branch, test status>\"` \
+         When blocked, `aoe og post --kind question \"...\"` and end your turn; the answer will be \
+         delivered to you. When done, `aoe og post --kind result \"<summary, branch, test status>\"` \
          exactly once, then end your turn."
     )
 }
@@ -388,7 +388,7 @@ mod tests {
     #[test]
     fn find_for_path_uses_nearest_project_ancestor() {
         let mut root = Group::new("p", "p");
-        root.project = Some(ProjectGroupInfo::new(None));
+        root.orchestration = Some(OrchestrationInfo::new(None));
         let groups = vec![root, Group::new("sub", "p/sub"), Group::new("q", "q")];
         assert_eq!(find_for_path(&groups, "p/sub").unwrap().path, "p");
         assert_eq!(find_for_path(&groups, "p").unwrap().path, "p");

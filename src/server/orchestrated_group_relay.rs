@@ -1,4 +1,4 @@
-//! ProjectGroup relay: posts worker lifecycle edges to the board and delivers unread board
+//! OrchestratedGroup relay: posts worker lifecycle edges to the board and delivers unread board
 //! messages into members once they can take input, so no agent has to poll.
 
 use std::collections::HashMap;
@@ -10,7 +10,7 @@ use chrono::Utc;
 
 use super::push::StatusChange;
 use super::AppState;
-use crate::session::project_group::{self, Board, BoardMessage, MessageKind, SYSTEM_AUTHOR};
+use crate::session::orchestrated_group::{self, Board, BoardMessage, MessageKind, SYSTEM_AUTHOR};
 use crate::session::{Group, Instance, Status, Storage};
 
 /// Also the debounce: an edge is acted on at the next tick only if the status still holds.
@@ -27,7 +27,7 @@ struct Delivery {
 
 pub fn spawn(state: Arc<AppState>) {
     crate::task_util::spawn_supervised(
-        "server.project_group_relay",
+        "server.orchestrated_group_relay",
         crate::task_util::PanicPolicy::Log,
         run(state),
     );
@@ -56,7 +56,7 @@ async fn run(state: Arc<AppState>) {
         let deliveries = match tokio::task::spawn_blocking(move || plan(&instances, &edges)).await {
             Ok(Ok(d)) => d,
             Ok(Err(error)) => {
-                tracing::warn!(%error, "project group relay pass failed");
+                tracing::warn!(%error, "orchestrated group relay pass failed");
                 continue;
             }
             Err(_) => continue,
@@ -94,7 +94,7 @@ fn plan(instances: &[Instance], edges: &[StatusChange]) -> Result<Vec<Delivery>>
     let mut groups: Vec<(String, Vec<Group>, Vec<Instance>)> = Vec::new();
     for (profile, members) in by_profile {
         let (_, profile_groups) = Storage::open_unwatched(profile)?.load_with_groups()?;
-        if profile_groups.iter().any(|g| g.project.is_some()) {
+        if profile_groups.iter().any(|g| g.orchestration.is_some()) {
             groups.push((profile.to_string(), profile_groups, members));
         }
     }
@@ -111,10 +111,14 @@ fn plan(instances: &[Instance], edges: &[StatusChange]) -> Result<Vec<Delivery>>
             if inst.status != edge.new {
                 continue;
             }
-            let Some(group) = project_group::find_for_path(profile_groups, &inst.group_path) else {
+            let Some(group) = orchestrated_group::find_for_path(profile_groups, &inst.group_path)
+            else {
                 continue;
             };
-            let info = group.project.as_ref().expect("filtered on project");
+            let info = group
+                .orchestration
+                .as_ref()
+                .expect("filtered on orchestration");
             if info.chief_session_id.as_deref() == Some(inst.id.as_str()) {
                 continue;
             }
@@ -139,12 +143,15 @@ fn plan(instances: &[Instance], edges: &[StatusChange]) -> Result<Vec<Delivery>>
 
     let mut out = Vec::new();
     for (profile, profile_groups, members) in &groups {
-        for group in profile_groups.iter().filter(|g| g.project.is_some()) {
-            let info = group.project.as_ref().expect("filtered on project");
+        for group in profile_groups.iter().filter(|g| g.orchestration.is_some()) {
+            let info = group
+                .orchestration
+                .as_ref()
+                .expect("filtered on orchestration");
             let Some(chief) = info.chief_session_id.as_deref() else {
                 continue;
             };
-            for member in project_group::members(group, members) {
+            for member in orchestrated_group::members(group, members) {
                 let (msgs, through_seq) = board.pending_for(&info.id, &member.id, chief)?;
                 if msgs.is_empty() {
                     board.advance_cursor(&info.id, &member.id, through_seq)?;
@@ -154,7 +161,7 @@ fn plan(instances: &[Instance], edges: &[StatusChange]) -> Result<Vec<Delivery>>
                     continue;
                 }
                 let mut text = format!(
-                    "[aoe ProjectGroup '{}' board: {} new message(s) for you]\n",
+                    "[aoe OrchestratedGroup '{}' board: {} new message(s) for you]\n",
                     group.path,
                     msgs.len()
                 );
@@ -162,9 +169,9 @@ fn plan(instances: &[Instance], edges: &[StatusChange]) -> Result<Vec<Delivery>>
                     text.push_str(&m.render(*seq));
                     text.push('\n');
                 }
-                let aoe = project_group::aoe_bin();
+                let aoe = orchestrated_group::aoe_bin();
                 text.push_str(&format!(
-                    "Respond with `{aoe} pg post`; full history: `{aoe} pg board`."
+                    "Respond with `{aoe} og post`; full history: `{aoe} og board`."
                 ));
                 out.push(Delivery {
                     profile: profile.clone(),
@@ -184,7 +191,7 @@ async fn deliver(d: Delivery) {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(error) => {
-            tracing::warn!(%error, "project group relay: no current exe");
+            tracing::warn!(%error, "orchestrated group relay: no current exe");
             return;
         }
     };
@@ -200,11 +207,11 @@ async fn deliver(d: Delivery) {
     let output = match tokio::time::timeout(SEND_TIMEOUT, cmd.output()).await {
         Ok(Ok(output)) => output,
         Ok(Err(error)) => {
-            tracing::warn!(%error, session = %d.session_id, "project group relay: send failed to start");
+            tracing::warn!(%error, session = %d.session_id, "orchestrated group relay: send failed to start");
             return;
         }
         Err(_) => {
-            tracing::warn!(session = %d.session_id, "project group relay: send timed out");
+            tracing::warn!(session = %d.session_id, "orchestrated group relay: send timed out");
             return;
         }
     };
@@ -212,7 +219,7 @@ async fn deliver(d: Delivery) {
         tracing::warn!(
             session = %d.session_id,
             stderr = %String::from_utf8_lossy(&output.stderr),
-            "project group relay: send failed"
+            "orchestrated group relay: send failed"
         );
         return;
     }
@@ -221,6 +228,6 @@ async fn deliver(d: Delivery) {
     })
     .await;
     if !matches!(advanced, Ok(Ok(()))) {
-        tracing::warn!("project group relay: delivered but could not advance cursor");
+        tracing::warn!("orchestrated group relay: delivered but could not advance cursor");
     }
 }
