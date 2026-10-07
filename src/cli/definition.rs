@@ -18,6 +18,7 @@ use super::mcp::McpCommands;
 use super::plugin::PluginCommands;
 use super::profile::ProfileCommands;
 use super::project::ProjectCommands;
+use super::project_group::ProjectGroupCommands;
 use super::ps::PsArgs;
 use super::remove::RemoveArgs;
 use super::sandbox::SandboxCommands;
@@ -133,6 +134,13 @@ pub enum Commands {
     Group {
         #[command(subcommand)]
         command: GroupCommands,
+    },
+
+    /// Run a ProjectGroup: a Chief of Staff session coordinating worker sessions
+    #[command(name = "project-group", alias = "pg")]
+    ProjectGroup {
+        #[command(subcommand)]
+        command: ProjectGroupCommands,
     },
 
     /// Manage plugins (list, info, enable, disable, install, update, uninstall)
@@ -280,6 +288,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "killall",
     "session",
     "group",
+    "project-group",
     "plugin",
     "profile",
     "project",
@@ -319,6 +328,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::Stop { .. } => return None,
         Commands::Session { .. } => "session",
         Commands::Group { .. } => "group",
+        Commands::ProjectGroup { .. } => "project-group",
         Commands::Plugin { .. } => "plugin",
         Commands::Profile { .. } => "profile",
         Commands::Project { .. } => "project",

@@ -2187,6 +2187,7 @@ fn test_moving_a_group_does_not_resurrect_a_peer_deleted_one() {
                 path: "gamma".to_string(),
                 collapsed: false,
                 archived_at: None,
+                project: None,
                 children: Vec::new(),
             });
             Ok(())
@@ -2293,6 +2294,7 @@ fn test_cross_group_move_lands_in_an_empty_neighbour() {
                     path: "beta".to_string(),
                     collapsed: true,
                     archived_at: None,
+                    project: None,
                     children: Vec::new(),
                 },
             );
@@ -2717,6 +2719,7 @@ fn test_an_empty_group_moves_in_a_unified_single_profile_view() {
                     path: path.to_string(),
                     collapsed: false,
                     archived_at: None,
+                    project: None,
                     children: Vec::new(),
                 })
                 .collect();

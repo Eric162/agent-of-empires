@@ -84,6 +84,9 @@ pub struct Group {
     pub collapsed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<DateTime<Utc>>,
+    /// Set when this group is a ProjectGroup run by a Chief of Staff session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<super::project_group::ProjectGroupInfo>,
     #[serde(skip)]
     pub children: Vec<Group>,
 }
@@ -95,6 +98,7 @@ impl Group {
             path: path.to_string(),
             collapsed: false,
             archived_at: None,
+            project: None,
             children: Vec::new(),
         }
     }

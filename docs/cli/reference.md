@@ -45,6 +45,13 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe group create`↴](#aoe-group-create)
 * [`aoe group delete`↴](#aoe-group-delete)
 * [`aoe group move`↴](#aoe-group-move)
+* [`aoe project-group`↴](#aoe-project-group)
+* [`aoe project-group init`↴](#aoe-project-group-init)
+* [`aoe project-group spawn`↴](#aoe-project-group-spawn)
+* [`aoe project-group post`↴](#aoe-project-group-post)
+* [`aoe project-group board`↴](#aoe-project-group-board)
+* [`aoe project-group status`↴](#aoe-project-group-status)
+* [`aoe project-group memory`↴](#aoe-project-group-memory)
 * [`aoe plugin`↴](#aoe-plugin)
 * [`aoe plugin list`↴](#aoe-plugin-list)
 * [`aoe plugin info`↴](#aoe-plugin-info)
@@ -152,6 +159,7 @@ Run without arguments to launch the TUI dashboard.
 * `killall` — Force-stop everything aoe is running: the serve daemon, all agent workers, and all aoe tmux sessions. Destructive and unprompted
 * `session` — Manage session lifecycle (start, stop, attach, etc.)
 * `group` — Manage groups for organizing sessions
+* `project-group` — Run a ProjectGroup: a Chief of Staff session coordinating worker sessions
 * `plugin` — Manage plugins (list, info, enable, disable, install, update, uninstall)
 * `profile` — Manage profiles (separate workspaces)
 * `project` — Manage the project registry used by multi-repo session pickers
@@ -821,6 +829,137 @@ Move session to group
 
 * `<IDENTIFIER>` — Session ID or title
 * `<GROUP>` — Target group
+
+
+
+## `aoe project-group`
+
+Run a ProjectGroup: a Chief of Staff session coordinating worker sessions
+
+**Usage:** `aoe project-group <COMMAND>`
+
+###### **Subcommands:**
+
+* `init` — Turn a group into a ProjectGroup and start its Chief of Staff session
+* `spawn` — Start a worker session with a task (run by the chief)
+* `post` — Post a message to the board
+* `board` — Read the board
+* `status` — Show the chief, workers and board state
+* `memory` — Print the memory directory
+
+
+
+## `aoe project-group init`
+
+Turn a group into a ProjectGroup and start its Chief of Staff session
+
+**Usage:** `aoe project-group init [OPTIONS] <GROUP> [PATH]`
+
+###### **Arguments:**
+
+* `<GROUP>` — Group path to turn into a ProjectGroup (created if missing)
+* `<PATH>` — Repository the chief and its workers operate on (defaults to current directory)
+
+###### **Options:**
+
+* `--brief <BRIEF>` — What this project is for
+* `-t`, `--title <TITLE>` — Chief session title
+* `--tool <TOOL>` — Named agent to run (defaults to your aoe default)
+* `--structured-view` — Use the structured (ACP) view instead of a terminal session
+* `--agent <AGENT>` — ACP agent for the structured view
+* `--model <MODEL>` — Model override
+
+
+
+## `aoe project-group spawn`
+
+Start a worker session with a task (run by the chief)
+
+**Usage:** `aoe project-group spawn [OPTIONS] --title <TITLE> <TASK>`
+
+###### **Arguments:**
+
+* `<TASK>` — Task brief for the worker
+
+###### **Options:**
+
+* `-t`, `--title <TITLE>` — Worker session title
+* `-b`, `--branch <BRANCH>` — Worktree branch (defaults to pg/<title>)
+* `--no-worktree` — Run in the chief's checkout instead of a new worktree
+* `--tool <TOOL>` — Named agent to run (defaults to your aoe default)
+* `--structured-view` — Use the structured (ACP) view instead of a terminal session
+* `--agent <AGENT>` — ACP agent for the structured view
+* `--model <MODEL>` — Model override
+* `-g`, `--group <GROUP>` — ProjectGroup path; defaults to the group of the session this runs in
+* `--as <AS_SESSION>` — Act as this session (id or title) instead of detecting the current one
+
+
+
+## `aoe project-group post`
+
+Post a message to the board
+
+**Usage:** `aoe project-group post [OPTIONS] <BODY>`
+
+###### **Arguments:**
+
+* `<BODY>` — Message text
+
+###### **Options:**
+
+* `-k`, `--kind <KIND>`
+
+  Default value: `note`
+
+  Possible values: `task`, `status`, `question`, `answer`, `result`, `learning`, `note`, `system`
+
+* `--to <TO>` — Recipient session (id or title), `all` for every worker; defaults to the chief
+* `-g`, `--group <GROUP>` — ProjectGroup path; defaults to the group of the session this runs in
+* `--as <AS_SESSION>` — Act as this session (id or title) instead of detecting the current one
+
+
+
+## `aoe project-group board`
+
+Read the board
+
+**Usage:** `aoe project-group board [OPTIONS]`
+
+###### **Options:**
+
+* `--after <AFTER>` — Only messages after this seq
+
+  Default value: `0`
+* `--limit <LIMIT>` — Only the last N messages
+* `--json`
+* `-g`, `--group <GROUP>` — ProjectGroup path; defaults to the group of the session this runs in
+* `--as <AS_SESSION>` — Act as this session (id or title) instead of detecting the current one
+
+
+
+## `aoe project-group status`
+
+Show the chief, workers and board state
+
+**Usage:** `aoe project-group status [OPTIONS]`
+
+###### **Options:**
+
+* `-g`, `--group <GROUP>` — ProjectGroup path; defaults to the group of the session this runs in
+* `--as <AS_SESSION>` — Act as this session (id or title) instead of detecting the current one
+
+
+
+## `aoe project-group memory`
+
+Print the memory directory
+
+**Usage:** `aoe project-group memory [OPTIONS]`
+
+###### **Options:**
+
+* `-g`, `--group <GROUP>` — ProjectGroup path; defaults to the group of the session this runs in
+* `--as <AS_SESSION>` — Act as this session (id or title) instead of detecting the current one
 
 
 

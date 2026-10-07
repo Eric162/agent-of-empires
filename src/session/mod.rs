@@ -24,6 +24,7 @@ mod instance;
 pub mod mcp;
 mod move_journal;
 pub mod poller;
+pub mod project_group;
 pub mod projects;
 pub(crate) mod recovery;
 pub mod restart;
