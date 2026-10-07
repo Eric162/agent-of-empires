@@ -1,6 +1,7 @@
 //! OrchestratedGroups: a group run by an Orchestrator Agent session that delegates to worker
 //! sessions and coordinates through a durable message board.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -31,8 +32,9 @@ pub struct OrchestrationInfo {
     pub orchestrator_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub brief: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub channels: Vec<Channel>,
+    /// Topic name to the sessions subscribed to it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub topics: BTreeMap<String, Vec<String>>,
 }
 
 impl OrchestrationInfo {
@@ -41,70 +43,30 @@ impl OrchestrationInfo {
             id: uuid::Uuid::new_v4().simple().to_string(),
             orchestrator_session_id: None,
             brief,
-            channels: Vec::new(),
+            topics: BTreeMap::new(),
         }
     }
 
-    pub fn open_channel(&self, name: &str) -> Option<&Channel> {
-        self.channels.iter().find(|c| c.name == name && !c.closed)
+    pub fn subscribed(&self, topic: &str, session: &str) -> bool {
+        self.topics
+            .get(topic)
+            .is_some_and(|subs| subs.iter().any(|s| s == session))
     }
 
-    pub fn open_channel_mut(&mut self, name: &str) -> Option<&mut Channel> {
-        self.channels
-            .iter_mut()
-            .find(|c| c.name == name && !c.closed)
-    }
-
-    /// The open channel a session was spawned into, which its posts default to.
-    pub fn home_channel(&self, session: &str) -> Option<&Channel> {
-        self.channels
-            .iter()
-            .rev()
-            .find(|c| !c.closed && c.joiners.iter().any(|j| j == session))
-    }
-
-    /// Open channels `session` takes part in.
-    pub fn channels_of<'a>(&'a self, session: &'a str) -> impl Iterator<Item = &'a Channel> {
-        self.channels
-            .iter()
-            .filter(move |c| !c.closed && c.has(session))
-    }
-}
-
-/// A side conversation inside an orchestrated group whose members share the owner's
-/// worktree. Members take turns editing: only the floor holder writes.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Channel {
-    pub name: String,
-    /// Worker whose worktree the channel works in.
-    pub owner: String,
-    /// Sessions spawned into the owner's worktree.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub joiners: Vec<String>,
-    /// The member allowed to edit; `None` means free for any member to take.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub floor: Option<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub closed: bool,
-}
-
-impl Channel {
-    pub fn new(name: &str, owner: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            owner: owner.to_string(),
-            joiners: Vec::new(),
-            floor: Some(owner.to_string()),
-            closed: false,
+    pub fn subscribe(&mut self, topic: &str, session: &str) {
+        let subs = self.topics.entry(topic.to_string()).or_default();
+        if !subs.iter().any(|s| s == session) {
+            subs.push(session.to_string());
         }
     }
 
-    pub fn has(&self, session: &str) -> bool {
-        self.owner == session || self.joiners.iter().any(|j| j == session)
-    }
-
-    pub fn members(&self) -> impl Iterator<Item = &str> {
-        std::iter::once(self.owner.as_str()).chain(self.joiners.iter().map(String::as_str))
+    pub fn unsubscribe(&mut self, topic: &str, session: &str) {
+        if let Some(subs) = self.topics.get_mut(topic) {
+            subs.retain(|s| s != session);
+            if subs.is_empty() {
+                self.topics.remove(topic);
+            }
+        }
     }
 }
 
@@ -147,34 +109,25 @@ pub struct BoardMessage {
     pub to: Option<String>,
     pub body: String,
     pub at: DateTime<Utc>,
-    /// Channel name; `None` is the group's general board.
+    /// Topic tag; topic posts reach the topic's subscribers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub channel: Option<String>,
+    pub topic: Option<String>,
 }
 
 impl BoardMessage {
-    /// Whether `reader` should receive this message. On the general board the
-    /// orchestrator gets everything addressed to it or to nobody and workers get direct
-    /// and broadcast messages; in a channel, its members get everything not aimed at
-    /// someone else.
+    /// Whether `reader` should receive this message: anything addressed to it; a topic
+    /// post's subscribers; otherwise the orchestrator for untargeted posts and workers
+    /// for broadcasts.
     pub fn is_for(&self, reader: &str, info: &OrchestrationInfo) -> bool {
         if self.from == reader {
             return false;
         }
         let orchestrator = info.orchestrator_session_id.as_deref().unwrap_or_default();
-        if let Some(channel) = self.channel.as_deref() {
-            return match self.to.as_deref() {
-                Some(to) => to == reader,
-                None => info
-                    .channels
-                    .iter()
-                    .any(|c| c.name == channel && c.has(reader)),
-            };
-        }
-        match self.to.as_deref() {
-            None => reader == orchestrator,
-            Some(ALL_WORKERS) => reader != orchestrator,
-            Some(to) => to == reader,
+        match (self.to.as_deref(), self.topic.as_deref()) {
+            (Some(ALL_WORKERS), _) => reader != orchestrator,
+            (Some(to), _) => to == reader,
+            (None, Some(topic)) => info.subscribed(topic, reader),
+            (None, None) => reader == orchestrator,
         }
     }
 
@@ -184,13 +137,13 @@ impl BoardMessage {
             .as_deref()
             .map(|t| format!(" -> {t}"))
             .unwrap_or_default();
-        let channel = self
-            .channel
+        let topic = self
+            .topic
             .as_deref()
             .map(|c| format!(" #{c}"))
             .unwrap_or_default();
         format!(
-            "#{seq}{channel} [{}] {} ({}){to}: {}",
+            "#{seq}{topic} [{}] {} ({}){to}: {}",
             self.kind.as_str(),
             self.from_title,
             self.from,
@@ -207,13 +160,13 @@ pub fn delivery_text(msgs: &[(u64, BoardMessage)]) -> String {
             MessageKind::Note => String::new(),
             k => format!(" {}", k.as_str()),
         };
-        let channel = m
-            .channel
+        let topic = m
+            .topic
             .as_deref()
             .map(|c| format!(" in #{c}"))
             .unwrap_or_default();
         format!(
-            "#{seq}{kind}{channel} from {}: {}",
+            "#{seq}{kind}{topic} from {}: {}",
             m.from_title,
             m.body.trim()
         )
@@ -455,13 +408,12 @@ pub fn worker_task_prompt(group_path: &str, orchestrator_title: &str, task: &str
     )
 }
 
-/// Appended to a worker's task when it joins a channel in someone else's worktree.
-pub fn channel_join_prompt(channel: &str, owner_title: &str) -> String {
+/// Appended to a worker's task when it starts in another worker's worktree.
+pub fn shared_worktree_prompt(owner_title: &str) -> String {
     format!(
-        "\n\nYou share the worktree of '{owner_title}' in channel #{channel}. You hold the floor \
-         now: only the floor holder edits files. Talk in the channel with `aoe og post` (it \
-         defaults to #{channel}); when you want the owner to continue, `aoe og pass \
-         \"{owner_title}\" \"<what to do>\"` and end your turn."
+        "\n\nYou share this worktree with '{owner_title}'. Take turns editing: say in your \
+         topic when you start and when you hand back (`aoe og post --topic <topic> \
+         \"your turn: ...\"`), and do not edit while the other is working."
     )
 }
 
@@ -477,16 +429,15 @@ mod tests {
             to: to.map(Into::into),
             body: "hi".into(),
             at: Utc::now(),
-            channel: None,
+            topic: None,
         }
     }
 
-    fn info_with_channel() -> OrchestrationInfo {
+    fn info_with_topic() -> OrchestrationInfo {
         let mut info = OrchestrationInfo::new(None);
         info.orchestrator_session_id = Some("orchestrator".into());
-        let mut review = Channel::new("review", "w1");
-        review.joiners.push("rev".into());
-        info.channels.push(review);
+        info.subscribe("review", "w1");
+        info.subscribe("review", "rev");
         info
     }
 
@@ -495,9 +446,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut board = Board::open_at(&tmp.path().join("b.db")).unwrap();
         let t = "topic";
-        let info = info_with_channel();
+        let info = info_with_topic();
         let in_review = |from: &str, to: Option<&str>| BoardMessage {
-            channel: Some("review".into()),
+            topic: Some("review".into()),
             ..msg(from, to)
         };
         // (message, orchestrator, w1, w2, rev receive)
@@ -545,11 +496,11 @@ mod tests {
         board.advance_cursor(t, "w1", 1).unwrap();
         assert_eq!(board.cursor(t, "w1").unwrap(), 8);
 
-        assert_eq!(
-            info.home_channel("rev").map(|c| c.name.as_str()),
-            Some("review")
-        );
-        assert!(info.home_channel("w1").is_none());
+        let mut info = info;
+        info.unsubscribe("review", "rev");
+        assert!(!info.subscribed("review", "rev") && info.subscribed("review", "w1"));
+        info.unsubscribe("review", "w1");
+        assert!(info.topics.is_empty());
     }
 
     #[test]

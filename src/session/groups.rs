@@ -3,7 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use super::config::SortOrder;
 use super::Instance;
@@ -934,40 +934,7 @@ fn flatten_group(
     let (workers, others): (Vec<&Instance>, Vec<&Instance>) = group_sessions
         .into_iter()
         .partition(|i| orchestrator.is_some() && i.parent_session_id.as_deref() == orchestrator);
-    // Channel joiners share their owner's worktree, so they sit under the owner.
-    let channels = group
-        .orchestration
-        .as_ref()
-        .map(|o| o.channels.as_slice())
-        .unwrap_or_default();
-    let owner_of = |id: &str| {
-        channels
-            .iter()
-            .rev()
-            .find(|c| !c.closed && c.joiners.iter().any(|j| j == id))
-            .map(|c| c.owner.as_str())
-    };
-    let (joiners, workers): (Vec<&Instance>, Vec<&Instance>) = workers
-        .into_iter()
-        .partition(|i| owner_of(&i.id).is_some_and(|o| o != i.id));
-    let mut rows: Vec<(&Instance, usize)> = Vec::new();
-    for worker in workers {
-        rows.push((worker, depth + 1));
-        rows.extend(
-            joiners
-                .iter()
-                .filter(|j| owner_of(&j.id) == Some(worker.id.as_str()))
-                .map(|j| (*j, depth + 2)),
-        );
-    }
-    let placed: HashSet<&str> = rows.iter().map(|(i, _)| i.id.as_str()).collect();
-    rows.extend(
-        joiners
-            .into_iter()
-            .filter(|j| !placed.contains(j.id.as_str()))
-            .chain(others)
-            .map(|i| (i, depth + 1)),
-    );
+    let rows = workers.into_iter().chain(others).map(|i| (i, depth + 1));
     for (inst, depth) in rows {
         items.push(Item::Session {
             id: inst.id.clone(),
@@ -1327,39 +1294,6 @@ mod tests {
             assert_eq!(rows[0], worker, "{order:?}: workers lead");
             assert!(!rows.contains(&orchestrator));
         }
-    }
-
-    #[test]
-    fn channel_joiners_nest_under_their_owner() {
-        let mut instances = vec![
-            inst("owner", "crew"),
-            inst("other", "crew"),
-            inst("rev", "crew"),
-            inst("orch", "crew"),
-        ];
-        let orchestrator = instances[3].id.clone();
-        for i in &mut instances[..3] {
-            i.parent_session_id = Some(orchestrator.clone());
-        }
-        let (owner, rev) = (instances[0].id.clone(), instances[2].id.clone());
-        let mut info = super::super::orchestrated_group::OrchestrationInfo::new(None);
-        info.orchestrator_session_id = Some(orchestrator);
-        let mut channel = super::super::orchestrated_group::Channel::new("review", &owner);
-        channel.joiners.push(rev.clone());
-        info.channels.push(channel);
-        let mut group = Group::new("crew", "crew");
-        group.orchestration = Some(info);
-        let tree = GroupTree::new_with_groups(&instances, &[group]);
-        let rows: Vec<(String, usize)> = flatten_tree(&tree, &instances, SortOrder::AZ)
-            .into_iter()
-            .filter_map(|i| match i {
-                Item::Session { id, depth } => Some((id, depth)),
-                _ => None,
-            })
-            .collect();
-        let at = |id: &str| rows.iter().position(|(r, _)| r == id).unwrap();
-        assert_eq!(at(&rev), at(&owner) + 1);
-        assert_eq!(rows[at(&rev)].1, 2);
     }
 
     #[test]

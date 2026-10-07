@@ -28,68 +28,20 @@ pub enum OrchestratedGroupCommands {
     Status(TargetArgs),
     /// Print the memory directory
     Memory(TargetArgs),
-    /// Side conversations whose members share one worker's worktree
-    Channel {
-        #[command(subcommand)]
-        command: ChannelCommands,
-    },
-    /// Show or take a channel's floor; only the holder edits files
-    Floor(FloorArgs),
-    /// Hand a channel's floor to another member with a message
-    Pass(PassArgs),
-}
-
-#[derive(Subcommand)]
-pub enum ChannelCommands {
-    /// Open a channel in a worker's worktree; helpers join with `og spawn --join`
-    Create(ChannelCreateArgs),
-    /// List open channels with their members and floor holder
-    List(TargetArgs),
-    /// Close a channel, posting an optional summary to the general board
-    Close(ChannelCloseArgs),
+    /// Subscribe a session to a topic; topic posts reach only subscribers
+    Sub(SubArgs),
+    /// Unsubscribe a session from a topic
+    Unsub(SubArgs),
+    /// List topics and their subscribers
+    Topics(TargetArgs),
 }
 
 #[derive(Args)]
-pub struct ChannelCreateArgs {
-    /// Channel name, e.g. review-country
-    name: String,
-    /// Worker whose worktree the channel works in
+pub struct SubArgs {
+    topic: String,
+    /// Session to (un)subscribe; defaults to yourself
     #[arg(long)]
-    owner: String,
-    #[command(flatten)]
-    target: TargetArgs,
-}
-
-#[derive(Args)]
-pub struct ChannelCloseArgs {
-    name: String,
-    /// Posted to the general board as a result
-    #[arg(long)]
-    summary: Option<String>,
-    #[command(flatten)]
-    target: TargetArgs,
-}
-
-#[derive(Args)]
-pub struct FloorArgs {
-    /// Take the floor (when it is free or its holder is not working)
-    #[arg(long)]
-    take: bool,
-    /// Channel; defaults to the one you were spawned into
-    #[arg(long)]
-    channel: Option<String>,
-    #[command(flatten)]
-    target: TargetArgs,
-}
-
-#[derive(Args)]
-pub struct PassArgs {
-    /// Member (id or title) to hand the floor to
-    member: String,
-    /// What they should do next
-    body: String,
-    #[arg(long)]
-    channel: Option<String>,
+    who: Option<String>,
     #[command(flatten)]
     target: TargetArgs,
 }
@@ -159,12 +111,15 @@ pub struct SpawnArgs {
     /// Run in the orchestrator's checkout instead of a new worktree
     #[arg(long = "no-worktree", conflicts_with = "branch")]
     no_worktree: bool,
-    /// Join this channel, working in its owner's worktree instead of a new one
-    #[arg(long, conflicts_with_all = ["branch", "no_worktree"])]
-    join: Option<String>,
+    /// Work in this worker's worktree instead of a new one (pairing, review)
+    #[arg(long = "in", conflicts_with_all = ["branch", "no_worktree"])]
+    in_worker: Option<String>,
     /// Run in a fresh scratch directory with no repository
-    #[arg(long, conflicts_with_all = ["branch", "no_worktree", "join"])]
+    #[arg(long, conflicts_with_all = ["branch", "no_worktree", "in_worker"])]
     scratch: bool,
+    /// Subscribe the worker to this topic and tag its task with it
+    #[arg(long)]
+    topic: Option<String>,
     #[command(flatten)]
     agent: AgentArgs,
     #[command(flatten)]
@@ -180,9 +135,9 @@ pub struct PostArgs {
     /// Recipient session (id or title), `all` for every worker; defaults to the orchestrator
     #[arg(long)]
     to: Option<String>,
-    /// Channel to post in, or `general`; defaults to the channel you were spawned into
+    /// Tag the post with a topic; it then reaches the topic's subscribers
     #[arg(long)]
-    channel: Option<String>,
+    topic: Option<String>,
     #[command(flatten)]
     target: TargetArgs,
 }
@@ -214,16 +169,12 @@ pub async fn run(profile: &str, command: OrchestratedGroupCommands) -> Result<()
             println!("{}", orchestrated_group::memory_dir(&ctx.info)?.display());
             Ok(())
         }
-        OrchestratedGroupCommands::Channel { command } => match command {
-            ChannelCommands::Create(args) => channel_create(profile, args),
-            ChannelCommands::List(args) => {
-                print_channels(&Ctx::resolve(profile, &args)?);
-                Ok(())
-            }
-            ChannelCommands::Close(args) => channel_close(profile, args),
-        },
-        OrchestratedGroupCommands::Floor(args) => floor(profile, args),
-        OrchestratedGroupCommands::Pass(args) => pass(profile, args),
+        OrchestratedGroupCommands::Sub(args) => subscription(profile, args, true),
+        OrchestratedGroupCommands::Unsub(args) => subscription(profile, args, false),
+        OrchestratedGroupCommands::Topics(args) => {
+            print_topics(&Ctx::resolve(profile, &args)?);
+            Ok(())
+        }
     }
 }
 
@@ -294,23 +245,6 @@ impl Ctx {
         super::resolve_session(who, &members).cloned()
     }
 
-    /// `general` is the main board; no name means the caller's home channel, if any.
-    fn channel(&self, explicit: Option<&str>) -> Result<Option<String>> {
-        match explicit {
-            Some("general") => Ok(None),
-            Some(name) => self
-                .info
-                .open_channel(name)
-                .map(|c| Some(c.name.clone()))
-                .ok_or_else(|| anyhow!("no open channel '{name}'")),
-            None => Ok(self
-                .me
-                .as_ref()
-                .and_then(|me| self.info.home_channel(&me.id))
-                .map(|c| c.name.clone())),
-        }
-    }
-
     fn title_of(&self, id: &str) -> String {
         self.instances
             .iter()
@@ -322,7 +256,7 @@ impl Ctx {
         &self,
         kind: MessageKind,
         to: Option<String>,
-        channel: Option<String>,
+        topic: Option<String>,
         body: String,
     ) -> Result<u64> {
         let (from, from_title) = if kind == MessageKind::System {
@@ -339,7 +273,7 @@ impl Ctx {
                 to,
                 body,
                 at: Utc::now(),
-                channel,
+                topic,
             },
         )
     }
@@ -555,7 +489,7 @@ async fn init(profile: &str, args: InitArgs) -> Result<()> {
             to: Some(orchestrator.id.clone()),
             body: format!("OrchestratedGroup '{group_path}' started with orchestrator '{title}'"),
             at: Utc::now(),
-            channel: None,
+            topic: None,
         },
     )?;
     board.advance_cursor(&info.id, &orchestrator.id, board.highest_seq(&info.id))?;
@@ -613,25 +547,13 @@ async fn spawn(profile: &str, args: SpawnArgs) -> Result<()> {
         .map_or(orchestrator.project_path.clone(), |wt| {
             wt.main_repo_path.clone()
         });
-    let joining = match args.join.as_deref() {
-        Some(name) => {
-            let channel = ctx
-                .info
-                .open_channel(name)
-                .ok_or_else(|| anyhow!("no open channel '{name}'"))?
-                .clone();
-            let owner = ctx
-                .instances
-                .iter()
-                .find(|i| i.id == channel.owner)
-                .ok_or_else(|| anyhow!("channel '{name}' owner no longer exists"))?
-                .clone();
-            Some((channel, owner))
-        }
-        None => None,
-    };
-    let path = match (&joining, args.scratch) {
-        (Some((_, owner)), _) => owner.project_path.clone(),
+    let sharing = args
+        .in_worker
+        .as_deref()
+        .map(|who| ctx.member(who))
+        .transpose()?;
+    let path = match (&sharing, args.scratch) {
+        (Some(owner), _) => owner.project_path.clone(),
         (None, true) => "--scratch".into(),
         (None, false) => repo_path,
     };
@@ -643,7 +565,7 @@ async fn spawn(profile: &str, args: SpawnArgs) -> Result<()> {
         orchestrator.id.clone(),
         "-l".into(),
     ];
-    if !args.no_worktree && joining.is_none() && !args.scratch {
+    if !args.no_worktree && sharing.is_none() && !args.scratch {
         let branch = args
             .branch
             .clone()
@@ -656,13 +578,14 @@ async fn spawn(profile: &str, args: SpawnArgs) -> Result<()> {
     add.extend(agent_flags(&args.agent));
     add_session(&ctx.profile, add).await?;
     let worker = newest_session(&ctx.profile, &args.title, &orchestrator.group_path)?;
-    let channel_name = joining.as_ref().map(|(c, _)| c.name.clone());
-    if let Some(name) = &channel_name {
-        let worker_id = worker.id.clone();
+    let topic = args.topic.as_deref().map(slug);
+    if let Some(topic) = &topic {
+        let (worker_id, orchestrator_id) = (worker.id.clone(), orchestrator.id.clone());
         update_info(&ctx.profile, &ctx.group.path, |info| {
-            if let Some(c) = info.open_channel_mut(name) {
-                c.joiners.push(worker_id.clone());
-                c.floor = Some(worker_id);
+            info.subscribe(topic, &worker_id);
+            info.subscribe(topic, &orchestrator_id);
+            if let Some(owner) = &sharing {
+                info.subscribe(topic, &owner.id);
             }
         })?;
     }
@@ -677,7 +600,7 @@ async fn spawn(profile: &str, args: SpawnArgs) -> Result<()> {
             to: Some(worker.id.clone()),
             body: args.task.clone(),
             at: Utc::now(),
-            channel: channel_name.clone(),
+            topic: topic.clone(),
         },
     )?;
     // The task goes out directly below, so the relay must not deliver it again.
@@ -685,27 +608,14 @@ async fn spawn(profile: &str, args: SpawnArgs) -> Result<()> {
 
     let mut prompt =
         orchestrated_group::worker_task_prompt(&ctx.group.path, &orchestrator.title, &args.task);
-    if let Some((channel, owner)) = &joining {
-        prompt.push_str(&orchestrated_group::channel_join_prompt(
-            &channel.name,
-            &owner.title,
+    if let Some(owner) = &sharing {
+        prompt.push_str(&orchestrated_group::shared_worktree_prompt(&owner.title));
+    }
+    if let Some(topic) = &topic {
+        prompt.push_str(&format!(
+            "\n\nYou are subscribed to #{topic}; discuss this task there with \
+             `aoe og post --topic {topic}`."
         ));
-        board.post(
-            &ctx.info.id,
-            &BoardMessage {
-                kind: MessageKind::System,
-                from: SYSTEM_AUTHOR.into(),
-                from_title: SYSTEM_AUTHOR.into(),
-                to: Some(owner.id.clone()),
-                body: format!(
-                    "{} joined #{} in your worktree and holds the floor; wait for it to pass \
-                     the floor back before editing.",
-                    worker.title, channel.name
-                ),
-                at: Utc::now(),
-                channel: Some(channel.name.clone()),
-            },
-        )?;
     }
     let prompt = format!(
         "{prompt}\n\n{}",
@@ -733,156 +643,57 @@ fn post(profile: &str, args: PostArgs) -> Result<()> {
             (target.id != ctx.orchestrator_id()).then(|| target.id.clone())
         }
     };
-    let channel = ctx.channel(args.channel.as_deref())?;
-    let seq = ctx.post(args.kind, to, channel.clone(), args.body)?;
-    match channel {
-        Some(c) => println!("Posted #{seq} in #{c}"),
+    let topic = args.topic.as_deref().map(slug);
+    let seq = ctx.post(args.kind, to, topic.clone(), args.body)?;
+    match topic {
+        Some(t) => println!("Posted #{seq} in #{t}"),
         None => println!("Posted #{seq}"),
     }
     Ok(())
 }
 
-fn channel_create(profile: &str, args: ChannelCreateArgs) -> Result<()> {
+fn subscription(profile: &str, args: SubArgs, subscribe: bool) -> Result<()> {
     let ctx = Ctx::resolve(profile, &args.target)?;
-    let name = slug(&args.name);
-    if name.is_empty() || name == "general" {
-        bail!("pick a channel name other than '{}'", args.name);
+    let who = match args.who.as_deref() {
+        Some(who) => ctx.member(who)?,
+        None => ctx
+            .me
+            .clone()
+            .ok_or_else(|| anyhow!("pass --who <session> when not running inside one"))?,
+    };
+    let topic = slug(&args.topic);
+    if topic.is_empty() {
+        bail!("topic name cannot be empty");
     }
-    if ctx.info.open_channel(&name).is_some() {
-        bail!("channel '{name}' is already open");
-    }
-    let owner = ctx.member(&args.owner)?;
-    if owner.id == ctx.orchestrator_id() {
-        bail!("a channel works in a worker's worktree; pick a worker as --owner");
-    }
-    let owner_id = owner.id.clone();
+    let id = who.id.clone();
     update_info(&ctx.profile, &ctx.group.path, |info| {
-        info.channels.retain(|c| !(c.closed && c.name == name));
-        info.channels
-            .push(orchestrated_group::Channel::new(&name, &owner_id));
+        if subscribe {
+            info.subscribe(&topic, &id);
+        } else {
+            info.unsubscribe(&topic, &id);
+        }
     })?;
-    ctx.post(
-        MessageKind::System,
-        Some(owner.id.clone()),
-        Some(name.clone()),
-        format!(
-            "#{name} opened in your worktree. Helpers will join it with `og spawn --join {name}`; \
-             you hold the floor until you pass it."
-        ),
-    )?;
-    println!("Opened #{name} in {}'s worktree", owner.title);
+    let verb = if subscribe {
+        "Subscribed"
+    } else {
+        "Unsubscribed"
+    };
+    println!(
+        "{verb} {} {} #{topic}",
+        who.title,
+        if subscribe { "to" } else { "from" }
+    );
     Ok(())
 }
 
-fn print_channels(ctx: &Ctx) {
-    let open: Vec<_> = ctx.info.channels.iter().filter(|c| !c.closed).collect();
-    if open.is_empty() {
-        println!("(no open channels)");
+fn print_topics(ctx: &Ctx) {
+    if ctx.info.topics.is_empty() {
+        println!("(no topics)");
     }
-    for c in open {
-        let members: Vec<String> = c.members().map(|m| ctx.title_of(m)).collect();
-        let floor = c
-            .floor
-            .as_deref()
-            .map_or_else(|| "free".to_string(), |f| ctx.title_of(f));
-        println!(
-            "#{}  members: {}  floor: {floor}",
-            c.name,
-            members.join(", ")
-        );
+    for (topic, subs) in &ctx.info.topics {
+        let names: Vec<String> = subs.iter().map(|s| ctx.title_of(s)).collect();
+        println!("#{topic}  {}", names.join(", "));
     }
-}
-
-fn channel_close(profile: &str, args: ChannelCloseArgs) -> Result<()> {
-    let ctx = Ctx::resolve(profile, &args.target)?;
-    let name = ctx
-        .channel(Some(&args.name))?
-        .ok_or_else(|| anyhow!("the general board cannot be closed"))?;
-    update_info(&ctx.profile, &ctx.group.path, |info| {
-        if let Some(c) = info.open_channel_mut(&name) {
-            c.closed = true;
-            c.floor = None;
-        }
-    })?;
-    if let Some(summary) = args.summary {
-        ctx.post(
-            MessageKind::Result,
-            None,
-            None,
-            format!("#{name} closed: {summary}"),
-        )?;
-    }
-    println!("Closed #{name}");
-    Ok(())
-}
-
-fn floor(profile: &str, args: FloorArgs) -> Result<()> {
-    let ctx = Ctx::resolve(profile, &args.target)?;
-    let name = ctx
-        .channel(args.channel.as_deref())?
-        .ok_or_else(|| anyhow!("not in a channel; pass --channel <name>"))?;
-    let channel = ctx.info.open_channel(&name).expect("resolved above");
-    if !args.take {
-        let holder = channel
-            .floor
-            .as_deref()
-            .map_or_else(|| "free".to_string(), |f| ctx.title_of(f));
-        println!("#{name} floor: {holder}");
-        return Ok(());
-    }
-    let me = ctx
-        .me
-        .as_ref()
-        .ok_or_else(|| anyhow!("only a channel member can take the floor; pass --as"))?;
-    if !channel.has(&me.id) {
-        bail!("you are not in #{name}");
-    }
-    if let Some(holder) = channel.floor.as_deref().filter(|h| *h != me.id) {
-        let busy = ctx
-            .instances
-            .iter()
-            .any(|i| i.id == holder && i.status == crate::session::Status::Running);
-        if busy {
-            bail!(
-                "{} holds the floor and is working; wait for it to pass",
-                ctx.title_of(holder)
-            );
-        }
-    }
-    let me_id = me.id.clone();
-    update_info(&ctx.profile, &ctx.group.path, |info| {
-        if let Some(c) = info.open_channel_mut(&name) {
-            c.floor = Some(me_id);
-        }
-    })?;
-    println!("You hold the floor in #{name}");
-    Ok(())
-}
-
-fn pass(profile: &str, args: PassArgs) -> Result<()> {
-    let ctx = Ctx::resolve(profile, &args.target)?;
-    let name = ctx
-        .channel(args.channel.as_deref())?
-        .ok_or_else(|| anyhow!("not in a channel; pass --channel <name>"))?;
-    let channel = ctx.info.open_channel(&name).expect("resolved above");
-    let target = ctx.member(&args.member)?;
-    if !channel.has(&target.id) {
-        bail!("{} is not in #{name}", target.title);
-    }
-    let target_id = target.id.clone();
-    update_info(&ctx.profile, &ctx.group.path, |info| {
-        if let Some(c) = info.open_channel_mut(&name) {
-            c.floor = Some(target_id);
-        }
-    })?;
-    let seq = ctx.post(
-        MessageKind::Note,
-        Some(target.id.clone()),
-        Some(name.clone()),
-        format!("(floor is yours) {}", args.body),
-    )?;
-    println!("Passed the #{name} floor to {} (#{seq})", target.title);
-    Ok(())
 }
 
 fn board(profile: &str, args: BoardArgs) -> Result<()> {
@@ -943,9 +754,9 @@ fn status(profile: &str, args: TargetArgs) -> Result<()> {
             .unwrap_or_default();
         println!("  {} ({}) {:?}{branch}", w.title, w.id, w.status);
     }
-    if ctx.info.channels.iter().any(|c| !c.closed) {
-        println!("Channels:");
-        print_channels(&ctx);
+    if !ctx.info.topics.is_empty() {
+        println!("Topics:");
+        print_topics(&ctx);
     }
     Ok(())
 }
