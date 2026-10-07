@@ -153,6 +153,7 @@ impl HomeView {
     /// Rebuild the rows and, while stopped sessions are hidden, every group header's full count.
     pub(super) fn refresh_flat_items(&mut self) {
         self.flat_items = self.build_flat_items();
+        self.worker_titles = self.compute_worker_titles();
         self.group_totals = if self.hide_stopped_in_groups {
             self.build_flat_items_hiding(false)
                 .into_iter()

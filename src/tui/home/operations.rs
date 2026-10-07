@@ -653,8 +653,44 @@ impl HomeView {
                 };
                 self.request_deletion(request);
             }
+            if options.delete_workers {
+                for worker in self.worker_ids_of(&id) {
+                    self.delete_worker_with_defaults(&worker);
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Delete a worker the way the delete dialog would by default: its own worktree,
+    /// branch and sandbox cleanup settings decide.
+    fn delete_worker_with_defaults(&mut self, id: &str) {
+        let Some(inst) = self.get_instance(id).cloned() else {
+            return;
+        };
+        if self.restart_in_flight.contains(id) || inst.status == Status::Creating {
+            return;
+        }
+        let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+            &inst.source_profile,
+            std::path::Path::new(&inst.project_path),
+        );
+        let managed_worktree = inst
+            .worktree_info
+            .as_ref()
+            .is_some_and(|wt| wt.managed_by_aoe);
+        self.set_instance_status(id, Status::Deleting);
+        self.request_deletion(DeletionRequest {
+            session_id: id.to_string(),
+            delete_worktree: managed_worktree && config.worktree.auto_cleanup,
+            delete_branch: managed_worktree && config.worktree.delete_branch_on_cleanup,
+            delete_sandbox: inst.sandbox_info.as_ref().is_some_and(|s| s.enabled)
+                && config.sandbox.auto_cleanup,
+            force_delete: false,
+            detach_hooks: true,
+            keep_scratch: false,
+            instance: inst,
+        });
     }
 
     pub(super) fn delete_selected_group(&mut self) -> anyhow::Result<()> {

@@ -114,6 +114,29 @@ impl BoardMessage {
     }
 }
 
+/// What the relay types into a session: one compact line per message, prefixed so the
+/// agent can tell board mail from its user.
+pub fn delivery_text(msgs: &[(u64, BoardMessage)]) -> String {
+    let line = |seq: u64, m: &BoardMessage| {
+        let kind = match m.kind {
+            MessageKind::Note => String::new(),
+            k => format!(" {}", k.as_str()),
+        };
+        format!("#{seq}{kind} from {}: {}", m.from_title, m.body.trim())
+    };
+    match msgs {
+        [(seq, m)] => format!("[board] {}", line(*seq, m)),
+        _ => {
+            let mut text = format!("[board] {} new messages", msgs.len());
+            for (seq, m) in msgs {
+                text.push('\n');
+                text.push_str(&line(*seq, m));
+            }
+            text
+        }
+    }
+}
+
 pub fn root_dir() -> Result<PathBuf> {
     Ok(super::get_app_dir()?.join("orchestrated_groups"))
 }
@@ -383,6 +406,20 @@ mod tests {
         }
         board.advance_cursor(t, "w1", 1).unwrap();
         assert_eq!(board.cursor(t, "w1").unwrap(), 5);
+    }
+
+    #[test]
+    fn delivery_text_is_one_line_per_message() {
+        let mut result = msg("w1", None);
+        result.kind = MessageKind::Result;
+        assert_eq!(
+            delivery_text(&[(7, msg("user", None))]),
+            "[board] #7 from user: hi"
+        );
+        assert_eq!(
+            delivery_text(&[(7, msg("user", None)), (8, result)]),
+            "[board] 2 new messages\n#7 from user: hi\n#8 result from w1: hi"
+        );
     }
 
     #[test]

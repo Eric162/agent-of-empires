@@ -729,6 +729,7 @@ impl App {
                                                 let hit_scroll_target = hit_diff
                                                     || hit_list
                                                     || hit_preview
+                                                    || self.home.hit_orchestration_panel(mouse.column, mouse.row)
                                                     || self.home.owns_wheel();
                                                 match mouse.kind {
                                                     MouseEventKind::ScrollUp if hit_scroll_target => { self.home.handle_scroll_up(mouse.column, mouse.row); }
@@ -924,6 +925,7 @@ impl App {
                             let hit_scroll_target = hit_diff
                                 || hit_list
                                 || hit_preview
+                                || self.home.hit_orchestration_panel(mouse.column, mouse.row)
                                 || self.home.owns_wheel();
                             // Left-click priority: context menu, dialog (the diff
                             // view included), sidebar toggle, diagnostics, tips
@@ -954,6 +956,9 @@ impl App {
                                         .home
                                         .handle_diagnostics_click(mouse.column, mouse.row)
                                     || self.home.handle_tips_badge_click(mouse.column, mouse.row)
+                                    || self
+                                        .home
+                                        .handle_orchestration_panel_click(mouse.column, mouse.row)
                                 {
                                     let _ = self.home.clear_preview_selection();
                                     self.draw(terminal)?;

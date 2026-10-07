@@ -107,6 +107,15 @@ impl ConfirmDialog {
         self
     }
 
+    /// Add a checkbox that starts checked.
+    pub fn checkbox_checked(mut self, key: &'static str, label: &str) -> Self {
+        self = self.checkbox(key, label);
+        if let Some(last) = self.checkboxes.last_mut() {
+            last.checked = true;
+        }
+        self
+    }
+
     pub fn is_checked(&self, key: &str) -> bool {
         self.checkboxes.iter().any(|c| c.key == key && c.checked)
     }

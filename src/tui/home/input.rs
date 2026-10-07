@@ -31,6 +31,7 @@ use crate::tui::settings::{SettingsAction, SettingsView};
 
 /// Empty Trash checkbox keys.
 const EMPTY_TRASH_FORCE_FAILED: &str = "force_failed";
+const CASCADE_WORKERS: &str = "cascade_workers";
 const EMPTY_TRASH_DROP_FAILED: &str = "drop_failed";
 
 /// Longest gap between two left-clicks on one row that still counts as a double-click;
@@ -1044,7 +1045,13 @@ impl HomeView {
                 None
             }
             "trash_session" => {
+                let cascade = std::mem::take(&mut self.confirm_checked).contains(&CASCADE_WORKERS);
                 if let Some(session_id) = self.pending_trash_session.take() {
+                    if cascade {
+                        for worker in self.live_worker_ids_of(&session_id) {
+                            self.trash_session_by_id(&worker);
+                        }
+                    }
                     self.trash_session_by_id(&session_id);
                 }
                 None
@@ -4523,6 +4530,9 @@ impl HomeView {
             self.help_scroll = self.help_scroll.saturating_sub(STEP);
             return true;
         }
+        if self.scroll_orchestration_panel(col, row, -(STEP as isize)) {
+            return true;
+        }
         if self.system_health_open && self.hit_preview(col, row) {
             self.system_health_scroll = self.system_health_scroll.saturating_sub(3);
             return true;
@@ -5291,6 +5301,7 @@ impl HomeView {
                 let delete_to_trash = session_cfg.delete_to_trash;
                 if delete_to_trash && !already_trashed {
                     let sid = session_id.clone();
+                    let workers = self.live_worker_ids_of(&sid).len();
                     // With session.confirm_delete on (the default), guard the trash with
                     // a confirmation instead of trashing on the keystroke. The delete key
                     // accepts the dialog, so the deliberate gesture is two taps of one key
@@ -5303,17 +5314,25 @@ impl HomeView {
                         // guard is on by default, so a user who wants one-keystroke trash
                         // back shouldn't have to find the setting. Ticking it persists
                         // confirm_delete = false.
-                        let dialog = self
+                        let mut dialog = self
                             .confirm_by_repeating(
                                 ActionId::Delete,
                                 "Confirm Delete",
                                 &message,
                                 "trash_session",
                             )
-                            .buttons("Delete", "Cancel")
-                            .offering_dont_ask_again();
-                        self.confirm_dialog = Some(dialog);
+                            .buttons("Delete", "Cancel");
+                        if workers > 0 {
+                            dialog = dialog.checkbox_checked(
+                                CASCADE_WORKERS,
+                                &format!("Also trash its {workers} worker session(s)"),
+                            );
+                        }
+                        self.confirm_dialog = Some(dialog.offering_dont_ask_again());
                         return;
+                    }
+                    for worker in self.live_worker_ids_of(&sid) {
+                        self.trash_session_by_id(&worker);
                     }
                     self.trash_session_by_id(&sid);
                     return;
@@ -5329,6 +5348,7 @@ impl HomeView {
                     has_sandbox: inst.sandbox_info.as_ref().is_some_and(|s| s.enabled),
                     project_path: Some(inst.project_path.clone()),
                     is_scratch: inst.scratch,
+                    worker_count: self.worker_ids_of(session_id).len(),
                 };
 
                 let profile = self.config_profile();
@@ -5410,6 +5430,9 @@ impl HomeView {
         col: u16,
         row: u16,
     ) -> Option<Action> {
+        if let Some(panel) = &mut self.orchestration_panel {
+            panel.unfocus();
+        }
         let abs_idx = self.resolve_row_to_index(col, row)?;
 
         let is_double_click = matches!(
@@ -5762,6 +5785,9 @@ impl HomeView {
         if self.show_help {
             // HelpOverlay::render clamps this to the real max scroll.
             self.help_scroll = self.help_scroll.saturating_add(STEP);
+            return true;
+        }
+        if self.scroll_orchestration_panel(col, row, STEP as isize) {
             return true;
         }
         if self.system_health_open && self.hit_preview(col, row) {

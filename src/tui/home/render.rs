@@ -1811,6 +1811,18 @@ impl HomeView {
             }
         };
 
+        // Orchestrated workers read as subordinate rows: short title, muted colors.
+        let (text, style) = match item {
+            Item::Session { id, .. } => match self.worker_titles.get(id) {
+                Some(short) => (
+                    Cow::Owned(short.clone()),
+                    style.add_modifier(ratatui::style::Modifier::DIM),
+                ),
+                None => (text, style),
+            },
+            Item::Group { .. } => (text, style),
+        };
+
         let mut line_spans = Vec::with_capacity(6);
         if favorite_gutter {
             let favorited = matches!(item, Item::Session { id, .. }

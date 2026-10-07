@@ -295,6 +295,7 @@ impl HomeView {
             send_message_dialog: None,
             pending_board_post: None,
             orchestration_panel: None,
+            worker_titles: HashMap::new(),
             orchestration_init_rx: None,
             permission_response_dialog: None,
             pending_permission_response: None,

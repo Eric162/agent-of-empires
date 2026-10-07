@@ -936,11 +936,20 @@ fn flatten_group(
         let chief = group_sessions.remove(pos);
         group_sessions.insert(0, chief);
     }
-
-    for inst in group_sessions {
+    // Its workers follow it, one level deeper.
+    let is_worker = |i: &Instance| chief.is_some() && i.parent_session_id.as_deref() == chief;
+    let (workers, others): (Vec<&Instance>, Vec<&Instance>) =
+        group_sessions.into_iter().partition(|i| is_worker(i));
+    let chief_rows = usize::from(chief.is_some() && others.first().map(|i| i.id.as_str()) == chief);
+    let rows = others[..chief_rows]
+        .iter()
+        .map(|i| (*i, depth + 1))
+        .chain(workers.iter().map(|i| (*i, depth + 2)))
+        .chain(others[chief_rows..].iter().map(|i| (*i, depth + 1)));
+    for (inst, depth) in rows {
         items.push(Item::Session {
             id: inst.id.clone(),
-            depth: depth + 1,
+            depth,
         });
     }
 
@@ -1274,8 +1283,10 @@ mod tests {
 
     #[test]
     fn orchestrated_group_chief_leads_in_every_sort_order() {
-        let instances = vec![inst("a", "crew"), inst("b", "crew"), inst("z", "crew")];
+        let mut instances = vec![inst("a", "crew"), inst("b", "crew"), inst("z", "crew")];
         let chief = instances[2].id.clone();
+        instances[1].parent_session_id = Some(chief.clone());
+        let worker = instances[1].id.clone();
         let mut group = Group::new("crew", "crew");
         group.orchestration = Some(super::super::orchestrated_group::OrchestrationInfo {
             chief_session_id: Some(chief.clone()),
@@ -1294,6 +1305,18 @@ mod tests {
                 _ => None,
             });
             assert_eq!(first, Some(chief.as_str()), "{order:?}");
+            let rows: Vec<(&str, usize)> = items
+                .iter()
+                .filter_map(|i| match i {
+                    Item::Session { id, depth } => Some((id.as_str(), *depth)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                rows[1],
+                (worker.as_str(), 2),
+                "{order:?}: worker nests under chief"
+            );
         }
     }
 

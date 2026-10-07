@@ -18,6 +18,8 @@ pub struct DeleteOptions {
     pub delete_sandbox: bool,
     /// Keep the scratch directory on disk. Only read when `is_scratch`.
     pub keep_scratch: bool,
+    /// Also delete an orchestrator's worker sessions. Only read when `worker_count > 0`.
+    pub delete_workers: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -28,10 +30,13 @@ pub struct DeleteDialogConfig {
     /// Surfaces the "Keep scratch directory" opt-in, off by default so the
     /// normal flow stays one keystroke.
     pub is_scratch: bool,
+    /// Worker sessions of an orchestrator; surfaces a default-on cascade option.
+    pub worker_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FocusElement {
+    WorkersCheckbox,
     WorktreeCheckbox,
     ForceCheckbox,
     BranchCheckbox,
@@ -74,9 +79,12 @@ impl UnifiedDeleteDialog {
                 && user_config.worktree.delete_branch_on_cleanup,
             delete_sandbox: config.has_sandbox && user_config.sandbox.auto_cleanup,
             keep_scratch: false,
+            delete_workers: config.worker_count > 0,
         };
 
-        let initial_focus = if config.worktree_branch.is_some() {
+        let initial_focus = if config.worker_count > 0 {
+            FocusElement::WorkersCheckbox
+        } else if config.worktree_branch.is_some() {
             FocusElement::WorktreeCheckbox
         } else if config.has_sandbox {
             FocusElement::SandboxCheckbox
@@ -163,6 +171,9 @@ impl UnifiedDeleteDialog {
             FocusElement::KeepScratchCheckbox => {
                 self.options.keep_scratch = !self.options.keep_scratch;
             }
+            FocusElement::WorkersCheckbox => {
+                self.options.delete_workers = !self.options.delete_workers;
+            }
             FocusElement::YesButton | FocusElement::NoButton => {}
         }
     }
@@ -172,6 +183,9 @@ impl UnifiedDeleteDialog {
         options: &DeleteOptions,
     ) -> Vec<FocusElement> {
         let mut elements = Vec::new();
+        if config.worker_count > 0 {
+            elements.push(FocusElement::WorkersCheckbox);
+        }
         if config.worktree_branch.is_some() {
             elements.push(FocusElement::WorktreeCheckbox);
             if options.delete_worktree {
@@ -290,13 +304,15 @@ impl UnifiedDeleteDialog {
         let has_worktree = self.config.worktree_branch.is_some();
         let has_sandbox = self.config.has_sandbox;
         let is_scratch = self.config.is_scratch;
+        let has_workers = self.config.worker_count > 0;
         let show_force = has_worktree && self.options.delete_worktree;
         // Count checkbox rows: worktree + force (if worktree checked) +
         // branch (if worktree exists) + sandbox + keep-scratch (if scratch).
         let checkbox_count = if has_worktree { 2 } else { 0 }
             + (show_force as u16)
             + (has_sandbox as u16)
-            + (is_scratch as u16);
+            + (is_scratch as u16)
+            + (has_workers as u16);
 
         let dialog_width = 55;
         let dialog_height = if checkbox_count > 0 {
@@ -343,6 +359,24 @@ impl UnifiedDeleteDialog {
         chunk_idx += 1; // skip spacer
 
         if checkbox_count > 0 {
+            if has_workers {
+                let area = chunks[chunk_idx];
+                let focused = self.focus == FocusElement::WorkersCheckbox;
+                let label = format!("Delete its {} worker session(s)", self.config.worker_count);
+                self.render_checkbox(
+                    frame,
+                    area,
+                    theme,
+                    &label,
+                    None,
+                    self.options.delete_workers,
+                    focused,
+                );
+                self.focusable_rects
+                    .push((FocusElement::WorkersCheckbox, area));
+                chunk_idx += 1;
+            }
+
             if let Some(branch) = &self.config.worktree_branch {
                 let area = chunks[chunk_idx];
                 let focused = self.focus == FocusElement::WorktreeCheckbox;
@@ -556,6 +590,7 @@ mod tests {
                 has_sandbox: true,
                 project_path: None,
                 is_scratch: false,
+                worker_count: 0,
             },
             "default",
         )
@@ -569,6 +604,7 @@ mod tests {
                 has_sandbox: false,
                 project_path: None,
                 is_scratch: true,
+                worker_count: 0,
             },
             "default",
         )
@@ -596,6 +632,22 @@ mod tests {
         }
         dialog.yes_button_area = Rect::new(10, 8, 5, 1);
         dialog.no_button_area = Rect::new(19, 8, 4, 1);
+    }
+
+    #[test]
+    fn worker_cascade_starts_checked_focused_and_toggles() {
+        let mut dialog = UnifiedDeleteDialog::new(
+            "Chief".to_string(),
+            DeleteDialogConfig {
+                worker_count: 3,
+                ..DeleteDialogConfig::default()
+            },
+            "default",
+        );
+        assert_eq!(dialog.focus, FocusElement::WorkersCheckbox);
+        assert!(dialog.options().delete_workers);
+        dialog.handle_key(KeyEvent::from(KeyCode::Char(' ')));
+        assert!(!dialog.options().delete_workers);
     }
 
     #[test]

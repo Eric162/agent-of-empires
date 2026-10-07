@@ -160,19 +160,7 @@ fn plan(instances: &[Instance], edges: &[StatusChange]) -> Result<Vec<Delivery>>
                 if !can_receive(member) {
                     continue;
                 }
-                let mut text = format!(
-                    "[aoe OrchestratedGroup '{}' board: {} new message(s) for you]\n",
-                    group.path,
-                    msgs.len()
-                );
-                for (seq, m) in &msgs {
-                    text.push_str(&m.render(*seq));
-                    text.push('\n');
-                }
-                let aoe = orchestrated_group::aoe_bin();
-                text.push_str(&format!(
-                    "Respond with `{aoe} og post`; full history: `{aoe} og board`."
-                ));
+                let text = orchestrated_group::delivery_text(&msgs);
                 out.push(Delivery {
                     profile: profile.clone(),
                     session_id: member.id.clone(),

@@ -10,7 +10,8 @@ worker sessions. They coordinate through a durable message board. `aoe og`
 commands infer your group and identity from the session you run them in.
 
 Board messages addressed to you and worker completions are delivered into your
-session automatically once you are idle. Never poll, sleep or loop waiting for
+session automatically once you are idle, as lines starting with `[board]`. Reply
+to them with `aoe og post`, not in chat. Never poll, sleep or loop waiting for
 them: end your turn.
 
 ## Commands

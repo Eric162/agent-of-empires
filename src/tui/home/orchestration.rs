@@ -42,6 +42,12 @@ pub(in crate::tui) struct OrchestrationPanel {
     show_notices: bool,
     /// First visible line, kept between frames so the view does not jump.
     top: usize,
+    /// Set by the wheel: a fixed first line instead of following the tail.
+    pinned_top: Option<usize>,
+    /// Hit targets from the last frame.
+    area: Rect,
+    row_seqs: Vec<(u16, Option<u64>)>,
+    tab_hits: Vec<(Rect, PanelTab)>,
     memory_scroll: u16,
     cache: Option<PanelCache>,
 }
@@ -56,9 +62,17 @@ impl OrchestrationPanel {
             expand_all: false,
             show_notices: true,
             top: 0,
+            pinned_top: None,
+            area: Rect::default(),
+            row_seqs: Vec::new(),
+            tab_hits: Vec::new(),
             memory_scroll: 0,
             cache: None,
         }
+    }
+
+    pub(super) fn unfocus(&mut self) {
+        self.focused = false;
     }
 
     /// Move the selection over chat messages; notices are not selectable. Stepping past
@@ -169,7 +183,10 @@ impl HomeView {
                 }
             }
             (_, KeyCode::Char('\\' | 'm')) => self.open_board_post_dialog(),
-            (PanelTab::Board, KeyCode::Up | KeyCode::Char('k')) => panel.select_step(-1),
+            (PanelTab::Board, KeyCode::Up | KeyCode::Char('k')) => {
+                panel.pinned_top = None;
+                panel.select_step(-1)
+            }
             (PanelTab::Board, KeyCode::Down | KeyCode::Char('j')) => panel.select_step(1),
             (PanelTab::Board, KeyCode::Home | KeyCode::Char('g')) => {
                 panel.selected = panel
@@ -202,6 +219,64 @@ impl HomeView {
             (PanelTab::Memory, KeyCode::Home | KeyCode::Char('g')) => panel.memory_scroll = 0,
             _ => {}
         }
+    }
+
+    pub fn hit_orchestration_panel(&self, col: u16, row: u16) -> bool {
+        self.orchestration_panel
+            .as_ref()
+            .is_some_and(|p| p.area.contains(Position::new(col, row)))
+    }
+
+    /// Wheel over the panel: scroll the board or memory by `delta` lines.
+    pub(super) fn scroll_orchestration_panel(&mut self, col: u16, row: u16, delta: isize) -> bool {
+        if self.has_dialog() || !self.hit_orchestration_panel(col, row) {
+            return false;
+        }
+        let panel = self.orchestration_panel.as_mut().expect("hit above");
+        match panel.tab {
+            PanelTab::Board => {
+                panel.selected = None;
+                panel.pinned_top = Some(panel.top.saturating_add_signed(delta));
+            }
+            PanelTab::Memory => {
+                panel.memory_scroll = panel.memory_scroll.saturating_add_signed(delta as i16);
+            }
+        }
+        true
+    }
+
+    /// Click in the panel: focus it, switch tabs, or select a message (a second click
+    /// on the selected message expands it).
+    pub fn handle_orchestration_panel_click(&mut self, col: u16, row: u16) -> bool {
+        if self.has_dialog() || !self.hit_orchestration_panel(col, row) {
+            return false;
+        }
+        let panel = self.orchestration_panel.as_mut().expect("hit above");
+        panel.focused = true;
+        let pos = Position::new(col, row);
+        if let Some((_, tab)) = panel.tab_hits.iter().find(|(r, _)| r.contains(pos)) {
+            panel.tab = *tab;
+            return true;
+        }
+        if panel.tab != PanelTab::Board {
+            return true;
+        }
+        let Some(seq) = panel
+            .row_seqs
+            .iter()
+            .find(|(y, _)| *y == row)
+            .and_then(|(_, seq)| *seq)
+        else {
+            return true;
+        };
+        if panel.selected == Some(seq) {
+            if !panel.expanded.remove(&seq) {
+                panel.expanded.insert(seq);
+            }
+        } else {
+            panel.selected = Some(seq);
+        }
+        true
     }
 
     /// Compose a board post: to the selected worker, otherwise to the chief.
@@ -371,6 +446,47 @@ impl HomeView {
         }
         let panel = self.orchestration_panel.as_mut().expect("checked above");
         render_panel(frame, panel_area, theme, panel, &group.path);
+    }
+
+    /// Chief id per orchestrated group across loaded profiles.
+    fn chief_ids(&self) -> HashSet<String> {
+        self.group_trees
+            .values()
+            .flat_map(|t| t.get_all_groups())
+            .filter_map(|g| g.orchestration?.chief_session_id)
+            .collect()
+    }
+
+    /// Workers of `chief_id`: sessions it spawned, trashed or not.
+    pub(super) fn worker_ids_of(&self, chief_id: &str) -> Vec<String> {
+        if !self.chief_ids().contains(chief_id) {
+            return Vec::new();
+        }
+        self.instances()
+            .filter(|i| i.parent_session_id.as_deref() == Some(chief_id))
+            .map(|i| i.id.clone())
+            .collect()
+    }
+
+    /// Workers not already in the trash.
+    pub(super) fn live_worker_ids_of(&self, chief_id: &str) -> Vec<String> {
+        self.worker_ids_of(chief_id)
+            .into_iter()
+            .filter(|id| self.get_instance(id).is_some_and(|i| !i.is_trashed()))
+            .collect()
+    }
+
+    pub(super) fn compute_worker_titles(&self) -> HashMap<String, String> {
+        let mut out = HashMap::new();
+        for chief in self.chief_ids() {
+            let workers: Vec<(&str, &str)> = self
+                .instances()
+                .filter(|i| i.parent_session_id.as_deref() == Some(chief.as_str()))
+                .map(|i| (i.id.as_str(), i.title.as_str()))
+                .collect();
+            out.extend(worker_nicks(&workers));
+        }
+        out
     }
 
     fn nicks_for(&self, group: &Group, info: &OrchestrationInfo) -> HashMap<String, String> {
@@ -713,15 +829,31 @@ fn render_panel(
             Style::default().fg(theme.hint),
         )));
     let inner = block.inner(area);
+    panel.area = area;
+    let board_x = area.x + 1 + rendered_width(&format!(" #{group_path} ")) as u16 + 2;
+    panel.tab_hits = vec![
+        (Rect::new(board_x, area.y, 5, 1), PanelTab::Board),
+        (Rect::new(board_x + 6, area.y, 6, 1), PanelTab::Memory),
+    ];
+    panel.row_seqs.clear();
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
 
     let cache = panel.cache.as_ref().expect("loaded before render");
     match panel.tab {
         PanelTab::Board => {
-            let (lines, top) = board_lines(panel, cache, inner, theme);
-            frame.render_widget(Paragraph::new(lines), inner);
-            panel.top = top;
+            let view = board_lines(panel, cache, inner, theme);
+            frame.render_widget(Paragraph::new(view.lines), inner);
+            panel.top = view.top;
+            if panel.pinned_top.is_some_and(|p| p >= view.max_top) {
+                panel.pinned_top = None;
+            }
+            panel.row_seqs = view
+                .seqs
+                .into_iter()
+                .enumerate()
+                .map(|(i, seq)| (inner.y + i as u16, seq))
+                .collect();
         }
         PanelTab::Memory => {
             frame.render_widget(
@@ -736,22 +868,36 @@ fn render_panel(
 
 /// Chat order, newest at the bottom. With no selection the view follows the tail;
 /// otherwise it scrolls just enough to keep the selection visible.
+struct BoardView {
+    lines: Vec<Line<'static>>,
+    /// The message each visible line belongs to; `None` for notices.
+    seqs: Vec<Option<u64>>,
+    top: usize,
+    max_top: usize,
+}
+
 fn board_lines(
     panel_state: &OrchestrationPanel,
     cache: &PanelCache,
     inner: Rect,
     theme: &Theme,
-) -> (Vec<Line<'static>>, usize) {
+) -> BoardView {
     if cache.messages.is_empty() {
         let empty = Line::styled(
             "No messages yet. Press \\ to post.",
             Style::default().fg(theme.dimmed),
         );
-        return (vec![empty], 0);
+        return BoardView {
+            lines: vec![empty],
+            seqs: vec![None],
+            top: 0,
+            max_top: 0,
+        };
     }
     let width = inner.width as usize;
     let height = inner.height as usize;
     let mut all: Vec<Line<'static>> = Vec::new();
+    let mut seqs: Vec<Option<u64>> = Vec::new();
     let mut selected_range = None;
     let mut notices: Vec<&BoardMessage> = Vec::new();
     for (seq, m) in &cache.messages {
@@ -762,18 +908,22 @@ fn board_lines(
             continue;
         }
         all.extend(notice_lines(&notices, cache, width, theme));
+        seqs.resize(all.len(), None);
         notices.clear();
         let selected = panel_state.focused && panel_state.selected == Some(*seq);
         let expanded = panel_state.expand_all || panel_state.expanded.contains(seq);
         let start = all.len();
         all.extend(message_lines(m, cache, expanded, selected, width, theme));
+        seqs.resize(all.len(), Some(*seq));
         if selected {
             selected_range = Some((start, all.len()));
         }
     }
     all.extend(notice_lines(&notices, cache, width, theme));
+    seqs.resize(all.len(), None);
+    let max_top = all.len().saturating_sub(height);
     let top = match selected_range {
-        None => all.len().saturating_sub(height),
+        None => panel_state.pinned_top.unwrap_or(max_top).min(max_top),
         Some((start, end)) => {
             let mut top = panel_state.top.min(all.len().saturating_sub(1));
             if start < top {
@@ -785,7 +935,12 @@ fn board_lines(
             top
         }
     };
-    (all.into_iter().skip(top).take(height).collect(), top)
+    BoardView {
+        lines: all.into_iter().skip(top).take(height).collect(),
+        seqs: seqs.into_iter().skip(top).take(height).collect(),
+        top,
+        max_top,
+    }
 }
 
 /// A run of relay notices as one dim line per verb: `-!- Country, QuoteSheet finished`.
