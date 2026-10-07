@@ -289,6 +289,17 @@ pub fn aoe_bin() -> String {
 
 pub fn identity_footer(session_id: &str) -> String {
     let aoe = aoe_bin();
+    // Skills reach agents only when `skills.auto_propagate` is on, so name the file too.
+    let skill = super::skills_model::managed_skills_dir()
+        .map(|d| d.join(SKILL_DIR).join("SKILL.md").display().to_string())
+        .unwrap_or_default();
+    format!(
+        "If the `{SKILL_DIR}` skill is not loaded, read {skill}. {}",
+        identity_line(&aoe, session_id)
+    )
+}
+
+fn identity_line(aoe: &str, session_id: &str) -> String {
     format!(
         "Run every `aoe` command, including those in the skill, as `{aoe}`. Your aoe session \
          id is {session_id}; if `aoe pg` cannot detect you, pass `--as {session_id}`."
