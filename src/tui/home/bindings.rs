@@ -1084,7 +1084,7 @@ pub static BINDINGS: &[Binding] = &[
         context: Context::Always,
         help: Some(HelpMeta {
             section: HelpSection::Views,
-            desc: "Orchestration panel: board, memory, close",
+            desc: "Orchestration panel: open or focus (Esc returns to the list)",
         }),
         palette: Some(PaletteMeta {
             title: "Orchestration panel (board / memory)",

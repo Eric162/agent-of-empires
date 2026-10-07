@@ -2561,6 +2561,11 @@ impl HomeView {
             return None;
         }
 
+        if self.orchestration_panel_focused() {
+            self.handle_orchestration_panel_key(key);
+            return None;
+        }
+
         // Ctrl+K opens the command palette in any hotkey mode, activated before strict
         // normalization so the binding stays discoverable on every keymap.
         if matches!(key.code, KeyCode::Char('k') | KeyCode::Char('K'))
