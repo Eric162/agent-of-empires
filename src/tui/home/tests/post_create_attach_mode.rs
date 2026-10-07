@@ -92,6 +92,7 @@ fn sync_path_session_data(project: &str) -> crate::tui::dialogs::NewSessionData 
         scratch: false,
         fork_seed: None,
         structured: false,
+        orchestrated: false,
     }
 }
 

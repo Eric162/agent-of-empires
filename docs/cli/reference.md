@@ -870,6 +870,7 @@ Turn a group into an OrchestratedGroup and start its Chief of Staff session
 * `--structured-view` — Use the structured (ACP) view instead of a terminal session
 * `--agent <AGENT>` — ACP agent for the structured view
 * `--model <MODEL>` — Model override
+* `-y`, `--yolo` — Skip permission prompts (defaults to your aoe setting)
 
 
 
@@ -892,6 +893,7 @@ Start a worker session with a task (run by the chief)
 * `--structured-view` — Use the structured (ACP) view instead of a terminal session
 * `--agent <AGENT>` — ACP agent for the structured view
 * `--model <MODEL>` — Model override
+* `-y`, `--yolo` — Skip permission prompts (defaults to your aoe setting)
 * `-g`, `--group <GROUP>` — OrchestratedGroup path; defaults to the group of the session this runs in
 * `--as <AS_SESSION>` — Act as this session (id or title) instead of detecting the current one
 

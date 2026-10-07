@@ -13,6 +13,7 @@ mod lifecycle;
 mod live_send;
 mod live_send_prep;
 mod operations;
+mod orchestration;
 mod overlays;
 mod panes;
 mod persistence;
@@ -207,6 +208,10 @@ pub struct HomeView {
     pub(super) tips_badge_rect: Option<ratatui::layout::Rect>,
     pub(super) tips_badge_hovered: bool,
     pub(super) send_message_dialog: Option<super::dialogs::SendMessageDialog>,
+    /// Set while the send dialog composes a board post instead of a pane message.
+    pub(super) pending_board_post: Option<orchestration::BoardPostTarget>,
+    pub(super) orchestration_panel: Option<orchestration::OrchestrationPanel>,
+    pub(super) orchestration_init_rx: Option<std::sync::mpsc::Receiver<orchestration::InitResult>>,
     pub(super) permission_response_dialog: Option<super::dialogs::PermissionResponseDialog>,
     pub(super) pending_permission_response: Option<PermissionResponseTarget>,
     pub(super) pending_send_session: Option<String>,

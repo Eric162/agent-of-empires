@@ -93,6 +93,10 @@ pub(super) const FIELD_HELP: &[FieldHelp] = &[
         name: "Group",
         description: "Optional grouping for organization (Ctrl+P to browse existing groups)",
     },
+    FieldHelp {
+        name: "Orchestrate",
+        description: "Start a Chief of Staff that delegates to worker sessions in this group",
+    },
 ];
 
 #[derive(Clone)]
@@ -125,6 +129,8 @@ pub struct NewSessionData {
     /// Create in the structured (ACP) view instead of a tmux terminal. Only
     /// true for ACP-capable tools; `validate_structured_choice` enforces it.
     pub structured: bool,
+    /// Start a Chief of Staff for `group` instead of a plain session.
+    pub orchestrated: bool,
 }
 
 /// The one conversion from wizard output to builder input, so a new field
@@ -197,6 +203,7 @@ pub struct NewSessionDialog {
     /// every tool or profile change. Gates the Structured field's visibility
     /// like `has_yolo` / `has_sandbox`.
     pub(super) structured_capable: bool,
+    pub(super) orchestrated: bool,
     pub(super) workspace_repos: Vec<String>,
     pub(super) workspace_repos_expanded: bool,
     pub(super) workspace_repo_selected_index: usize,
@@ -410,6 +417,7 @@ pub(super) struct FieldIndices {
     pub worktree: usize,
     pub sandbox: usize,
     pub group: usize,
+    pub orchestrated: usize,
     /// One past the last focusable row, where Tab wraps.
     pub count: usize,
 }
@@ -536,6 +544,7 @@ impl NewSessionDialog {
             structured_enabled: structured_capable && structured_default,
             structured_default,
             structured_choice: None,
+            orchestrated: false,
             structured_capable,
             extra_env,
             extra_env_overridden: false,
@@ -855,6 +864,7 @@ impl NewSessionDialog {
             worktree: take(!is_host_only),
             sandbox: take(self.docker_available && !is_host_only),
             group: take(true),
+            orchestrated: take(!self.scratch),
             count: next,
         }
     }
@@ -983,6 +993,7 @@ impl NewSessionDialog {
             structured_enabled: false,
             structured_default: false,
             structured_choice: None,
+            orchestrated: false,
             structured_capable: false,
             extra_env: Vec::new(),
             extra_env_overridden: false,
@@ -1064,6 +1075,7 @@ impl NewSessionDialog {
             structured_enabled: false,
             structured_default: false,
             structured_choice: None,
+            orchestrated: false,
             structured_capable: false,
             extra_env: Vec::new(),
             extra_env_overridden: false,
@@ -1278,6 +1290,8 @@ impl NewSessionDialog {
             }
         } else if self.focused_field == fields.sandbox {
             self.set_sandbox_enabled(!self.sandbox_enabled);
+        } else if self.focused_field == fields.orchestrated {
+            self.orchestrated = !self.orchestrated;
         }
     }
 
@@ -1416,7 +1430,7 @@ impl NewSessionDialog {
                         return DialogResult::Continue;
                     }
                 }
-                if !self.validate_structured() {
+                if !self.validate_structured() || !self.validate_orchestrated() {
                     return DialogResult::Continue;
                 }
                 self.build_submit_result()
@@ -1523,6 +1537,12 @@ impl NewSessionDialog {
                 DialogResult::Continue
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                if self.focused_field == fields.orchestrated =>
+            {
+                self.orchestrated = !self.orchestrated;
+                DialogResult::Continue
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
                 if self.focused_field == fields.yolo =>
             {
                 self.yolo_mode = !self.yolo_mode;
@@ -1542,6 +1562,7 @@ impl NewSessionDialog {
                     && self.focused_field != fields.sandbox
                     && self.focused_field != fields.yolo
                     && self.focused_field != fields.structured
+                    && self.focused_field != fields.orchestrated
                 {
                     self.current_input_mut()
                         .handle_event(&crossterm::event::Event::Key(key));
@@ -2014,6 +2035,16 @@ impl NewSessionDialog {
     /// Check the structured-view choice still holds (adapter installed, tool
     /// capable), surfacing a refusal inline. Runs before any worktree, scratch
     /// or container work, so a refusal cannot orphan resources.
+    /// An orchestrated group needs a group to run and a repository for its workers.
+    fn validate_orchestrated(&mut self) -> bool {
+        if self.orchestrated && !self.scratch && self.group.value().trim().is_empty() {
+            self.error_message = Some("Orchestrate needs a group name".to_string());
+            self.focused_field = self.field_indices().group;
+            return false;
+        }
+        true
+    }
+
     fn validate_structured(&mut self) -> bool {
         if !(self.structured_enabled && self.structured_capable) {
             return true;
@@ -2082,6 +2113,7 @@ impl NewSessionDialog {
             scratch: self.scratch,
             fork_seed: self.fork_seed.clone(),
             structured: self.structured_enabled && self.structured_capable,
+            orchestrated: self.orchestrated && !self.scratch,
         })
     }
 
@@ -2124,7 +2156,7 @@ impl NewSessionDialog {
     }
 
     fn try_create_dir_and_submit(&mut self) -> DialogResult<NewSessionData> {
-        if !self.validate_structured() {
+        if !self.validate_structured() || !self.validate_orchestrated() {
             return DialogResult::Continue;
         }
         let path_str = self.path.value().trim().to_string();

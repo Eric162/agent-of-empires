@@ -284,6 +284,7 @@ fn test_create_session_in_all_mode_is_findable() {
         scratch: false,
         fork_seed: None,
         structured: false,
+        orchestrated: false,
     };
 
     let session_id = view.create_session(data).unwrap();

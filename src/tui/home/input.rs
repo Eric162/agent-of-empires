@@ -1685,6 +1685,11 @@ impl HomeView {
                 }
                 None
             }
+            DialogResult::Submit(data) if data.orchestrated => {
+                self.new_dialog = None;
+                self.start_orchestrated_group(data);
+                None
+            }
             DialogResult::Submit(data) => {
                 // Check if the tool uses hooks and user hasn't acknowledged yet
                 let tool_name = if data.tool.is_empty() {
@@ -2461,12 +2466,15 @@ impl HomeView {
                 DialogResult::Continue => {}
                 DialogResult::Cancel => {
                     self.send_message_dialog = None;
+                    self.pending_board_post = None;
                     self.pending_send_session = None;
                     self.pending_send_target = live_send::LiveSendTarget::Agent;
                 }
                 DialogResult::Submit(message) => {
                     self.send_message_dialog = None;
-                    if let Some(session_id) = self.pending_send_session.take() {
+                    if let Some(target) = self.pending_board_post.take() {
+                        self.post_to_board(target, message);
+                    } else if let Some(session_id) = self.pending_send_session.take() {
                         // Defer the work to execute_action so the loop can render a
                         // status indicator first: the send path may start a container or
                         // wait out an agent splash, which inline would freeze the TUI.
@@ -2881,6 +2889,8 @@ impl HomeView {
             ActionId::Fork => self.open_fork_from_selection(),
             ActionId::EmptyTrash => self.prompt_empty_trash(),
             ActionId::AutoName => return self.auto_name_selected(),
+            ActionId::OrchestrationPanel => self.cycle_orchestration_panel(),
+            ActionId::PostToBoard => self.open_board_post_dialog(),
         }
         None
     }
@@ -7201,6 +7211,7 @@ mod tests {
             scratch: false,
             fork_seed: None,
             structured: false,
+            orchestrated: false,
         }
     }
 

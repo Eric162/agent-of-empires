@@ -1229,6 +1229,7 @@ impl App {
                 full = true;
             }
 
+            self.home.poll_orchestration_init();
             if let Some(session_id) = self.home.apply_creation_results() {
                 self.dispatch_new_session_attach(&session_id, terminal)?;
                 if let Some(sid) = self.pending_structured_view_open.take() {

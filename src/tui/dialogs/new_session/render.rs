@@ -121,7 +121,10 @@ impl NewSessionDialog {
         if has_sandbox {
             constraints.push(Constraint::Length(2)); // Sandbox checkbox (summary only)
         }
-        constraints.push(Constraint::Length(2)); // Group (always, at the bottom)
+        constraints.push(Constraint::Length(2)); // Group
+        if !self.scratch {
+            constraints.push(Constraint::Length(2)); // Orchestrate checkbox
+        }
 
         // Inner width is 76: dialog width less borders and margin. The hint
         // line reserves 2 rows so per-field hints wrap instead of truncating.
@@ -419,6 +422,35 @@ impl NewSessionDialog {
         );
         self.focusable_rects.push((fields.group, area));
         ci += 1;
+
+        if !self.scratch {
+            let focused = self.focused_field == fields.orchestrated;
+            let on = self.orchestrated;
+            let accent_if_on = |on: bool| {
+                if on {
+                    Style::default().fg(theme.accent)
+                } else {
+                    Style::default().fg(theme.dimmed)
+                }
+            };
+            let line = Line::from(vec![
+                Span::styled(
+                    "Orchestrate:",
+                    if focused {
+                        Style::default().fg(theme.accent).underlined()
+                    } else {
+                        Style::default().fg(theme.text)
+                    },
+                ),
+                Span::raw(" "),
+                Span::styled(if on { "[x]" } else { "[ ]" }, accent_if_on(on).bold()),
+                Span::styled(" Chief of Staff for this group", accent_if_on(on)),
+            ]);
+            let area = chunks[ci];
+            frame.render_widget(Paragraph::new(line), area);
+            self.focusable_rects.push((fields.orchestrated, area));
+            ci += 1;
+        }
 
         // Hints/errors (last chunk)
         let hint_chunk = ci;

@@ -53,6 +53,9 @@ pub struct AgentArgs {
     /// Model override
     #[arg(long)]
     model: Option<String>,
+    /// Skip permission prompts (defaults to your aoe setting)
+    #[arg(long, short = 'y')]
+    yolo: bool,
 }
 
 #[derive(Args)]
@@ -249,6 +252,9 @@ fn agent_flags(agent: &AgentArgs) -> Vec<String> {
     }
     if let Some(m) = &agent.model {
         out.extend(["--model".into(), m.clone()]);
+    }
+    if agent.yolo {
+        out.push("-y".into());
     }
     out
 }

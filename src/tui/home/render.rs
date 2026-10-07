@@ -966,7 +966,7 @@ impl HomeView {
             // list column.
             let strip_col = self.diagnostics_dock(frame, strip_area, theme);
             self.render_collapsed_strip(frame, strip_col, theme);
-            self.render_preview(frame, preview_area, theme);
+            self.render_preview_with_panel(frame, preview_area, theme);
         } else if available_width < responsive::STACKED_BREAKPOINT {
             let main_height = content_area.height;
             let list_height = responsive::stacked_list_height(main_height);
@@ -986,7 +986,7 @@ impl HomeView {
             // under; the strip spans the list's width.
             let list_rect = self.diagnostics_dock(frame, chunks[0], theme);
             self.render_list(frame, list_rect, theme, ListLayout::Stacked);
-            self.render_preview(frame, chunks[1], theme);
+            self.render_preview_with_panel(frame, chunks[1], theme);
         } else {
             // Side-by-side: cap list width so the preview pane keeps its
             // usability floor (PREVIEW_MIN_WIDTH).
@@ -1010,7 +1010,7 @@ impl HomeView {
             let list_rect = self.diagnostics_dock(frame, list_area, theme);
             let layout = ListLayout::Horizontal(self.sidebar_position);
             self.render_list(frame, list_rect, theme, layout);
-            self.render_preview(frame, preview_area, theme);
+            self.render_preview_with_panel(frame, preview_area, theme);
         }
         self.render_status_bar(frame, main_chunks[1], theme);
 
@@ -2620,7 +2620,7 @@ impl HomeView {
     }
 
     /// Paint the preview and refresh geometry used by selection and live-send.
-    fn render_preview(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    pub(super) fn render_preview(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         self.structured_transcript_painted = false;
         if self.system_health_open {
             self.preview_outer_area = area;

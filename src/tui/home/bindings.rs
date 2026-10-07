@@ -89,6 +89,10 @@ pub enum ActionId {
     AutoName,
     /// Permanently purge every trashed session after a confirm (palette only; no chord).
     EmptyTrash,
+    /// Cycle the orchestrated-group side panel: board, memory, closed.
+    OrchestrationPanel,
+    /// Post a note to the orchestrated group's board.
+    PostToBoard,
 }
 
 /// A single chord. `ctrl` requires the Control modifier; Shift is implicit in the
@@ -1072,6 +1076,37 @@ pub static BINDINGS: &[Binding] = &[
             group: PaletteGroup::Actions,
         }),
     },
+    // Every letter is taken, so the orchestration panel uses the `|` / `\` pair.
+    Binding {
+        id: ActionId::OrchestrationPanel,
+        non_strict: &[k('|')],
+        strict: &[k('|')],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Views,
+            desc: "Orchestration panel: board, memory, close",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Orchestration panel (board / memory)",
+            keywords: &["orchestrated", "chief", "board", "memory", "panel", "side"],
+            group: PaletteGroup::Views,
+        }),
+    },
+    Binding {
+        id: ActionId::PostToBoard,
+        non_strict: &[k('\\')],
+        strict: &[k('\\')],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Actions,
+            desc: "Post to the orchestrated group's board",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Post to orchestration board",
+            keywords: &["orchestrated", "chief", "board", "post", "message"],
+            group: PaletteGroup::Actions,
+        }),
+    },
     // The mnemonic keys (a/A, n/N, r/R, t/T) are taken and the home keyspace is saturated
     // (see Fork), so "Auto-name now" lands on the free v/V pair. Gated to a
     // still-default-named session inside the handler.
@@ -1143,6 +1178,8 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::Fork => "fork",
         ActionId::AutoName => "auto-name",
         ActionId::EmptyTrash => "empty-trash",
+        ActionId::OrchestrationPanel => "orchestration-panel",
+        ActionId::PostToBoard => "post-to-board",
     }
 }
 

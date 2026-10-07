@@ -7,7 +7,7 @@ use std::fs;
 const TEST_PATH: &str = ".";
 
 /// Field layout with one tool and one profile: path 0, title 1, yolo 2,
-/// worktree 3, group 4.
+/// worktree 3, group 4, orchestrate 5.
 fn single_tool_dialog() -> NewSessionDialog {
     NewSessionDialog::new_with_tools(vec!["claude"], TEST_PATH.to_string())
 }
@@ -67,6 +67,26 @@ fn screen_of(dialog: &mut NewSessionDialog, width: u16, height: u16) -> String {
 
 fn draw(dialog: &mut NewSessionDialog) -> ratatui::buffer::Buffer {
     crate::tui::dialogs::test_render::draw(100, 40, |f, theme| dialog.render(f, f.area(), theme))
+}
+
+#[test]
+fn orchestrate_requires_a_group_and_marks_the_submit() {
+    let mut dialog = single_tool_dialog();
+    dialog.title = Input::new("chief".to_string());
+    let fields = dialog.field_indices();
+    dialog.focused_field = fields.orchestrated;
+    dialog.handle_key(key(KeyCode::Char(' ')));
+    assert!(dialog.orchestrated);
+
+    assert!(matches!(
+        dialog.handle_key(key(KeyCode::Enter)),
+        DialogResult::Continue
+    ));
+    assert_eq!(dialog.focused_field, fields.group);
+    type_str(&mut dialog, "crew");
+    let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
+    assert!(data.orchestrated);
+    assert_eq!(data.group, "crew");
 }
 
 #[test]
@@ -138,20 +158,20 @@ fn tab_walks_the_visible_fields_in_both_directions() {
     let mut worktree_on = single_tool_dialog();
     worktree_on.worktree_enabled = true;
     for mut dialog in [single_tool_dialog(), worktree_on] {
-        for expected in [1, 2, 3, 4, 0] {
+        for expected in [1, 2, 3, 4, 5, 0] {
             dialog.handle_key(key(KeyCode::Tab));
             assert_eq!(dialog.focused_field, expected);
         }
     }
 
     let mut dialog = multi_tool_dialog();
-    for expected in [1, 2, 3, 4, 5, 0] {
+    for expected in [1, 2, 3, 4, 5, 6, 0] {
         dialog.handle_key(key(KeyCode::Tab));
         assert_eq!(dialog.focused_field, expected);
     }
 
     let mut dialog = single_tool_dialog();
-    for expected in [4, 3, 2, 1, 0] {
+    for expected in [5, 4, 3, 2, 1, 0] {
         dialog.handle_key(shift_key(KeyCode::BackTab));
         assert_eq!(dialog.focused_field, expected);
     }
@@ -168,6 +188,8 @@ fn tab_walks_the_visible_fields_in_both_directions() {
         assert_eq!(dialog.focused_field, 5, "sandbox row");
         dialog.handle_key(key(KeyCode::Tab));
         assert_eq!(dialog.focused_field, 6, "group row");
+        dialog.handle_key(key(KeyCode::Tab));
+        assert_eq!(dialog.focused_field, 7, "orchestrate row");
         dialog.handle_key(key(KeyCode::Tab));
         assert_eq!(dialog.focused_field, 0);
     }
