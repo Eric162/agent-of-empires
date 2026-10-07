@@ -864,6 +864,8 @@ Turn a group into a ProjectGroup and start its Chief of Staff session
 
 * `--brief <BRIEF>` — What this project is for
 * `-t`, `--title <TITLE>` — Chief session title
+* `-w`, `--worktree <WORKTREE>` — Run the chief in a worktree on this integration branch (created if missing); workers then branch from it
+* `--base-branch <BASE_BRANCH>` — Base for a newly created --worktree branch (defaults to the repo's default branch)
 * `--tool <TOOL>` — Named agent to run (defaults to your aoe default)
 * `--structured-view` — Use the structured (ACP) view instead of a terminal session
 * `--agent <AGENT>` — ACP agent for the structured view
