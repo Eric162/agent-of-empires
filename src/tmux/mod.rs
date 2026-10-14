@@ -744,6 +744,33 @@ impl LiveSessionSnapshot {
         Self::default()
     }
 
+    /// Never forks tmux; stale caches read as unreachable.
+    pub(crate) fn from_display_caches() -> Self {
+        let fresh = |time: Option<Instant>| time.is_some_and(|at| at.elapsed() <= CACHE_TTL);
+        let panes = PANE_META_CACHE
+            .read()
+            .ok()
+            .filter(|cache| fresh(cache.time))
+            .and_then(|cache| cache.data.as_deref().cloned());
+        let sessions = SESSION_CACHE
+            .read()
+            .ok()
+            .filter(|cache| fresh(cache.time) && cache.outcome == SessionCacheRefresh::Populated)
+            .and_then(|cache| {
+                cache.data.as_ref().map(|sessions| {
+                    sessions
+                        .iter()
+                        .map(|(name, session)| (name.clone(), session.kind))
+                        .collect()
+                })
+            })
+            .filter(|_| panes.is_some());
+        let snapshot = Self::new();
+        let _ = snapshot.sessions.set(sessions);
+        let _ = snapshot.panes.set(panes);
+        snapshot
+    }
+
     #[cfg(test)]
     pub(crate) fn from_parts(
         names: Option<Vec<String>>,
@@ -3910,6 +3937,45 @@ mod tests {
             }
         }
     }
+    #[test]
+    #[serial_test::serial]
+    fn display_cache_snapshot_answers_from_fresh_caches_only() {
+        let sessions = SessionCacheGuard::capture();
+        let panes = PaneMetaCacheGuard::capture();
+        let name = format!("{P}Agent_{ID8}");
+        sessions.force_present(&[name.as_str()]);
+        if let Ok(mut cache) = PANE_META_CACHE.write() {
+            cache.data = Some(std::sync::Arc::new(HashMap::from([(
+                name.clone(),
+                PaneMetadata {
+                    pane_dead: true,
+                    pane_current_command: None,
+                    pane_start_command_is_protected: false,
+                    pane_pid: None,
+                    pane_title: None,
+                    window_activity: None,
+                    window_size: None,
+                },
+            )])));
+            cache.time = Some(Instant::now());
+        }
+
+        let snapshot = LiveSessionSnapshot::from_display_caches();
+        assert_eq!(
+            snapshot.names().unwrap().collect::<Vec<_>>(),
+            vec![name.as_str()]
+        );
+        assert!(snapshot.pane_dead(&name));
+
+        panes.force_stale();
+        assert!(
+            LiveSessionSnapshot::from_display_caches()
+                .sessions()
+                .is_none(),
+            "a stale pane cache must skip the cycle, not fork tmux"
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn a_failed_pane_snapshot_is_an_answer_so_rows_do_not_re_fork() {
