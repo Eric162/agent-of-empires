@@ -2225,15 +2225,23 @@ static PROBE_TIMEOUT_DIVISOR: std::sync::OnceLock<u32> = std::sync::OnceLock::ne
 fn agent_probe_output(
     command: &mut Command,
     timeout: std::time::Duration,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> Option<std::process::Output> {
     #[cfg(test)]
     let timeout = timeout / PROBE_TIMEOUT_DIVISOR.get().copied().unwrap_or(1);
-    match crate::process::run_with_timeout_process_group(
-        command.stdin(std::process::Stdio::null()),
-        timeout,
-    ) {
+    if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+        return None;
+    }
+    command.stdin(std::process::Stdio::null());
+    let result = match cancel {
+        Some(cancel) => crate::process::run_until_cancelled_process_group(command, timeout, cancel),
+        None => crate::process::run_with_timeout_process_group(command, timeout),
+    };
+    match result {
         Ok(output) => {
-            if output.is_none() {
+            if output.is_none()
+                && !cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            {
                 tracing::warn!(
                     program = ?command.get_program(),
                     timeout_s = timeout.as_secs(),
@@ -2246,15 +2254,22 @@ fn agent_probe_output(
     }
 }
 
-fn agent_available_direct(agent: &crate::agents::AgentDef) -> Option<bool> {
+fn agent_available_direct(
+    agent: &crate::agents::AgentDef,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Option<bool> {
     use crate::agents::DetectionMethod;
     match &agent.detection {
         DetectionMethod::Which(binary) => {
             if binary.contains('/') || binary.contains('\\') {
                 return Some(std::path::Path::new(binary).exists());
             }
-            let found = agent_probe_output(Command::new("which").arg(binary), AGENT_PROBE_TIMEOUT)
-                .is_some_and(|output| output.status.success());
+            let found = agent_probe_output(
+                Command::new("which").arg(binary),
+                AGENT_PROBE_TIMEOUT,
+                cancel,
+            )
+            .is_some_and(|output| output.status.success());
             if found {
                 Some(true)
             } else {
@@ -2262,7 +2277,7 @@ fn agent_available_direct(agent: &crate::agents::AgentDef) -> Option<bool> {
             }
         }
         DetectionMethod::RunWithArg(binary, arg) => {
-            let ok = agent_probe_output(Command::new(binary).arg(arg), AGENT_PROBE_TIMEOUT)
+            let ok = agent_probe_output(Command::new(binary).arg(arg), AGENT_PROBE_TIMEOUT, cancel)
                 .is_some_and(|output| output.status.success());
             if ok {
                 Some(true)
@@ -2311,7 +2326,10 @@ fn parse_login_shell_probe(stdout: &str) -> std::collections::HashSet<String> {
 }
 
 /// One login shell for all agents, since profile startup is slow.
-fn login_shell_probe(agents: &[&crate::agents::AgentDef]) -> std::collections::HashSet<String> {
+fn login_shell_probe(
+    agents: &[&crate::agents::AgentDef],
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> std::collections::HashSet<String> {
     if agents.is_empty() {
         return std::collections::HashSet::new();
     }
@@ -2319,6 +2337,7 @@ fn login_shell_probe(agents: &[&crate::agents::AgentDef]) -> std::collections::H
     agent_probe_output(
         Command::new(&shell).args(["-lc", &login_shell_probe_script(agents)]),
         LOGIN_SHELL_PROBE_TIMEOUT,
+        cancel,
     )
     .map(|o| parse_login_shell_probe(&String::from_utf8_lossy(&o.stdout)))
     .unwrap_or_default()
@@ -2384,6 +2403,13 @@ fn partition_cached_agents<'a>(
 pub(crate) fn probe_agents_available(
     agents: &[&crate::agents::AgentDef],
 ) -> std::collections::HashSet<String> {
+    probe_agents_available_inner(agents, None)
+}
+
+fn probe_agents_available_inner(
+    agents: &[&crate::agents::AgentDef],
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> std::collections::HashSet<String> {
     let (mut found, uncached) = partition_cached_agents(agents);
     if uncached.is_empty() {
         return found;
@@ -2396,7 +2422,22 @@ pub(crate) fn probe_agents_available(
     }
 
     // A queued caller must consume the preceding probe's publication before starting another.
-    let _probe_guard = AGENT_PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _probe_guard = if let Some(cancel) = cancel {
+        loop {
+            if cancel.is_cancelled() {
+                return found;
+            }
+            match AGENT_PROBE_LOCK.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::thread::sleep(Duration::from_millis(1))
+                }
+            }
+        }
+    } else {
+        AGENT_PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    };
     let (already_found, uncached) = partition_cached_agents(&uncached);
     found.extend(already_found);
     if uncached.is_empty() {
@@ -2406,12 +2447,18 @@ pub(crate) fn probe_agents_available(
     let mut results: Vec<(&str, bool)> = Vec::new();
     let mut needs_shell: Vec<&crate::agents::AgentDef> = Vec::new();
     for agent in uncached {
-        match agent_available_direct(agent) {
+        if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return found;
+        }
+        match agent_available_direct(agent, cancel) {
             Some(ok) => results.push((agent.name, ok)),
             None => needs_shell.push(agent),
         }
     }
-    let shell_found = login_shell_probe(&needs_shell);
+    let shell_found = login_shell_probe(&needs_shell, cancel);
+    if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+        return found;
+    }
     for agent in needs_shell {
         results.push((agent.name, shell_found.contains(agent.name)));
     }
@@ -2435,6 +2482,22 @@ pub(crate) fn is_agent_available(agent: &crate::agents::AgentDef) -> bool {
     probe_agents_available(&[agent]).contains(agent.name)
 }
 
+/// A nonblocking UI snapshot: cached answers, with local PATH lookups for misses.
+pub(crate) fn agent_availability_snapshot(agents: &[&crate::agents::AgentDef]) -> HashSet<String> {
+    let (mut found, uncached) = partition_cached_agents(agents);
+    found.extend(
+        uncached
+            .into_iter()
+            .filter_map(|agent| match agent.detection {
+                crate::agents::DetectionMethod::Which(binary) if which::which(binary).is_ok() => {
+                    Some(agent.name.to_string())
+                }
+                _ => None,
+            }),
+    );
+    found
+}
+
 #[derive(Debug, Clone)]
 pub struct AvailableTools {
     available: Vec<String>,
@@ -2443,15 +2506,8 @@ pub struct AvailableTools {
 impl AvailableTools {
     /// Startup's local snapshot. Login shells and executable probes run later.
     pub(crate) fn detect_on_path() -> Self {
-        let found = crate::agents::AGENTS
-            .iter()
-            .filter(|agent| match agent.detection {
-                crate::agents::DetectionMethod::Which(binary) => which::which(binary).is_ok(),
-                crate::agents::DetectionMethod::RunWithArg(_, _) => false,
-            })
-            .map(|agent| agent.name.to_string())
-            .collect();
-        Self::from_detected(found)
+        let refs: Vec<_> = crate::agents::AGENTS.iter().collect();
+        Self::from_detected(agent_availability_snapshot(&refs))
     }
 
     pub fn detect() -> Self {
@@ -2460,6 +2516,11 @@ impl AvailableTools {
         let refs: Vec<&crate::agents::AgentDef> = agents.iter().collect();
         let found = probe_agents_available(&refs);
         Self::from_detected(found)
+    }
+
+    pub(crate) fn detect_cancellable(cancel: &tokio_util::sync::CancellationToken) -> Self {
+        let refs: Vec<_> = crate::agents::AGENTS.iter().collect();
+        Self::from_detected(probe_agents_available_inner(&refs, Some(cancel)))
     }
 
     fn from_detected(found: HashSet<String>) -> Self {
@@ -2690,6 +2751,9 @@ mod tests {
         let _env = probe_environment(home.path());
         let memo = AgentAvailabilityGuard::capture();
         memo.clear();
+        let _blocked_probe = AGENT_PROBE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let executable = home.path().join("bin/claude");
         std::fs::write(&executable, "#!/bin/sh\nexit 1\n").unwrap();
         std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -4185,10 +4249,13 @@ mod tests {
             ),
         )
         .unwrap();
-        let found = login_shell_probe(&[
-            crate::agents::get_agent("vibe").unwrap(),
-            crate::agents::get_agent("claude").unwrap(),
-        ]);
+        let found = login_shell_probe(
+            &[
+                crate::agents::get_agent("vibe").unwrap(),
+                crate::agents::get_agent("claude").unwrap(),
+            ],
+            None,
+        );
         assert_eq!(found, HashSet::from(["claude".to_owned()]));
         assert_eq!(
             std::fs::read_to_string(home.path().join("probes")).unwrap(),

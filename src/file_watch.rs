@@ -114,9 +114,17 @@ struct SubscriptionId(u64);
 struct DirState {
     refcount: usize,
     pending: Option<u64>,
+    failure: Option<WatchInstallFailure>,
     /// Re-stat on every subscribe: a mismatch forces a rewatch, since NonRecursive watches do
     /// not follow a same-path recreate. Cleared on rewatch failure.
     installed_identity: Option<WatchIdentity>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WatchInstallFailure {
+    pub kind: WatchErrorKind,
+    pub message: String,
+    retry_after: Instant,
 }
 
 struct Subscription {
@@ -397,6 +405,7 @@ impl FileWatchService {
         let state = inner.dirs.entry(dir.clone()).or_insert(DirState {
             refcount: 0,
             pending: None,
+            failure: None,
             installed_identity: None,
         });
         let pre_bump = state.refcount;
@@ -440,6 +449,7 @@ impl FileWatchService {
             let state = inner.dirs.get_mut(&dir).expect("entry exists");
             state.installed_identity = current_identity;
             state.pending = deferred.then_some(generation);
+            state.failure = None;
         }
 
         let (tx, rx) = mpsc::channel::<FileEvent>(cap);
@@ -494,6 +504,66 @@ pub mod test_support {
 
     pub fn noop_filewatch() -> Arc<FileWatchService> {
         FileWatchService::noop()
+    }
+
+    #[cfg(test)]
+    pub(crate) struct ManualBackend {
+        service: std::sync::Weak<FileWatchService>,
+        requests: std::sync::mpsc::Receiver<super::WatchRequest>,
+    }
+
+    #[cfg(test)]
+    pub(crate) fn manual_filewatch() -> (Arc<FileWatchService>, ManualBackend) {
+        let (tx, requests) = std::sync::mpsc::channel();
+        let (dispatch, _) = tokio::sync::mpsc::unbounded_channel();
+        let service = FileWatchService::build(Some(tx), dispatch);
+        let backend = ManualBackend {
+            service: Arc::downgrade(&service),
+            requests,
+        };
+        (service, backend)
+    }
+
+    #[cfg(test)]
+    impl ManualBackend {
+        pub(crate) fn complete_watch(&self, result: notify::Result<()>) -> std::path::PathBuf {
+            loop {
+                match self
+                    .requests
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap()
+                {
+                    super::WatchRequest::Unwatch(_) => continue,
+                    super::WatchRequest::Watch {
+                        dir,
+                        generation,
+                        reply,
+                    } => {
+                        assert!(reply.is_none());
+                        super::watch_ready(
+                            &self.service.upgrade().unwrap(),
+                            &dir,
+                            generation,
+                            result,
+                        );
+                        return dir;
+                    }
+                }
+            }
+        }
+
+        pub(crate) fn allow_retry(&self, dir: &Path) {
+            let service = self.service.upgrade().unwrap();
+            let mut inner = service.inner.lock().unwrap();
+            inner
+                .dirs
+                .get_mut(dir)
+                .unwrap()
+                .failure
+                .as_mut()
+                .unwrap()
+                .retry_after = std::time::Instant::now();
+        }
     }
 }
 
@@ -657,8 +727,15 @@ fn watch_ready(
             .filter(|state| state.pending == Some(generation))
         {
             state.pending = None;
-            if result.is_err() {
+            if let Err(error) = &result {
                 state.installed_identity = None;
+                state.failure = Some(WatchInstallFailure {
+                    kind: classify_notify_err(error),
+                    message: error.to_string(),
+                    retry_after: Instant::now() + Duration::from_secs(5),
+                });
+            } else {
+                state.failure = None;
             }
         }
     }
@@ -687,6 +764,34 @@ fn watch_ready(
                 EventSource::Local,
             );
         }
+    }
+}
+
+impl SubscriptionHandle {
+    pub(crate) fn installation_failure(&self) -> Option<WatchInstallFailure> {
+        let svc = self.service.upgrade()?;
+        let inner = svc.inner.lock().ok()?;
+        let sub = inner.subscriptions.get(&self.id)?;
+        inner.dirs.get(&sub.spec.dir)?.failure.clone()
+    }
+
+    pub(crate) fn installation_pending(&self) -> bool {
+        let Some(svc) = self.service.upgrade() else {
+            return false;
+        };
+        let Ok(inner) = svc.inner.lock() else {
+            return false;
+        };
+        inner
+            .subscriptions
+            .get(&self.id)
+            .and_then(|sub| inner.dirs.get(&sub.spec.dir))
+            .is_some_and(|state| state.pending.is_some())
+    }
+
+    pub(crate) fn installation_retry_due(&self) -> bool {
+        self.installation_failure()
+            .is_some_and(|failure| Instant::now() >= failure.retry_after)
     }
 }
 

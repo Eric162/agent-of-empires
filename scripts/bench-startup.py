@@ -5,6 +5,8 @@ Build with `cargo build --profile dev-release`, then run:
     python3 scripts/bench-startup.py --runs 20 --sessions 100 --profiles 4
     python3 scripts/bench-startup.py --upgrade --stall-updates --slow-probes
 
+For a build with debug assertions enabled, add `--namespace dev`.
+
 Requires Python 3.11+, Unix, and tmux. Uses synthetic data, a private HOME and
 tmux socket, no telemetry, and optionally a local HTTP endpoint that never
 responds. Every launch, including the first, counts against the budget.
@@ -157,6 +159,7 @@ def main():
     parser.add_argument("--upgrade", action="store_true")
     parser.add_argument("--stall-updates", action="store_true")
     parser.add_argument("--slow-probes", action="store_true")
+    parser.add_argument("--namespace", choices=["release", "dev"], default="release")
     args = parser.parse_args()
     if args.sessions < 0:
         parser.error("sessions cannot be negative")
@@ -167,7 +170,9 @@ def main():
     with tempfile.TemporaryDirectory(prefix="aoe-startup-", dir=temp_base) as directory:
         home = Path(directory)
         env = environment(home)
-        app = home / ".config/agent-of-empires"
+        app_name = "agent-of-empires-dev" if args.namespace == "dev" else "agent-of-empires"
+        app = home / ".config" / app_name
+        other_name = "agent-of-empires" if args.namespace == "dev" else "agent-of-empires-dev"
         (home / "project").mkdir()
         accepted = []
         listener = socket.socket()
@@ -204,6 +209,8 @@ def main():
             env.update(PATH=f"{bindir}:{env.get('PATH', '')}", SHELL=str(bindir / "login-shell"))
 
         def wait_for_background():
+            if (home / ".config" / other_name).exists():
+                raise RuntimeError("binary used the wrong namespace; set --namespace to match its build")
             if args.stall_updates and not contacted.wait(timeout=2):
                 raise RuntimeError("background update check did not contact fixture endpoint")
             if args.slow_probes:
@@ -221,6 +228,13 @@ def main():
                 contacted.clear()
                 try:
                     first, quit_ms = run(binary, env, wait_for_background, 10)
+                    if children.exists():
+                        for pid in children.read_text().splitlines():
+                            try:
+                                os.killpg(int(pid), 0)
+                            except ProcessLookupError:
+                                continue
+                            raise RuntimeError("agent probe survived TUI shutdown")
                     measurements.append(first)
                     passed = first < args.budget_ms and quit_ms < args.budget_ms
                     print(f"{index + 1:2}: first_frame={first:7.2f}ms quit={quit_ms:7.2f}ms "
@@ -249,6 +263,8 @@ def main():
             stopping.set()
             thread.join(timeout=1)
             listener.close()
+            for connection in accepted:
+                connection.close()
         return int(failed)
 
 

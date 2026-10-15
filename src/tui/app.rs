@@ -96,6 +96,7 @@ pub type TuiBackend = crate::tui::hyperlink::HyperlinkBackend<std::io::Stdout>;
 
 pub struct App {
     home: HomeView,
+    tool_detection: Option<ToolDetection>,
     available_tools_rx: Option<tokio::sync::oneshot::Receiver<AvailableTools>>,
     startup_dialogs_pending: bool,
     force_update_check: bool,
@@ -142,6 +143,23 @@ pub struct App {
     /// The running binary keeps its old version until restart, so this stops
     /// periodic re-checks from re-offering a release we already installed.
     last_installed_version_in_session: Option<String>,
+}
+
+struct ToolDetection {
+    cancel: tokio_util::sync::CancellationToken,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for ToolDetection {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        // The worker reaps its independently grouped probe before the TUI can exit.
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                tracing::warn!(target: "tui.startup", "agent detection worker panicked during shutdown");
+            }
+        }
+    }
 }
 
 /// Ignores SIGINT/SIGQUIT while alive. With raw mode off for a child process,
@@ -279,6 +297,7 @@ impl App {
 
         let mut app = Self {
             home,
+            tool_detection: None,
             available_tools_rx: None,
             startup_dialogs_pending: !suppress_first_run_dialogs,
             force_update_check,
@@ -353,13 +372,22 @@ impl App {
     fn spawn_tool_detection(&mut self) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.available_tools_rx = Some(rx);
-        if let Err(error) = std::thread::Builder::new()
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let worker_cancel = cancel.clone();
+        match std::thread::Builder::new()
             .name("aoe-agent-detection".into())
             .spawn(move || {
-                let _ = tx.send(AvailableTools::detect());
-            })
-        {
-            tracing::warn!(target: "tui.startup", %error, "could not start agent detection");
+                let _ = tx.send(AvailableTools::detect_cancellable(&worker_cancel));
+            }) {
+            Ok(thread) => {
+                self.tool_detection = Some(ToolDetection {
+                    cancel,
+                    thread: Some(thread),
+                })
+            }
+            Err(error) => {
+                tracing::warn!(target: "tui.startup", %error, "could not start agent detection")
+            }
         }
     }
 
@@ -380,6 +408,7 @@ impl App {
                 Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {}
             }
             self.available_tools_rx = None;
+            self.tool_detection = None;
             self.finish_startup_dialogs(true);
             return true;
         }
@@ -1433,6 +1462,7 @@ impl App {
             }
         }
 
+        self.tool_detection = None;
         self.home.apply_session_id_updates();
         // Persist the final restart snapshot instead of a stale `Starting` row.
         self.home.apply_restart_results();
@@ -3198,6 +3228,68 @@ fn smart_rename_failure(e: &crate::acp::client::HttpError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    async fn startup_detection_shutdown_reaps_an_in_flight_probe() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _memo = crate::tmux::AgentAvailabilityGuard::capture();
+        crate::tmux::invalidate_agent_availability();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let gate = temp.path().join("gate");
+        nix::unistd::mkfifo(
+            &gate,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let pid_file = temp.path().join("probe-pid");
+        let probe = bin.join("vibe");
+        std::fs::write(
+            &probe,
+            format!(
+                "#!/bin/sh\necho $$ > {}\nread gate < {}\n",
+                shell_words::quote(pid_file.to_str().unwrap()),
+                shell_words::quote(gate.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _path = crate::session::test_support::EnvGuard::set(&[(
+            "PATH",
+            format!("{}:/usr/bin:/bin", bin.display()),
+        )]);
+        let mut app = App::new(
+            "test",
+            AvailableTools::with_tools(&["claude"]),
+            true,
+            false,
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        app.spawn_tool_detection();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let pid = loop {
+            if let Ok(value) = std::fs::read_to_string(&pid_file) {
+                if let Ok(pid) = value.trim().parse::<i32>() {
+                    break pid;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "probe did not reach its gate"
+            );
+            std::thread::yield_now();
+        };
+        app.tool_detection = None;
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH)
+        );
+    }
 
     #[tokio::test]
     #[serial_test::serial]
