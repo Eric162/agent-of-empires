@@ -288,12 +288,15 @@ static PANE_META_REFRESH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 static PANE_META_CACHE: RwLock<PaneMetaCache> = RwLock::new(PaneMetaCache {
     data: None,
     time: None,
+    published: None,
     refresh_id: 0,
 });
 
 struct PaneMetaCache {
     data: Option<std::sync::Arc<HashMap<String, PaneMetadata>>>,
     time: Option<Instant>,
+    /// When the snapshot landed; `time` predates the fork.
+    published: Option<Instant>,
     refresh_id: u64,
 }
 pub(crate) const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -736,8 +739,11 @@ pub(crate) type MarkedSessionName = (String, Option<SessionKind>);
 #[derive(Default)]
 pub(crate) struct LiveSessionSnapshot {
     sessions: OnceLock<Option<Vec<MarkedSessionName>>>,
-    panes: OnceLock<Option<HashMap<String, PaneMetadata>>>,
+    panes: OnceLock<Option<std::sync::Arc<HashMap<String, PaneMetadata>>>>,
 }
+
+/// Whether the last display snapshot was stale, so a skip logs once per outage.
+static STALE_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 impl LiveSessionSnapshot {
     pub(crate) fn new() -> Self {
@@ -750,8 +756,12 @@ impl LiveSessionSnapshot {
         let panes = PANE_META_CACHE
             .read()
             .ok()
-            .filter(|cache| fresh(cache.time))
-            .and_then(|cache| cache.data.as_deref().cloned());
+            .filter(|cache| fresh(cache.published))
+            .and_then(|cache| cache.data.clone());
+        let was_stale = STALE_LOGGED.swap(panes.is_none(), std::sync::atomic::Ordering::Relaxed);
+        if panes.is_none() && !was_stale {
+            tracing::debug!(target: "tmux.cache", "display caches stale; skipping snapshot consumers");
+        }
         let sessions = SESSION_CACHE
             .read()
             .ok()
@@ -789,7 +799,7 @@ impl LiveSessionSnapshot {
     ) -> Self {
         let snapshot = Self::new();
         let _ = snapshot.sessions.set(names);
-        let _ = snapshot.panes.set(panes);
+        let _ = snapshot.panes.set(panes.map(std::sync::Arc::new));
         snapshot
     }
 
@@ -819,7 +829,7 @@ impl LiveSessionSnapshot {
     /// From the batched metadata; an absent entry reads as alive.
     pub(crate) fn pane_dead(&self, name: &str) -> bool {
         self.panes
-            .get_or_init(|| batch_pane_metadata().ok())
+            .get_or_init(|| batch_pane_metadata().ok().map(std::sync::Arc::new))
             .as_ref()
             .and_then(|panes| panes.get(name))
             .map(|meta| meta.pane_dead)
@@ -1472,6 +1482,7 @@ impl Drop for SessionCacheGuard {
 pub(crate) struct PaneMetaCacheGuard {
     prev_data: Option<std::sync::Arc<HashMap<String, PaneMetadata>>>,
     prev_time: Option<Instant>,
+    prev_published: Option<Instant>,
     prev_refresh_id: u64,
 }
 
@@ -1482,6 +1493,7 @@ impl PaneMetaCacheGuard {
         Self {
             prev_data: cache.data.clone(),
             prev_time: cache.time,
+            prev_published: cache.published,
             prev_refresh_id: cache.refresh_id,
         }
     }
@@ -1490,11 +1502,14 @@ impl PaneMetaCacheGuard {
         if let Ok(mut cache) = PANE_META_CACHE.write() {
             cache.data = None;
             cache.time = Some(Instant::now());
+            cache.published = cache.time;
         }
     }
     pub(crate) fn force_stale(&self) {
         if let Ok(mut cache) = PANE_META_CACHE.write() {
-            cache.time = Some(Instant::now() - CACHE_TTL - Duration::from_secs(1));
+            let stale = Instant::now() - CACHE_TTL - Duration::from_secs(1);
+            cache.time = Some(stale);
+            cache.published = Some(stale);
         }
     }
 }
@@ -1504,6 +1519,7 @@ impl Drop for PaneMetaCacheGuard {
         if let Ok(mut cache) = PANE_META_CACHE.write() {
             cache.data = self.prev_data.take();
             cache.time = self.prev_time;
+            cache.published = self.prev_published;
             cache.refresh_id = self.prev_refresh_id;
         }
     }
@@ -1737,6 +1753,7 @@ fn publish_pane_meta_cache(
     }
     cache.data = data;
     cache.time = Some(taken_at);
+    cache.published = Some(Instant::now());
     cache.refresh_id = refresh_id;
     true
 }
@@ -3944,7 +3961,12 @@ mod tests {
         let panes = PaneMetaCacheGuard::capture();
         let name = format!("{P}Agent_{ID8}");
         sessions.force_present(&[name.as_str()]);
-        if let Ok(mut cache) = PANE_META_CACHE.write() {
+        let _ = fork_probe::take();
+        let probe = fork_probe::arm();
+
+        // A list-panes fork slower than CACHE_TTL still publishes a usable snapshot.
+        for (label, taken_ago) in [("fast", Duration::ZERO), ("slow fork", CACHE_TTL * 2)] {
+            let mut cache = PANE_META_CACHE.write().expect("pane meta cache lock");
             cache.data = Some(std::sync::Arc::new(HashMap::from([(
                 name.clone(),
                 PaneMetadata {
@@ -3957,15 +3979,18 @@ mod tests {
                     window_size: None,
                 },
             )])));
-            cache.time = Some(Instant::now());
-        }
+            cache.time = Some(Instant::now() - taken_ago);
+            cache.published = Some(Instant::now());
+            drop(cache);
 
-        let snapshot = LiveSessionSnapshot::from_display_caches();
-        assert_eq!(
-            snapshot.names().unwrap().collect::<Vec<_>>(),
-            vec![name.as_str()]
-        );
-        assert!(snapshot.pane_dead(&name));
+            let snapshot = LiveSessionSnapshot::from_display_caches();
+            assert_eq!(
+                snapshot.names().unwrap().collect::<Vec<_>>(),
+                vec![name.as_str()],
+                "{label}"
+            );
+            assert!(snapshot.pane_dead(&name), "{label}");
+        }
 
         panes.force_stale();
         assert!(
@@ -3974,6 +3999,8 @@ mod tests {
                 .is_none(),
             "a stale pane cache must skip the cycle, not fork tmux"
         );
+        drop(probe);
+        assert_eq!(fork_probe::take(), 0, "display snapshots must never fork");
     }
 
     #[test]
