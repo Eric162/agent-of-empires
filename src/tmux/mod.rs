@@ -766,12 +766,14 @@ impl LiveSessionSnapshot {
         snapshot
     }
 
-    /// `None` when tmux is unreachable. Also warms the display cache.
+    /// `None` for an unknown observation; a missing server is an empty list.
     pub(crate) fn sessions(&self) -> Option<&[MarkedSessionName]> {
         self.sessions
             .get_or_init(|| {
-                if refresh_session_cache() != SessionCacheRefresh::Populated {
-                    return None;
+                match refresh_session_cache() {
+                    SessionCacheRefresh::NoServer => return Some(Vec::new()),
+                    SessionCacheRefresh::Unknown => return None,
+                    SessionCacheRefresh::Populated => {}
                 }
                 SESSION_CACHE.read().ok().and_then(|cache| {
                     cache.data.as_ref().map(|sessions| {
@@ -2439,11 +2441,29 @@ pub struct AvailableTools {
 }
 
 impl AvailableTools {
+    /// Startup's local snapshot. Login shells and executable probes run later.
+    pub(crate) fn detect_on_path() -> Self {
+        let found = crate::agents::AGENTS
+            .iter()
+            .filter(|agent| match agent.detection {
+                crate::agents::DetectionMethod::Which(binary) => which::which(binary).is_ok(),
+                crate::agents::DetectionMethod::RunWithArg(_, _) => false,
+            })
+            .map(|agent| agent.name.to_string())
+            .collect();
+        Self::from_detected(found)
+    }
+
     pub fn detect() -> Self {
         // One batched probe warms the memo for later per-agent callers.
         let agents = crate::agents::AGENTS;
         let refs: Vec<&crate::agents::AgentDef> = agents.iter().collect();
         let found = probe_agents_available(&refs);
+        Self::from_detected(found)
+    }
+
+    fn from_detected(found: HashSet<String>) -> Self {
+        let agents = crate::agents::AGENTS;
         let mut available: Vec<String> = agents
             .iter()
             .filter(|a| found.contains(a.name))
@@ -2628,6 +2648,59 @@ mod tests {
 
     use super::test_helpers::TmuxTestSession;
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn absent_server_is_one_observation_for_the_whole_startup_batch() {
+        if run_probe_test_in_subprocess() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let log = home.path().join("queries");
+        let tmux = home.path().join("tmux");
+        std::fs::write(
+            &tmux,
+            format!(
+                "#!/bin/sh\necho scan >> {}\necho 'no server running on startup-test' >&2\nexit 1\n",
+                shell_words::quote(log.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _env = crate::session::test_support::EnvGuard::set(&[("PATH", home.path())]);
+        let live = LiveSessionSnapshot::new();
+        for _ in 0..20 {
+            let instance = crate::session::Instance::new("startup", "/fixture");
+            assert_eq!(instance.tmux_env_session_name_in_or_probe(&live), None);
+        }
+        assert_eq!(std::fs::read_to_string(log).unwrap().lines().count(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn startup_tool_snapshot_never_launches_an_executable_or_login_shell() {
+        if run_probe_test_in_subprocess() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let _env = probe_environment(home.path());
+        let memo = AgentAvailabilityGuard::capture();
+        memo.clear();
+        let executable = home.path().join("bin/claude");
+        std::fs::write(&executable, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let tools = AvailableTools::detect_on_path();
+        assert_eq!(tools.available_list(), &["claude"]);
+        assert!(!home.path().join("probes").exists());
+        assert!(
+            !memo.is_populated(),
+            "full detection still needs a fresh probe"
+        );
+    }
 
     const P: &str = SESSION_PREFIX;
 

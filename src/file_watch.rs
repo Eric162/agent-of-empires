@@ -113,6 +113,7 @@ struct SubscriptionId(u64);
 #[derive(Debug)]
 struct DirState {
     refcount: usize,
+    pending: Option<u64>,
     /// Re-stat on every subscribe: a mismatch forces a rewatch, since NonRecursive watches do
     /// not follow a same-path recreate. Cleared on rewatch failure.
     installed_identity: Option<WatchIdentity>,
@@ -129,7 +130,7 @@ struct DebounceEntry {
 }
 
 struct Inner {
-    watcher: Option<RecommendedWatcher>,
+    watcher: Option<std::sync::mpsc::Sender<WatchRequest>>,
     subscriptions: HashMap<SubscriptionId, Subscription>,
     dirs: HashMap<PathBuf, DirState>,
     next_id: u64,
@@ -140,8 +141,59 @@ struct Inner {
 enum DispatchMsg {
     Kernel(notify::Result<notify::Event>),
     Local(PathBuf),
+    WatchReady(PathBuf, u64, notify::Result<()>),
     #[cfg(any(test, debug_assertions))]
     Barrier(tokio::sync::oneshot::Sender<()>),
+}
+
+enum WatchRequest {
+    Watch {
+        dir: PathBuf,
+        generation: u64,
+        reply: Option<std::sync::mpsc::Sender<notify::Result<()>>>,
+    },
+    Unwatch(PathBuf),
+}
+
+fn watch_loop(
+    mut watcher: RecommendedWatcher,
+    requests: std::sync::mpsc::Receiver<WatchRequest>,
+    dispatch: mpsc::UnboundedSender<DispatchMsg>,
+) {
+    while let Ok(first) = requests.recv() {
+        let requests: Vec<_> = std::iter::once(first).chain(requests.try_iter()).collect();
+        let mut paths = watcher.paths_mut();
+        let mut results = Vec::new();
+        for request in requests {
+            match request {
+                WatchRequest::Watch {
+                    dir,
+                    generation,
+                    reply,
+                } => {
+                    let result = paths.add(&dir, RecursiveMode::NonRecursive);
+                    results.push((dir, generation, reply, result));
+                }
+                WatchRequest::Unwatch(dir) => {
+                    let _ = paths.remove(&dir);
+                }
+            }
+        }
+        let committed = paths.commit();
+        for (dir, generation, reply, result) in results {
+            let result = result.and_then(|()| {
+                committed
+                    .as_ref()
+                    .copied()
+                    .map_err(|error| notify::Error::generic(&error.to_string()))
+            });
+            if let Some(reply) = reply {
+                let _ = reply.send(result);
+            } else {
+                let _ = dispatch.send(DispatchMsg::WatchReady(dir, generation, result));
+            }
+        }
+    }
 }
 
 pub struct FileWatchService {
@@ -172,7 +224,7 @@ impl std::fmt::Debug for FileWatchService {
 
 impl FileWatchService {
     fn build(
-        watcher: Option<RecommendedWatcher>,
+        watcher: Option<std::sync::mpsc::Sender<WatchRequest>>,
         tokio_tx: mpsc::UnboundedSender<DispatchMsg>,
     ) -> Arc<Self> {
         Arc::new(FileWatchService {
@@ -220,7 +272,17 @@ impl FileWatchService {
         };
 
         let (tokio_tx, tokio_rx) = mpsc::unbounded_channel::<DispatchMsg>();
-        let svc = Self::build(Some(watcher), tokio_tx.clone());
+        let (watch_tx, watch_rx) = std::sync::mpsc::channel();
+        let watch_dispatch = tokio_tx.clone();
+        std::thread::Builder::new()
+            .name("file_watch_backend".into())
+            .spawn(move || watch_loop(watcher, watch_rx, watch_dispatch))
+            .map_err(|e| WatchError::Init {
+                kind: WatchErrorKind::Other,
+                message: format!("could not spawn file_watch_backend thread: {e}"),
+                source: None,
+            })?;
+        let svc = Self::build(Some(watch_tx), tokio_tx.clone());
 
         // The drain thread holds the only kernel sender and a `Weak` service, so dropping the
         // last `Arc` shuts it down.
@@ -280,8 +342,27 @@ impl FileWatchService {
     /// Dropping the receiver does not unsubscribe; drop the handle.
     pub fn subscribe_channel(
         self: &Arc<Self>,
+        spec: WatchSpec,
+        capacity: usize,
+    ) -> Result<(mpsc::Receiver<FileEvent>, SubscriptionHandle), WatchError> {
+        self.subscribe(spec, capacity, false)
+    }
+
+    /// Register without waiting for native watch setup. A refresh after installation
+    /// covers writes between the caller's initial read and the watch becoming live.
+    pub(crate) fn subscribe_channel_deferred(
+        self: &Arc<Self>,
+        spec: WatchSpec,
+        capacity: usize,
+    ) -> Result<(mpsc::Receiver<FileEvent>, SubscriptionHandle), WatchError> {
+        self.subscribe(spec, capacity, true)
+    }
+
+    fn subscribe(
+        self: &Arc<Self>,
         mut spec: WatchSpec,
         capacity: usize,
+        deferred: bool,
     ) -> Result<(mpsc::Receiver<FileEvent>, SubscriptionHandle), WatchError> {
         let mut inner = self.inner.lock().expect("file_watch inner mutex poisoned");
         let cap = capacity.max(1);
@@ -312,18 +393,37 @@ impl FileWatchService {
                 (Some(_), None) => false,
             }
         });
+        let generation = inner.next_id;
         let state = inner.dirs.entry(dir.clone()).or_insert(DirState {
             refcount: 0,
+            pending: None,
             installed_identity: None,
         });
         let pre_bump = state.refcount;
         state.refcount += 1;
-        let needs_install = pre_bump == 0;
+        let needs_install = pre_bump == 0
+            || state.installed_identity.is_none()
+            || (!deferred && state.pending.is_some());
         if needs_install || drift_against_existing {
-            // Hold the lock across the watch call so no subscriber observes a mid-rollback refcount.
-            let watcher = inner.watcher.as_mut().expect("live service has a watcher");
-            if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
-                if needs_install {
+            let watcher = inner.watcher.as_ref().expect("live service has a watcher");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let result = watcher
+                .send(WatchRequest::Watch {
+                    dir: dir.clone(),
+                    generation,
+                    reply: (!deferred).then_some(tx),
+                })
+                .map_err(|_| notify::Error::generic("watch backend closed"))
+                .and_then(|()| {
+                    if deferred {
+                        Ok(())
+                    } else {
+                        rx.recv()
+                            .unwrap_or_else(|_| Err(notify::Error::generic("watch backend closed")))
+                    }
+                });
+            if let Err(e) = result {
+                if pre_bump == 0 {
                     inner.dirs.remove(&dir);
                 } else {
                     let state = inner.dirs.get_mut(&dir).expect("entry exists");
@@ -337,13 +437,9 @@ impl FileWatchService {
                     source: Some(e),
                 });
             }
-            if let Some(curr) = current_identity {
-                inner
-                    .dirs
-                    .get_mut(&dir)
-                    .expect("entry exists")
-                    .installed_identity = Some(curr);
-            }
+            let state = inner.dirs.get_mut(&dir).expect("entry exists");
+            state.installed_identity = current_identity;
+            state.pending = deferred.then_some(generation);
         }
 
         let (tx, rx) = mpsc::channel::<FileEvent>(cap);
@@ -532,6 +628,7 @@ async fn run_dispatcher(
                     DispatchMsg::Local(path) => {
                         dispatch_path(&arc, &path, FileEventKind::Upserted, EventSource::Local);
                     }
+                    DispatchMsg::WatchReady(dir, generation, result) => watch_ready(&arc, &dir, generation, result),
                     #[cfg(any(test, debug_assertions))]
                     DispatchMsg::Barrier(tx) => {
                         let _ = tx.send(());
@@ -542,6 +639,53 @@ async fn run_dispatcher(
                 let Some(arc) = svc.upgrade() else { return "service_dropped" };
                 fire_due(&arc);
             }
+        }
+    }
+}
+
+fn watch_ready(
+    svc: &Arc<FileWatchService>,
+    dir: &Path,
+    generation: u64,
+    result: notify::Result<()>,
+) {
+    {
+        let mut inner = svc.inner.lock().expect("file_watch inner mutex poisoned");
+        if let Some(state) = inner
+            .dirs
+            .get_mut(dir)
+            .filter(|state| state.pending == Some(generation))
+        {
+            state.pending = None;
+            if result.is_err() {
+                state.installed_identity = None;
+            }
+        }
+    }
+    if let Err(error) = result {
+        tracing::warn!(target: "file_watch.service", dir = %dir.display(), %error,
+            "deferred watch failed; falling back to polling");
+    }
+    let paths: Vec<_> = svc
+        .inner
+        .lock()
+        .expect("file_watch inner mutex poisoned")
+        .subscriptions
+        .values()
+        .filter(|sub| sub.spec.dir == dir)
+        .flat_map(|sub| match &sub.spec.matcher {
+            FileMatcher::Exact(path) => vec![path.clone()],
+            FileMatcher::AnyOf(paths) => paths.clone(),
+        })
+        .collect();
+    for path in paths {
+        if let Some(name) = path.file_name() {
+            dispatch_path(
+                svc,
+                &dir.join(name),
+                FileEventKind::Upserted,
+                EventSource::Local,
+            );
         }
     }
 }
@@ -700,8 +844,8 @@ impl Drop for SubscriptionHandle {
             state.refcount = state.refcount.saturating_sub(1);
             if state.refcount == 0 {
                 inner.dirs.remove(&dir);
-                if let Some(w) = inner.watcher.as_mut() {
-                    let _ = w.unwatch(&dir);
+                if let Some(w) = inner.watcher.as_ref() {
+                    let _ = w.send(WatchRequest::Unwatch(dir));
                 }
             }
         }
@@ -744,6 +888,97 @@ mod tests {
     /// macOS FSEvents can take ~1.5s to forward small writes.
     const KERNEL_WAIT: Duration = Duration::from_millis(2_500);
     const NEG_WAIT: Duration = Duration::from_millis(300);
+
+    #[tokio::test]
+    async fn deferred_watch_does_not_wait_and_refreshes_after_installation() {
+        let dir = TempDir::new().unwrap();
+        let (backend_tx, backend_rx) = std::sync::mpsc::channel();
+        let (dispatch_tx, _dispatch_rx) = mpsc::unbounded_channel();
+        let svc = FileWatchService::build(Some(backend_tx), dispatch_tx);
+        let (mut rx, handle) = svc
+            .subscribe_channel_deferred(exact(dir.path(), "config.toml"), 4)
+            .expect("registration does not need a running backend");
+        let WatchRequest::Watch {
+            dir: watched,
+            generation,
+            reply,
+        } = backend_rx.recv().unwrap()
+        else {
+            panic!("native watch queued");
+        };
+        assert!(reply.is_none());
+        assert_empty(&mut rx);
+
+        write_file(
+            dir.path(),
+            "config.toml",
+            "edited before native watch was ready",
+        );
+        watch_ready(&svc, &watched, generation, Ok(()));
+        let event = rx
+            .try_recv()
+            .expect("installation triggers a catch-up refresh");
+        assert_eq!(event.path, watched.join("config.toml"));
+        assert_eq!(event.source, EventSource::Local);
+
+        drop(handle);
+        assert!(
+            matches!(backend_rx.recv().unwrap(), WatchRequest::Unwatch(path) if path == watched)
+        );
+        watch_ready(&svc, &watched, generation, Ok(()));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn synchronous_subscriber_waits_for_a_shared_pending_watch() {
+        for success in [true, false] {
+            let dir = TempDir::new().unwrap();
+            let (backend_tx, backend_rx) = std::sync::mpsc::channel();
+            let (dispatch_tx, _dispatch_rx) = mpsc::unbounded_channel();
+            let svc = FileWatchService::build(Some(backend_tx), dispatch_tx);
+            let (_rx, _handle) = svc
+                .subscribe_channel_deferred(exact(dir.path(), "a"), 4)
+                .unwrap();
+            let _pending = backend_rx.recv().unwrap();
+            let worker_service = svc.clone();
+            let worker_dir = dir.path().to_owned();
+            let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let result = worker_service.subscribe_channel(exact(&worker_dir, "b"), 4);
+                completed_tx.send(result.is_ok()).unwrap();
+            });
+            let WatchRequest::Watch {
+                reply: Some(reply), ..
+            } = backend_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+            else {
+                panic!("synchronous subscriber needs a native-watch acknowledgement");
+            };
+            assert!(matches!(
+                completed_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            reply
+                .send(if success {
+                    Ok(())
+                } else {
+                    Err(notify::Error::generic("fixture error"))
+                })
+                .unwrap();
+            assert_eq!(
+                completed_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                success
+            );
+            worker.join().unwrap();
+            assert_eq!(
+                svc.subscriber_count(),
+                1,
+                "original deferred subscriber survives"
+            );
+        }
+    }
 
     // Environment-disabled construction lives in tests/filewatch_degradation.rs so its
     // process-wide switch cannot disable concurrent live-watch tests.

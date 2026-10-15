@@ -85,7 +85,7 @@ fn subscribe(
 ) -> Result<DiskWatchEntry, crate::file_watch::WatchError> {
     use tracing::Instrument;
     let dir = spec.dir.clone();
-    let (mut rx, handle) = file_watch.subscribe_channel(spec, capacity)?;
+    let (mut rx, handle) = file_watch.subscribe_channel_deferred(spec, capacity)?;
     let latches = latches.to_vec();
     let join = crate::task_util::spawn_supervised(
         task_name,
