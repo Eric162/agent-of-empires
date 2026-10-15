@@ -202,6 +202,7 @@ impl DiskWatchState {
         let mut new_init_error = self
             .handles
             .iter()
+            .filter(|(name, _)| current.contains(name))
             .find_map(|(name, entry)| entry.installation_failure(Some(name.clone())));
         if to_remove.is_empty()
             && to_add.is_empty()
@@ -254,6 +255,7 @@ impl DiskWatchState {
             }
         }
         if new_init_error.is_some()
+            || reload_failure.disk_watcher_init_error_references_missing_profile(current)
             || !self
                 .handles
                 .values()
@@ -294,6 +296,7 @@ impl ConfigWatchState {
         let mut new_init_error = self.handles.iter().find_map(|(key, entry)| {
             let profile = match key {
                 ConfigWatchKey::Global => None,
+                ConfigWatchKey::Profile(name) if !current.contains(name) => return None,
                 ConfigWatchKey::Profile(name) => Some(name.clone()),
             };
             entry.installation_failure(profile)
@@ -402,6 +405,7 @@ impl ConfigWatchState {
             }
         }
         if new_init_error.is_some()
+            || reload_failure.config_watcher_init_error_references_missing_profile(current)
             || !self
                 .handles
                 .values()
