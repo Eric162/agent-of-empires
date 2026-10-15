@@ -28,8 +28,9 @@ const MUTATION_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// intentional remove or move.
 const WORKTREE_LOCK_REASON: &str = "aoe-managed worktree (prevents cross-boundary prune)";
 
-/// Reason on a worktree whose purge is in progress. Listings skip it so no session can adopt it.
-const PURGE_LOCK_REASON: &str = "aoe purge in progress";
+/// Lock reason on a worktree whose purge is in progress, followed by the purging pid. Listings
+/// skip it so no session can adopt it.
+const PURGE_LOCK_PREFIX: &str = "aoe purge in progress, pid ";
 
 pub struct WorktreeEntry {
     pub path: PathBuf,
@@ -189,7 +190,8 @@ impl GitWorktree {
     /// Relock `path` as purging, hiding it from `list_worktrees`.
     pub fn lock_for_purge(&self, path: &Path) -> Result<()> {
         self.unlock_worktree(path);
-        self.lock_with_reason(path, PURGE_LOCK_REASON)
+        let reason = format!("{PURGE_LOCK_PREFIX}{}", std::process::id());
+        self.lock_with_reason(path, &reason)
     }
 
     fn lock_with_reason(&self, path: &Path, reason: &str) -> Result<()> {
@@ -201,10 +203,54 @@ impl GitWorktree {
         .map(drop)
     }
 
+    fn purge_owner(lock_reason: &str) -> Option<u32> {
+        lock_reason
+            .trim()
+            .strip_prefix(PURGE_LOCK_PREFIX)?
+            .parse()
+            .ok()
+    }
+
     fn is_purging(path: &Path) -> bool {
         crate::git::cleanup::read_linked_worktree_gitdir(path)
             .and_then(|admin| std::fs::read_to_string(admin.join("locked")).ok())
-            .is_some_and(|reason| reason.trim() == PURGE_LOCK_REASON)
+            .is_some_and(|reason| Self::purge_owner(&reason).is_some())
+    }
+
+    /// Finish purges whose process died mid-removal; their row is gone, so nothing else retries
+    /// them, and they still hold their branch.
+    pub fn reap_abandoned_purges(&self) {
+        let Ok(repo) = open_repo_at(&self.repo_path) else {
+            return;
+        };
+        let Ok(names) = repo.worktrees() else {
+            return;
+        };
+        for name in names.iter().filter_map(|name| name.ok().flatten()) {
+            let Ok(wt) = repo.find_worktree(name) else {
+                continue;
+            };
+            let Ok(git2::WorktreeLockStatus::Locked(Some(reason))) = wt.is_locked() else {
+                continue;
+            };
+            let Some(pid) = Self::purge_owner(&reason) else {
+                continue;
+            };
+            if crate::process::worker::is_pid_alive(pid) {
+                continue;
+            }
+            let path = wt.path().to_path_buf();
+            tracing::info!(target: "git.worktree", path = %path.display(), pid, "reaping abandoned purge");
+            let removed = if path.exists() {
+                self.remove_worktree(&path, true)
+            } else {
+                self.unlock_worktree(&path);
+                self.prune_worktrees()
+            };
+            if let Err(error) = removed {
+                tracing::warn!(target: "git.worktree", path = %path.display(), %error, "could not reap abandoned purge");
+            }
+        }
     }
 
     /// Unlock `path`'s admin entry, best-effort and idempotent. Must precede

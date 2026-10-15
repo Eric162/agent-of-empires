@@ -127,6 +127,7 @@ impl GitWorktree {
         // skips locked entries; siblings keep their locks.
         self.unlock_worktree(path);
         let t = Instant::now();
+        self.reap_abandoned_purges();
         self.prune_worktrees()?;
         tracing::info!(target: "git.worktree", "worktree create: prune done in {:?}", t.elapsed());
 
@@ -561,6 +562,33 @@ pub(super) mod tests {
             git_wt.fetch_branch("origin", "nonexistent-branch"),
             FetchOutcome::Failed(_)
         ));
+    }
+
+    #[test]
+    fn create_worktree_reaps_purges_whose_process_died() {
+        let mut exited = std::process::Command::new("true").spawn().unwrap();
+        exited.wait().unwrap();
+        for (label, owner, reaped) in [
+            ("dead purger", exited.id(), true),
+            ("live purger", std::process::id(), false),
+        ] {
+            let (dir, _repo) = init_repo();
+            let git_wt = GitWorktree::new(dir.path().to_path_buf()).unwrap();
+            let parent = TempDir::new().unwrap();
+            let aside = parent.path().join(".aoe-purge-x");
+            git_wt.create_worktree("feat", &aside, true, None).unwrap();
+            let aside_str = aside.to_str().unwrap();
+            run_git(dir.path(), &["worktree", "unlock", aside_str]);
+            let reason = format!("{}{owner}", super::super::PURGE_LOCK_PREFIX);
+            run_git(
+                dir.path(),
+                &["worktree", "lock", "--reason", &reason, aside_str],
+            );
+
+            let created = git_wt.create_worktree("feat", &parent.path().join("new"), false, None);
+            assert_eq!(created.is_ok(), reaped, "{label}: {created:?}");
+            assert_eq!(aside.exists(), !reaped, "{label}");
+        }
     }
 
     #[test]
