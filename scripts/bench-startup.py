@@ -215,7 +215,7 @@ def main():
                 raise RuntimeError("background update check did not contact fixture endpoint")
             if args.slow_probes:
                 deadline = time.perf_counter() + 2
-                while not children.exists():
+                while not children.exists() or not children.read_text().strip():
                     if time.perf_counter() >= deadline:
                         raise RuntimeError("background probe did not reach fixture gate")
                     stopping.wait(0.005)

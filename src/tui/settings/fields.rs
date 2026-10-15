@@ -489,10 +489,13 @@ fn custom_value_from_json(id: &str, current: &Value) -> FieldValue {
             FieldValue::Select { selected, options }
         }
         "smart-rename-agent" => {
-            let names = installed_oneshot_agents();
+            let mut names = installed_oneshot_agents();
+            let current = current.as_str().unwrap_or("").trim();
+            if !current.is_empty() && !names.iter().any(|name| name == current) {
+                names.push(current.to_string());
+            }
             let mut options = vec!["Same as session".to_string()];
             options.extend(names.iter().cloned());
-            let current = current.as_str().unwrap_or("").trim();
             let selected = if current.is_empty() {
                 0
             } else {
@@ -1129,6 +1132,19 @@ fn clear_override_path(profile: &mut ProfileConfig, section: &str, field: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn smart_rename_picker_retains_a_configured_agent_until_discovery_finishes() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let memo = crate::tmux::AgentAvailabilityGuard::capture();
+        memo.seed("claude", false);
+        let value = custom_value_from_json("smart-rename-agent", &json!("claude"));
+        assert_eq!(
+            custom_value_to_json("smart-rename-agent", &value),
+            json!("claude")
+        );
+    }
 
     /// Find a built field by its stable identity (`section.field`).
     fn field<'a>(fields: &'a [SettingField], ident: &str) -> &'a SettingField {

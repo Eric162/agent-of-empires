@@ -369,7 +369,10 @@ impl App {
         true
     }
 
-    fn spawn_tool_detection(&mut self) {
+    fn spawn_tool_detection(&mut self, force: bool) {
+        if self.available_tools_rx.is_some() {
+            return;
+        }
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.available_tools_rx = Some(rx);
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -377,7 +380,7 @@ impl App {
         match std::thread::Builder::new()
             .name("aoe-agent-detection".into())
             .spawn(move || {
-                let _ = tx.send(AvailableTools::detect_cancellable(&worker_cancel));
+                let _ = tx.send(AvailableTools::detect_cancellable(&worker_cancel, force));
             }) {
             Ok(thread) => {
                 self.tool_detection = Some(ToolDetection {
@@ -604,7 +607,7 @@ impl App {
         #[cfg(feature = "e2e-tests")]
         e2e_render_ack(true)?;
 
-        self.spawn_tool_detection();
+        self.spawn_tool_detection(false);
         crate::plugin::auto_update::spawn_if_enabled(&Config::load_or_warn(), None);
 
         // `None` when checks are off, so enabling them later checks immediately.
@@ -1411,6 +1414,7 @@ impl App {
 
             if last_update_eval.elapsed() >= UPDATE_CHECK_THROTTLE_GAP {
                 last_update_eval = std::time::Instant::now();
+                self.spawn_tool_detection(false);
                 let settings = get_update_settings();
                 if should_spawn_periodic_update_check(
                     last_update_check.map(|t| t.elapsed()),
@@ -2588,6 +2592,7 @@ impl App {
     ) -> Result<()> {
         match action {
             Action::Quit => self.should_quit = true,
+            Action::RecheckAgents => self.spawn_tool_detection(true),
             Action::AttachSession(id) => {
                 self.attach_session(&id, terminal)?;
             }
@@ -3184,6 +3189,7 @@ fn wait_for_background_tool(session_id: &str, tool_name: &str, mut child: std::p
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     Quit,
+    RecheckAgents,
     AttachSession(String),
     AttachTerminal(String, TerminalMode),
     EditFile(PathBuf),
@@ -3270,7 +3276,7 @@ mod tests {
             crate::file_watch::FileWatchService::noop(),
         )
         .unwrap();
-        app.spawn_tool_detection();
+        app.spawn_tool_detection(false);
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let pid = loop {
             if let Ok(value) = std::fs::read_to_string(&pid_file) {
@@ -3284,6 +3290,33 @@ mod tests {
             );
             std::thread::yield_now();
         };
+        app.home.show_no_agents();
+        assert_eq!(
+            app.home
+                .handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE), None),
+            Some(Action::RecheckAgents)
+        );
+        let worker_id = app
+            .tool_detection
+            .as_ref()
+            .unwrap()
+            .thread
+            .as_ref()
+            .unwrap()
+            .thread()
+            .id();
+        app.spawn_tool_detection(true);
+        assert_eq!(
+            app.tool_detection
+                .as_ref()
+                .unwrap()
+                .thread
+                .as_ref()
+                .unwrap()
+                .thread()
+                .id(),
+            worker_id
+        );
         app.tool_detection = None;
         assert_eq!(
             nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),

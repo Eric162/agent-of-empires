@@ -2361,6 +2361,7 @@ thread_local! {
     static AGENT_PROBE_LOCK_CONTENDED: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(test)]
 fn lock_agent_probe() -> std::sync::MutexGuard<'static, ()> {
     #[cfg(test)]
     if let Some(contended) = AGENT_PROBE_LOCK_CONTENDED.with(|slot| slot.borrow_mut().take()) {
@@ -2373,6 +2374,7 @@ fn lock_agent_probe() -> std::sync::MutexGuard<'static, ()> {
 }
 
 /// Clear the memo after any in-flight probe finishes (probe lock, then memo).
+#[cfg(test)]
 pub(crate) fn invalidate_agent_availability() {
     let _probe_guard = lock_agent_probe();
     if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
@@ -2403,14 +2405,19 @@ fn partition_cached_agents<'a>(
 pub(crate) fn probe_agents_available(
     agents: &[&crate::agents::AgentDef],
 ) -> std::collections::HashSet<String> {
-    probe_agents_available_inner(agents, None)
+    probe_agents_available_inner(agents, None, false)
 }
 
 fn probe_agents_available_inner(
     agents: &[&crate::agents::AgentDef],
     cancel: Option<&tokio_util::sync::CancellationToken>,
+    force: bool,
 ) -> std::collections::HashSet<String> {
-    let (mut found, uncached) = partition_cached_agents(agents);
+    let (mut found, uncached) = if force {
+        (HashSet::new(), agents.to_vec())
+    } else {
+        partition_cached_agents(agents)
+    };
     if uncached.is_empty() {
         return found;
     }
@@ -2438,6 +2445,11 @@ fn probe_agents_available_inner(
     } else {
         AGENT_PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     };
+    if force {
+        *AGENT_AVAILABILITY
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+    }
     let (already_found, uncached) = partition_cached_agents(&uncached);
     found.extend(already_found);
     if uncached.is_empty() {
@@ -2485,6 +2497,18 @@ pub(crate) fn is_agent_available(agent: &crate::agents::AgentDef) -> bool {
 /// A nonblocking UI snapshot: cached answers, with local PATH lookups for misses.
 pub(crate) fn agent_availability_snapshot(agents: &[&crate::agents::AgentDef]) -> HashSet<String> {
     let (mut found, uncached) = partition_cached_agents(agents);
+    // Keep login-shell discoveries visible while the next background refresh runs.
+    if let Ok(cache) = AGENT_AVAILABILITY.read() {
+        for agent in agents {
+            if cache
+                .as_ref()
+                .and_then(|cache| cache.get(agent.name))
+                .is_some_and(|(available, _)| *available)
+            {
+                found.insert(agent.name.to_string());
+            }
+        }
+    }
     found.extend(
         uncached
             .into_iter()
@@ -2518,9 +2542,12 @@ impl AvailableTools {
         Self::from_detected(found)
     }
 
-    pub(crate) fn detect_cancellable(cancel: &tokio_util::sync::CancellationToken) -> Self {
+    pub(crate) fn detect_cancellable(
+        cancel: &tokio_util::sync::CancellationToken,
+        force: bool,
+    ) -> Self {
         let refs: Vec<_> = crate::agents::AGENTS.iter().collect();
-        Self::from_detected(probe_agents_available_inner(&refs, Some(cancel)))
+        Self::from_detected(probe_agents_available_inner(&refs, Some(cancel), force))
     }
 
     fn from_detected(found: HashSet<String>) -> Self {
@@ -2763,6 +2790,22 @@ mod tests {
         assert!(
             !memo.is_populated(),
             "full detection still needs a fresh probe"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn availability_snapshot_retains_expired_login_shell_discoveries() {
+        let memo = AgentAvailabilityGuard::capture();
+        memo.clear();
+        memo.seed("vibe", true);
+        memo.age_past_ttl("vibe");
+        let _probe = AGENT_PROBE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(
+            agent_availability_snapshot(&[crate::agents::get_agent("vibe").unwrap()])
+                .contains("vibe")
         );
     }
 

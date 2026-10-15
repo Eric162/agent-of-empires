@@ -291,6 +291,13 @@ impl ConfigWatchState {
             return;
         }
 
+        let mut new_init_error = self.handles.iter().find_map(|(key, entry)| {
+            let profile = match key {
+                ConfigWatchKey::Global => None,
+                ConfigWatchKey::Profile(name) => Some(name.clone()),
+            };
+            entry.installation_failure(profile)
+        });
         let global_invalidated = self
             .handles
             .get(&ConfigWatchKey::Global)
@@ -309,14 +316,6 @@ impl ConfigWatchState {
             }),
             current,
         );
-
-        let mut new_init_error = self.handles.iter().find_map(|(key, entry)| {
-            let profile = match key {
-                ConfigWatchKey::Global => None,
-                ConfigWatchKey::Profile(name) => Some(name.clone()),
-            };
-            entry.installation_failure(profile)
-        });
 
         if !global_needs_install
             && to_remove.is_empty()
@@ -597,39 +596,43 @@ mod tests {
     #[serial_test::serial]
     async fn deferred_config_watch_failure_retries_and_clears_only_after_success() {
         let _home = crate::session::test_support::isolate_app_dir();
-        let (service, backend) = crate::file_watch::test_support::manual_filewatch();
-        let mut watches = ConfigWatchState {
-            dirty: Arc::new(AtomicBool::new(false)),
-            link_policy_dirty: Arc::new(AtomicBool::new(false)),
-            handles: HashMap::new(),
-        };
-        let mut failure = ReloadFailureState::default();
-        watches.rewire(&service, &[], &mut failure);
-        let dir = backend.complete_watch(Err(notify::Error::generic("fixture native failure")));
-        watches.rewire(&service, &[], &mut failure);
-        assert!(
-            failure.config_watcher_init_error.is_some(),
-            "asynchronous failure must reach the warning state"
-        );
-        assert!(
-            !watches.handles[&ConfigWatchKey::Global]
-                .handle
-                .installation_pending(),
-            "backoff prevents an immediate retry loop"
-        );
+        for observe_before_backoff in [true, false] {
+            let (service, backend) = crate::file_watch::test_support::manual_filewatch();
+            let mut watches = ConfigWatchState {
+                dirty: Arc::new(AtomicBool::new(false)),
+                link_policy_dirty: Arc::new(AtomicBool::new(false)),
+                handles: HashMap::new(),
+            };
+            let mut failure = ReloadFailureState::default();
+            watches.rewire(&service, &[], &mut failure);
+            let dir = backend.complete_watch(Err(notify::Error::generic("fixture native failure")));
+            if observe_before_backoff {
+                watches.rewire(&service, &[], &mut failure);
+                assert!(
+                    failure.config_watcher_init_error.is_some(),
+                    "asynchronous failure must reach the warning state"
+                );
+                assert!(
+                    !watches.handles[&ConfigWatchKey::Global]
+                        .handle
+                        .installation_pending(),
+                    "backoff prevents an immediate retry loop"
+                );
+            }
 
-        backend.allow_retry(&dir);
-        watches.rewire(&service, &[], &mut failure);
-        assert!(watches.handles[&ConfigWatchKey::Global]
-            .handle
-            .installation_pending());
-        assert!(
-            failure.config_watcher_init_error.is_some(),
-            "queued retry is not a successful native installation"
-        );
-        backend.complete_watch(Ok(()));
-        watches.rewire(&service, &[], &mut failure);
-        assert!(failure.config_watcher_init_error.is_none());
-        assert_eq!(service.subscriber_count(), 1);
+            backend.allow_retry(&dir);
+            watches.rewire(&service, &[], &mut failure);
+            assert!(watches.handles[&ConfigWatchKey::Global]
+                .handle
+                .installation_pending());
+            assert!(
+                failure.config_watcher_init_error.is_some(),
+                "queued retry is not a successful native installation"
+            );
+            backend.complete_watch(Ok(()));
+            watches.rewire(&service, &[], &mut failure);
+            assert!(failure.config_watcher_init_error.is_none());
+            assert_eq!(service.subscriber_count(), 1);
+        }
     }
 }
