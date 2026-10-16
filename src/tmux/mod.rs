@@ -750,9 +750,10 @@ impl LiveSessionSnapshot {
         Self::default()
     }
 
-    /// Never forks tmux; stale caches read as unreachable.
+    /// Never forks tmux; caches older than `DISPLAY_SNAPSHOT_MAX_AGE` read as unreachable.
     pub(crate) fn from_display_caches() -> Self {
-        let fresh = |time: Option<Instant>| time.is_some_and(|at| at.elapsed() <= CACHE_TTL);
+        let fresh =
+            |time: Option<Instant>| time.is_some_and(|at| at.elapsed() <= DISPLAY_SNAPSHOT_MAX_AGE);
         let panes = PANE_META_CACHE
             .read()
             .ok()
@@ -1627,6 +1628,9 @@ impl Drop for AgentAvailabilityGuard {
 
 /// How long a [`SESSION_CACHE`] snapshot is trusted.
 const CACHE_TTL: Duration = Duration::from_secs(2);
+
+/// Bound on the latest completed display refresh; only guards a dead refresh thread.
+const DISPLAY_SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(30);
 
 pub fn session_exists_from_cache(name: &str) -> Option<bool> {
     let cache = SESSION_CACHE.read().ok()?;
@@ -3965,7 +3969,17 @@ mod tests {
         let probe = fork_probe::arm();
 
         // A list-panes fork slower than CACHE_TTL still publishes a usable snapshot.
-        for (label, taken_ago) in [("fast", Duration::ZERO), ("slow fork", CACHE_TTL * 2)] {
+        // Slow scans leave each cache older than CACHE_TTL when the other lands.
+        for (label, taken_ago, published_ago) in [
+            ("fast", Duration::ZERO, Duration::ZERO),
+            ("slow fork", CACHE_TTL * 2, Duration::ZERO),
+            (
+                "both published past CACHE_TTL",
+                CACHE_TTL * 2,
+                CACHE_TTL * 2,
+            ),
+        ] {
+            sessions.force_stale();
             let mut cache = PANE_META_CACHE.write().expect("pane meta cache lock");
             cache.data = Some(std::sync::Arc::new(HashMap::from([(
                 name.clone(),
@@ -3980,7 +3994,7 @@ mod tests {
                 },
             )])));
             cache.time = Some(Instant::now() - taken_ago);
-            cache.published = Some(Instant::now());
+            cache.published = Some(Instant::now() - published_ago);
             drop(cache);
 
             let snapshot = LiveSessionSnapshot::from_display_caches();
@@ -3993,11 +4007,15 @@ mod tests {
         }
 
         panes.force_stale();
+        PANE_META_CACHE
+            .write()
+            .expect("pane meta cache lock")
+            .published = Some(Instant::now() - DISPLAY_SNAPSHOT_MAX_AGE - Duration::from_secs(1));
         assert!(
             LiveSessionSnapshot::from_display_caches()
                 .sessions()
                 .is_none(),
-            "a stale pane cache must skip the cycle, not fork tmux"
+            "a pane cache past the max age must skip the cycle, not fork tmux"
         );
         drop(probe);
         assert_eq!(fork_probe::take(), 0, "display snapshots must never fork");
