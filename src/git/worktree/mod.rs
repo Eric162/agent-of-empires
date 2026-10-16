@@ -28,9 +28,19 @@ const MUTATION_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// intentional remove or move.
 const WORKTREE_LOCK_REASON: &str = "aoe-managed worktree (prevents cross-boundary prune)";
 
-/// Lock reason on a worktree whose purge is in progress, followed by the purging pid. Listings
-/// skip it so no session can adopt it.
+/// Lock reason on a worktree whose purge is in progress, followed by the purging pid and its
+/// [`PurgeLock`] flags. Listings skip it so no session can adopt it.
 const PURGE_LOCK_PREFIX: &str = "aoe purge in progress, pid ";
+const ROW_REMOVED_FLAG: &str = "row removed";
+const FORCE_FLAG: &str = "force";
+
+/// The terms an abandoned purge may be finished on: only once its session row is gone, and
+/// discarding changes only when the purge was forced.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PurgeLock {
+    pub row_removed: bool,
+    pub force: bool,
+}
 
 pub struct WorktreeEntry {
     pub path: PathBuf,
@@ -188,9 +198,18 @@ impl GitWorktree {
     }
 
     /// Relock `path` as purging, hiding it from `list_worktrees`.
-    pub fn lock_for_purge(&self, path: &Path) -> Result<()> {
+    pub fn lock_for_purge(&self, path: &Path, lock: PurgeLock) -> Result<()> {
         self.unlock_worktree(path);
-        let reason = format!("{PURGE_LOCK_PREFIX}{}", std::process::id());
+        let mut reason = format!("{PURGE_LOCK_PREFIX}{}", std::process::id());
+        for (set, flag) in [
+            (lock.row_removed, ROW_REMOVED_FLAG),
+            (lock.force, FORCE_FLAG),
+        ] {
+            if set {
+                reason.push_str(", ");
+                reason.push_str(flag);
+            }
+        }
         self.lock_with_reason(path, &reason)
     }
 
@@ -203,22 +222,29 @@ impl GitWorktree {
         .map(drop)
     }
 
-    fn purge_owner(lock_reason: &str) -> Option<u32> {
-        lock_reason
+    fn purge_lock(lock_reason: &str) -> Option<(u32, PurgeLock)> {
+        let mut fields = lock_reason
             .trim()
             .strip_prefix(PURGE_LOCK_PREFIX)?
-            .parse()
-            .ok()
+            .split(", ");
+        let pid = fields.next()?.parse().ok()?;
+        let flags: Vec<&str> = fields.collect();
+        let lock = PurgeLock {
+            row_removed: flags.contains(&ROW_REMOVED_FLAG),
+            force: flags.contains(&FORCE_FLAG),
+        };
+        Some((pid, lock))
     }
 
     fn is_purging(path: &Path) -> bool {
         crate::git::cleanup::read_linked_worktree_gitdir(path)
             .and_then(|admin| std::fs::read_to_string(admin.join("locked")).ok())
-            .is_some_and(|reason| Self::purge_owner(&reason).is_some())
+            .is_some_and(|reason| Self::purge_lock(&reason).is_some())
     }
 
-    /// Finish purges whose process died mid-removal; their row is gone, so nothing else retries
-    /// them, and they still hold their branch.
+    /// Finish purges whose process died mid-removal after their row was removed, since nothing
+    /// else retries them and they still hold their branch. A purge whose row remains is retried
+    /// through it instead.
     pub fn reap_abandoned_purges(&self) {
         let Ok(repo) = open_repo_at(&self.repo_path) else {
             return;
@@ -233,16 +259,16 @@ impl GitWorktree {
             let Ok(git2::WorktreeLockStatus::Locked(Some(reason))) = wt.is_locked() else {
                 continue;
             };
-            let Some(pid) = Self::purge_owner(&reason) else {
+            let Some((pid, lock)) = Self::purge_lock(&reason) else {
                 continue;
             };
-            if crate::process::worker::is_pid_alive(pid) {
+            if !lock.row_removed || crate::process::worker::is_pid_alive(pid) {
                 continue;
             }
             let path = wt.path().to_path_buf();
             tracing::info!(target: "git.worktree", path = %path.display(), pid, "reaping abandoned purge");
             let removed = if path.exists() {
-                self.remove_worktree(&path, true)
+                self.remove_worktree(&path, lock.force)
             } else {
                 self.unlock_worktree(&path);
                 self.prune_worktrees()

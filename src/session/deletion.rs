@@ -402,7 +402,7 @@ impl PurgeTransaction {
         if !matches!(gate, CompletionGate::Proceed) {
             return self.result_for_gate(gate, retained);
         }
-        let mut result = perform_deletion_teardown_lifecycle_locked(&self.request);
+        let mut result = perform_deletion_teardown_lifecycle_locked(&self.request, false);
         if !result.success && !commit_on_teardown_failure {
             result.retained_instance = self.release_reservation().ok().flatten();
             result.disposition = DeletionDisposition::Failed;
@@ -493,7 +493,7 @@ impl CommittedPurge {
     /// Clean up resources while retaining the lifecycle flock that covered the
     /// irreversible durable-row removal.
     pub fn finish(self) -> DeletionResult {
-        let mut result = perform_deletion_teardown_lifecycle_locked(&self.request);
+        let mut result = perform_deletion_teardown_lifecycle_locked(&self.request, true);
         result.disposition = DeletionDisposition::Removed;
         result
     }
@@ -703,8 +703,12 @@ pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
     })
 }
 
-fn perform_deletion_teardown_lifecycle_locked(request: &DeletionRequest) -> DeletionResult {
-    perform_deletion_core(request, true, |session_id| {
+/// `row_removed` says the durable row is already gone, so nothing will retry a purge that dies.
+fn perform_deletion_teardown_lifecycle_locked(
+    request: &DeletionRequest,
+    row_removed: bool,
+) -> DeletionResult {
+    perform_deletion_core(request, true, row_removed, |session_id| {
         DockerContainer::from_session_id(session_id).teardown(session_id)
     })
 }
@@ -716,13 +720,14 @@ fn perform_deletion_with(
     request: &DeletionRequest,
     teardown: impl FnOnce(&str) -> crate::containers::Teardown,
 ) -> DeletionResult {
-    perform_deletion_core(request, false, teardown)
+    perform_deletion_core(request, false, false, teardown)
 }
 
 /// `lifecycle_locked` is the production path, which also keeps any worktree another session uses.
 fn perform_deletion_core(
     request: &DeletionRequest,
     lifecycle_locked: bool,
+    row_removed: bool,
     teardown: impl FnOnce(&str) -> crate::containers::Teardown,
 ) -> DeletionResult {
     let mut errors = Vec::new();
@@ -793,7 +798,7 @@ fn perform_deletion_core(
             .is_some_and(|wt| wt.managed_by_aoe)
             || request.instance.workspace_info.is_some());
     let stage = |paths_in_use: &PathsInUse| {
-        stage_teardown_worktrees(
+        let (container_gone, moved) = stage_teardown_worktrees(
             request,
             repos,
             is_sandboxed,
@@ -801,7 +806,19 @@ fn perform_deletion_core(
             teardown,
             &mut errors,
             &mut messages,
-        )
+        );
+        let lock = crate::git::PurgeLock {
+            row_removed,
+            force: request.force_delete,
+        };
+        match moved {
+            Some(moved) if hide_for_purge(&moved, lock) => (container_gone, Some(moved)),
+            Some(moved) => {
+                remove_moved_worktree(request, &moved, &mut errors, &mut messages);
+                (container_gone, None)
+            }
+            None => (container_gone, None),
+        }
     };
     let (container_gone, deferred) = if lifecycle_locked && removes_managed_worktree {
         with_paths_in_use_locked(&request.session_id, stage)
@@ -903,11 +920,7 @@ fn stage_teardown_worktrees(
     }
 
     if let Some(moved) = move_worktree_aside(request, &preserved_worktree_paths) {
-        if hide_for_purge(&moved) {
-            return (container_gone, Some(moved));
-        }
-        remove_moved_worktree(request, &moved, errors, messages);
-        return (container_gone, None);
+        return (container_gone, Some(moved));
     }
     stage_remove_worktrees_and_branches(
         request,
@@ -1027,13 +1040,13 @@ fn remove_moved_worktree(
     }
 }
 
-fn hide_for_purge(moved: &DeletionRequest) -> bool {
+fn hide_for_purge(moved: &DeletionRequest, lock: crate::git::PurgeLock) -> bool {
     #[cfg(test)]
     if FAIL_HIDE_FOR_PURGE.with(|fail| fail.replace(false)) {
         return false;
     }
     let aside = PathBuf::from(&moved.instance.project_path);
-    let locked = main_repo_git(moved).and_then(|git| git.lock_for_purge(&aside));
+    let locked = main_repo_git(moved).and_then(|git| git.lock_for_purge(&aside, lock));
     if let Err(error) = &locked {
         tracing::warn!(target: "session.delete",
             session_id = %moved.session_id,
@@ -1959,6 +1972,14 @@ mod tests {
                         .unwrap()
                         .iter()
                         .any(|entry| entry.branch.as_deref() == Some("feature/slow"));
+                    let lock_reason =
+                        crate::git::cleanup::read_linked_worktree_gitdir(&aside_probe)
+                            .and_then(|admin| std::fs::read_to_string(admin.join("locked")).ok())
+                            .unwrap_or_default();
+                    assert!(
+                        lock_reason.contains("purge") && !lock_reason.contains("row removed"),
+                        "a retained-row purge was marked reapable: {lock_reason}"
+                    );
                     match case {
                         Case::RemovalFails => {
                             std::fs::create_dir(aside_probe.join("stuck")).unwrap();

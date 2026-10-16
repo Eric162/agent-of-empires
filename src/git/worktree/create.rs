@@ -568,9 +568,32 @@ pub(super) mod tests {
     fn create_worktree_reaps_purges_whose_process_died() {
         let mut exited = std::process::Command::new("true").spawn().unwrap();
         exited.wait().unwrap();
-        for (label, owner, reaped) in [
-            ("dead purger", exited.id(), true),
-            ("live purger", std::process::id(), false),
+        let (dead, live) = (exited.id(), std::process::id());
+        // (case, purging pid, flags, written after marking, reaped)
+        for (label, owner, flags, dirty, reaped) in [
+            (
+                "dead purger, row removed",
+                dead,
+                ", row removed",
+                false,
+                true,
+            ),
+            ("live purger", live, ", row removed", false, false),
+            ("row still retained", dead, "", false, false),
+            (
+                "unforced purge dirtied later",
+                dead,
+                ", row removed",
+                true,
+                false,
+            ),
+            (
+                "forced purge dirtied later",
+                dead,
+                ", row removed, force",
+                true,
+                true,
+            ),
         ] {
             let (dir, _repo) = init_repo();
             let git_wt = GitWorktree::new(dir.path().to_path_buf()).unwrap();
@@ -579,11 +602,14 @@ pub(super) mod tests {
             git_wt.create_worktree("feat", &aside, true, None).unwrap();
             let aside_str = aside.to_str().unwrap();
             run_git(dir.path(), &["worktree", "unlock", aside_str]);
-            let reason = format!("{}{owner}", super::super::PURGE_LOCK_PREFIX);
+            let reason = format!("{}{owner}{flags}", super::super::PURGE_LOCK_PREFIX);
             run_git(
                 dir.path(),
                 &["worktree", "lock", "--reason", &reason, aside_str],
             );
+            if dirty {
+                std::fs::write(aside.join("late-edit"), "").unwrap();
+            }
 
             let created = git_wt.create_worktree("feat", &parent.path().join("new"), false, None);
             assert_eq!(created.is_ok(), reaped, "{label}: {created:?}");
