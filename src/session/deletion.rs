@@ -662,6 +662,7 @@ thread_local! {
     static BEFORE_DEFERRED_REMOVAL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
     static FAIL_HIDE_FOR_PURGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_MOVE_AFTER_MOVING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Run `f` with the paths other sessions use while every profile's storage lock is held, so no
@@ -952,7 +953,18 @@ fn move_worktree_aside(
     if preserved_worktree_paths.contains(&from) {
         return None;
     }
-    if let Err(error) = main_repo_git(request).and_then(|git| git.move_worktree(&from, &aside)) {
+    let moved = main_repo_git(request).and_then(|git| git.move_worktree(&from, &aside));
+    #[cfg(test)]
+    let moved =
+        moved.and_then(
+            |()| match FAIL_MOVE_AFTER_MOVING.with(|fail| fail.replace(false)) {
+                true => Err(crate::git::error::GitError::WorktreeCommandFailed(
+                    "injected".into(),
+                )),
+                false => Ok(()),
+            },
+        );
+    if let Err(error) = moved {
         // A timed-out or partly failed move can still have moved the checkout.
         if from.exists() || !aside.exists() {
             tracing::warn!(target: "session.delete",
@@ -973,6 +985,14 @@ fn adopted_aside(request: &DeletionRequest, paths_in_use: &PathsInUse) -> Option
     let (from, aside) = aside_paths(request)?;
     if from.exists() || !aside.exists() || !paths_in_use.covers(&aside) {
         return None;
+    }
+    // A kept checkout must not stay hidden, or later purges and reaping would treat it as theirs.
+    if let Err(error) = main_repo_git(request).and_then(|git| git.relock_as_managed(&aside)) {
+        tracing::warn!(target: "session.delete",
+            session_id = %request.session_id,
+            %error,
+            "perform_deletion: could not unhide an adopted worktree"
+        );
     }
     let mut adopted = request.clone();
     adopted.instance.project_path = aside.to_string_lossy().into_owned();
@@ -1031,13 +1051,35 @@ fn move_back_from_aside(request: &DeletionRequest) -> crate::git::error::Result<
     if from.exists() || !aside.exists() {
         return Ok(());
     }
+    let has_git = aside.join(".git").exists();
+    let branch = request
+        .instance
+        .worktree_info
+        .as_ref()
+        .map(|wt| wt.branch.as_str());
+    // A partly removed checkout may have no readable branch; only another branch disowns it.
+    let other_branch = GitWorktree::get_current_branch(&aside)
+        .ok()
+        .filter(|found| Some(found.as_str()) != branch);
+    if let Some(other_branch) = other_branch {
+        return Err(crate::git::error::GitError::WorktreeCommandFailed(format!(
+            "{} is on {other_branch}, not this session's branch",
+            aside.display()
+        )));
+    }
     let git = main_repo_git(request)?;
     if git.move_worktree(&aside, &from).is_ok() {
         return Ok(());
     }
-    // A partial removal can leave no `.git` for git to move; unlocking lets prune reap the entry.
+    // A partial removal can leave no `.git` for git to move; without one, unlocking lets prune
+    // reap the entry, and with one, repair points it at the new path.
     git.unlock_worktree(&aside);
-    std::fs::rename(&aside, &from).map_err(Into::into)
+    std::fs::rename(&aside, &from)?;
+    if has_git {
+        git.repair_worktree(&from)?;
+        git.lock_worktree(&from)?;
+    }
+    Ok(())
 }
 
 fn stage_collect_preserved_worktrees(
@@ -1882,9 +1924,13 @@ mod tests {
         enum Case {
             Clean,
             Resumed,
+            MoveErrorAfterMoving,
             AdoptedBeforeHide,
+            AdoptedAfterHide,
+            UnreadableProfileAfterHide,
             RemovalFails,
             DirtiedAfterCheck,
+            StatusUnreadable,
             HideFails,
         }
         let read_only = |dir: &Path, mode| {
@@ -1893,11 +1939,23 @@ mod tests {
         for case in [
             Case::Clean,
             Case::Resumed,
+            Case::MoveErrorAfterMoving,
             Case::AdoptedBeforeHide,
+            Case::AdoptedAfterHide,
+            Case::UnreadableProfileAfterHide,
             Case::RemovalFails,
             Case::DirtiedAfterCheck,
+            Case::StatusUnreadable,
             Case::HideFails,
         ] {
+            let kept_aside = matches!(
+                case,
+                Case::AdoptedBeforeHide | Case::AdoptedAfterHide | Case::UnreadableProfileAfterHide
+            );
+            let after_hide = matches!(
+                case,
+                Case::AdoptedAfterHide | Case::UnreadableProfileAfterHide
+            );
             let (tmp, main_repo, worktree, mut owner) = worktree_fixture("feature/slow");
             let _home = isolate_app_dir_at(&tmp.path().join("home"));
             let profile = "slow-purge";
@@ -1908,11 +1966,21 @@ mod tests {
                 .unwrap()
                 .join(format!(".aoe-purge-{}", owner.id));
             let mut rows = vec![owner.clone()];
-            if matches!(case, Case::Resumed | Case::AdoptedBeforeHide) {
+            if case == Case::Resumed || kept_aside {
                 let (from, to) = (worktree.to_str().unwrap(), aside.to_str().unwrap());
                 git_in(&main_repo, &["worktree", "move", from, to]);
             }
-            if case == Case::AdoptedBeforeHide {
+            if after_hide {
+                GitWorktree::new(main_repo.clone())
+                    .unwrap()
+                    .lock_for_purge(&aside)
+                    .unwrap();
+            }
+            if case == Case::UnreadableProfileAfterHide {
+                let other = Storage::new_unwatched("other").unwrap();
+                std::fs::write(other.sessions_path(), "not json").unwrap();
+            }
+            if matches!(case, Case::AdoptedBeforeHide | Case::AdoptedAfterHide) {
                 let mut adopter = Instance::new("Adopter", aside.to_str().unwrap());
                 adopter.source_profile = profile.to_string();
                 rows.push(adopter);
@@ -1928,6 +1996,9 @@ mod tests {
                 std::fs::write(worktree.join("stuck/file"), "").unwrap();
                 read_only(&worktree.join("stuck"), 0o555);
                 FAIL_HIDE_FOR_PURGE.with(|fail| fail.set(true));
+            }
+            if case == Case::MoveErrorAfterMoving {
+                FAIL_MOVE_AFTER_MOVING.with(|fail| fail.set(true));
             }
 
             let (seen_tx, seen_rx) = std::sync::mpsc::channel();
@@ -1950,6 +2021,12 @@ mod tests {
                         }
                         Case::DirtiedAfterCheck => {
                             std::fs::write(aside_probe.join("late-edit"), "").unwrap();
+                        }
+                        Case::StatusUnreadable => {
+                            let admin =
+                                crate::git::cleanup::read_linked_worktree_gitdir(&aside_probe)
+                                    .unwrap();
+                            std::fs::write(admin.join("index"), "not an index").unwrap();
                         }
                         _ => {}
                     }
@@ -1983,7 +2060,7 @@ mod tests {
 
             let deferred = seen_rx.try_recv().ok();
             let label = format!("{case:?}: {:?}", result.errors);
-            if matches!(case, Case::AdoptedBeforeHide | Case::HideFails) {
+            if kept_aside || case == Case::HideFails {
                 assert!(deferred.is_none(), "{label}: removal was deferred");
             } else {
                 let (locks_free, original_present, aside_present, listed) =
@@ -1998,23 +2075,39 @@ mod tests {
 
             let rows = Storage::open_unwatched(profile).unwrap().load().unwrap();
             match case {
-                Case::Clean | Case::Resumed => {
+                Case::Clean | Case::Resumed | Case::MoveErrorAfterMoving => {
                     assert_eq!(result.disposition, DeletionDisposition::Removed, "{label}");
                     assert!(!aside.exists() && !worktree.exists(), "{label}");
                     assert!(!branch_exists(&main_repo, "feature/slow"), "{label}");
                 }
-                Case::AdoptedBeforeHide => {
+                Case::AdoptedBeforeHide
+                | Case::AdoptedAfterHide
+                | Case::UnreadableProfileAfterHide => {
                     assert_eq!(result.disposition, DeletionDisposition::Removed, "{label}");
-                    assert!(aside.exists(), "{label}: adopted checkout was removed");
+                    assert!(aside.exists(), "{label}: kept checkout was removed");
                     assert!(branch_exists(&main_repo, "feature/slow"), "{label}");
-                    assert_eq!(rows.len(), 1, "{label}");
-                    assert_eq!(rows[0].project_path, aside.to_str().unwrap(), "{label}");
+                    let listed = GitWorktree::new(main_repo.clone())
+                        .unwrap()
+                        .list_worktrees()
+                        .unwrap()
+                        .iter()
+                        .any(|entry| entry.branch.as_deref() == Some("feature/slow"));
+                    assert!(listed, "{label}: kept checkout is still hidden");
+                    if case != Case::UnreadableProfileAfterHide {
+                        assert_eq!(rows.len(), 1, "{label}");
+                        assert_eq!(rows[0].project_path, aside.to_str().unwrap(), "{label}");
+                    }
                 }
-                Case::RemovalFails | Case::DirtiedAfterCheck | Case::HideFails => {
-                    if case != Case::DirtiedAfterCheck {
-                        read_only(&worktree.join("stuck"), 0o755);
-                    } else {
-                        assert!(worktree.join("late-edit").exists(), "{label}: edit lost");
+                Case::RemovalFails
+                | Case::DirtiedAfterCheck
+                | Case::StatusUnreadable
+                | Case::HideFails => {
+                    match case {
+                        Case::DirtiedAfterCheck => {
+                            assert!(worktree.join("late-edit").exists(), "{label}: edit lost");
+                        }
+                        Case::StatusUnreadable => {}
+                        _ => read_only(&worktree.join("stuck"), 0o755),
                     }
                     assert_ne!(result.disposition, DeletionDisposition::Removed, "{label}");
                     assert!(
