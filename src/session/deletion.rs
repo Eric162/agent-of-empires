@@ -661,6 +661,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static BEFORE_DEFERRED_REMOVAL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    static FAIL_HIDE_FOR_PURGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Run `f` with the paths other sessions use while every profile's storage lock is held, so no
@@ -811,25 +812,7 @@ fn perform_deletion_core(
         if let Some(hook) = BEFORE_DEFERRED_REMOVAL.with(|slot| slot.borrow_mut().take()) {
             hook();
         }
-        let errors_before = errors.len();
-        stage_remove_worktrees_and_branches(
-            &moved,
-            &[],
-            &std::collections::HashSet::new(),
-            false,
-            &mut errors,
-            &mut messages,
-        );
-        // The retained row still records the original path.
-        if errors.len() > errors_before {
-            if let Err(error) = move_back_from_aside(request) {
-                tracing::warn!(target: "session.delete",
-                    session_id = %request.session_id,
-                    %error,
-                    "perform_deletion: could not move the worktree back after a failed removal"
-                );
-            }
-        }
+        remove_moved_worktree(request, &moved, &mut errors, &mut messages);
     }
 
     stage_cleanup_scratch(request, &mut errors, &mut messages);
@@ -879,13 +862,21 @@ fn stage_teardown_worktrees(
     errors: &mut Vec<String>,
     messages: &mut Vec<String>,
 ) -> (bool, Option<DeletionRequest>) {
-    // A retry after an interrupted removal: restore the path every guard below checks.
-    if let Err(error) = move_back_from_aside(request) {
-        errors.push(format!(
-            "Worktree: could not recover moved-aside checkout: {error}"
-        ));
-        return (false, None);
-    }
+    // A retry after an interrupted removal. A checkout another session adopted before it was
+    // hidden is judged where it is; otherwise restore the path every guard below checks.
+    let adopted = adopted_aside(request, paths_in_use);
+    let request = match &adopted {
+        Some(adopted) => adopted,
+        None => {
+            if let Err(error) = move_back_from_aside(request) {
+                errors.push(format!(
+                    "Worktree: could not recover moved-aside checkout: {error}"
+                ));
+                return (false, None);
+            }
+            request
+        }
+    };
     let preserved_worktree_paths =
         stage_collect_preserved_worktrees(request, repos, paths_in_use, errors, messages);
     // Any preserved worktree, dirty or default-branch, blocks the in-container preclean (a
@@ -914,14 +905,7 @@ fn stage_teardown_worktrees(
         if hide_for_purge(&moved) {
             return (container_gone, Some(moved));
         }
-        stage_remove_worktrees_and_branches(
-            &moved,
-            &[],
-            &std::collections::HashSet::new(),
-            false,
-            errors,
-            messages,
-        );
+        remove_moved_worktree(request, &moved, errors, messages);
         return (container_gone, None);
     }
     stage_remove_worktrees_and_branches(
@@ -985,7 +969,49 @@ fn move_worktree_aside(
     Some(moved)
 }
 
+fn adopted_aside(request: &DeletionRequest, paths_in_use: &PathsInUse) -> Option<DeletionRequest> {
+    let (from, aside) = aside_paths(request)?;
+    if from.exists() || !aside.exists() || !paths_in_use.covers(&aside) {
+        return None;
+    }
+    let mut adopted = request.clone();
+    adopted.instance.project_path = aside.to_string_lossy().into_owned();
+    Some(adopted)
+}
+
+/// Removes a moved-aside worktree, moving it back on failure since the retained row still records
+/// the original path.
+fn remove_moved_worktree(
+    request: &DeletionRequest,
+    moved: &DeletionRequest,
+    errors: &mut Vec<String>,
+    messages: &mut Vec<String>,
+) {
+    let errors_before = errors.len();
+    stage_remove_worktrees_and_branches(
+        moved,
+        &[],
+        &std::collections::HashSet::new(),
+        false,
+        errors,
+        messages,
+    );
+    if errors.len() > errors_before {
+        if let Err(error) = move_back_from_aside(request) {
+            tracing::warn!(target: "session.delete",
+                session_id = %request.session_id,
+                %error,
+                "perform_deletion: could not move the worktree back after a failed removal"
+            );
+        }
+    }
+}
+
 fn hide_for_purge(moved: &DeletionRequest) -> bool {
+    #[cfg(test)]
+    if FAIL_HIDE_FOR_PURGE.with(|fail| fail.replace(false)) {
+        return false;
+    }
     let aside = PathBuf::from(&moved.instance.project_path);
     let locked = main_repo_git(moved).and_then(|git| git.lock_for_purge(&aside));
     if let Err(error) = &locked {
@@ -1852,34 +1878,62 @@ mod tests {
     #[serial]
     fn purge_removes_the_worktree_without_holding_store_locks() {
         use std::os::unix::fs::PermissionsExt;
-        for (resumed, removal_fails) in [(false, false), (true, false), (false, true)] {
-            let label = format!("resumed={resumed} removal_fails={removal_fails}");
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Case {
+            Clean,
+            Resumed,
+            AdoptedBeforeHide,
+            RemovalFails,
+            DirtiedAfterCheck,
+            HideFails,
+        }
+        let read_only = |dir: &Path, mode| {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        for case in [
+            Case::Clean,
+            Case::Resumed,
+            Case::AdoptedBeforeHide,
+            Case::RemovalFails,
+            Case::DirtiedAfterCheck,
+            Case::HideFails,
+        ] {
             let (tmp, main_repo, worktree, mut owner) = worktree_fixture("feature/slow");
             let _home = isolate_app_dir_at(&tmp.path().join("home"));
             let profile = "slow-purge";
             let storage = Storage::new_unwatched(profile).unwrap();
             owner.source_profile = profile.to_string();
-            storage
-                .update(|instances, _groups| {
-                    instances.push(owner.clone());
-                    Ok(())
-                })
-                .unwrap();
             let aside = worktree
                 .parent()
                 .unwrap()
                 .join(format!(".aoe-purge-{}", owner.id));
-            if resumed {
+            let mut rows = vec![owner.clone()];
+            if matches!(case, Case::Resumed | Case::AdoptedBeforeHide) {
                 let (from, to) = (worktree.to_str().unwrap(), aside.to_str().unwrap());
                 git_in(&main_repo, &["worktree", "move", from, to]);
             }
-            let stuck = aside.join("stuck");
+            if case == Case::AdoptedBeforeHide {
+                let mut adopter = Instance::new("Adopter", aside.to_str().unwrap());
+                adopter.source_profile = profile.to_string();
+                rows.push(adopter);
+            }
+            storage
+                .update(|instances, _groups| {
+                    instances.extend(rows);
+                    Ok(())
+                })
+                .unwrap();
+            if case == Case::HideFails {
+                std::fs::create_dir(worktree.join("stuck")).unwrap();
+                std::fs::write(worktree.join("stuck/file"), "").unwrap();
+                read_only(&worktree.join("stuck"), 0o555);
+                FAIL_HIDE_FOR_PURGE.with(|fail| fail.set(true));
+            }
 
             let (seen_tx, seen_rx) = std::sync::mpsc::channel();
             let probe = Storage::open_unwatched(profile).unwrap();
             let (worktree_probe, aside_probe, repo_probe) =
                 (worktree.clone(), aside.clone(), main_repo.clone());
-            let stuck_probe = stuck.clone();
             BEFORE_DEFERRED_REMOVAL.with(|slot| {
                 *slot.borrow_mut() = Some(Box::new(move || {
                     let listed = GitWorktree::new(repo_probe)
@@ -1888,14 +1942,16 @@ mod tests {
                         .unwrap()
                         .iter()
                         .any(|entry| entry.branch.as_deref() == Some("feature/slow"));
-                    if removal_fails {
-                        std::fs::create_dir(&stuck_probe).unwrap();
-                        std::fs::write(stuck_probe.join("file"), "").unwrap();
-                        std::fs::set_permissions(
-                            &stuck_probe,
-                            std::fs::Permissions::from_mode(0o555),
-                        )
-                        .unwrap();
+                    match case {
+                        Case::RemovalFails => {
+                            std::fs::create_dir(aside_probe.join("stuck")).unwrap();
+                            std::fs::write(aside_probe.join("stuck/file"), "").unwrap();
+                            read_only(&aside_probe.join("stuck"), 0o555);
+                        }
+                        Case::DirtiedAfterCheck => {
+                            std::fs::write(aside_probe.join("late-edit"), "").unwrap();
+                        }
+                        _ => {}
                     }
                     seen_tx
                         .send((
@@ -1913,6 +1969,7 @@ mod tests {
                 DeletionRequest {
                     delete_worktree: true,
                     delete_branch: true,
+                    force_delete: matches!(case, Case::RemovalFails | Case::HideFails),
                     ..request(owner)
                 },
             )
@@ -1922,40 +1979,51 @@ mod tests {
                 PurgeReservation::Rejected(_) => panic!("purge reservation was refused"),
             };
             let result = transaction.complete();
+            BEFORE_DEFERRED_REMOVAL.with(|slot| slot.borrow_mut().take());
 
-            let (locks_free, original_present, aside_present, listed) =
-                seen_rx.try_recv().expect("the removal was not deferred");
-            assert!(locks_free, "{label}: store locks held during removal");
-            assert!(
-                !original_present && aside_present,
-                "{label}: worktree was not moved aside first"
-            );
-            assert!(!listed, "{label}: a session could adopt the moved worktree");
-            if removal_fails {
-                let restored = worktree.join("stuck");
-                std::fs::set_permissions(&restored, std::fs::Permissions::from_mode(0o755))
-                    .unwrap();
-                assert_ne!(result.disposition, DeletionDisposition::Removed, "{label}");
-                assert!(
-                    restored.exists() && !aside.exists(),
-                    "{label}: worktree was not moved back for the retained row"
-                );
-                assert!(branch_exists(&main_repo, "feature/slow"), "{label}");
-                let retained = Storage::open_unwatched(profile).unwrap().load().unwrap();
-                assert_eq!(
-                    retained[0].project_path,
-                    worktree.to_str().unwrap(),
-                    "{label}"
-                );
+            let deferred = seen_rx.try_recv().ok();
+            let label = format!("{case:?}: {:?}", result.errors);
+            if matches!(case, Case::AdoptedBeforeHide | Case::HideFails) {
+                assert!(deferred.is_none(), "{label}: removal was deferred");
             } else {
-                assert_eq!(
-                    result.disposition,
-                    DeletionDisposition::Removed,
-                    "{label}: {:?}",
-                    result.errors
+                let (locks_free, original_present, aside_present, listed) =
+                    deferred.expect("the removal was not deferred");
+                assert!(locks_free, "{label}: store locks held during removal");
+                assert!(
+                    !original_present && aside_present,
+                    "{label}: not moved aside"
                 );
-                assert!(!aside.exists(), "{label}: moved worktree was not removed");
-                assert!(!branch_exists(&main_repo, "feature/slow"), "{label}");
+                assert!(!listed, "{label}: a session could adopt the moved worktree");
+            }
+
+            let rows = Storage::open_unwatched(profile).unwrap().load().unwrap();
+            match case {
+                Case::Clean | Case::Resumed => {
+                    assert_eq!(result.disposition, DeletionDisposition::Removed, "{label}");
+                    assert!(!aside.exists() && !worktree.exists(), "{label}");
+                    assert!(!branch_exists(&main_repo, "feature/slow"), "{label}");
+                }
+                Case::AdoptedBeforeHide => {
+                    assert_eq!(result.disposition, DeletionDisposition::Removed, "{label}");
+                    assert!(aside.exists(), "{label}: adopted checkout was removed");
+                    assert!(branch_exists(&main_repo, "feature/slow"), "{label}");
+                    assert_eq!(rows.len(), 1, "{label}");
+                    assert_eq!(rows[0].project_path, aside.to_str().unwrap(), "{label}");
+                }
+                Case::RemovalFails | Case::DirtiedAfterCheck | Case::HideFails => {
+                    if case != Case::DirtiedAfterCheck {
+                        read_only(&worktree.join("stuck"), 0o755);
+                    } else {
+                        assert!(worktree.join("late-edit").exists(), "{label}: edit lost");
+                    }
+                    assert_ne!(result.disposition, DeletionDisposition::Removed, "{label}");
+                    assert!(
+                        worktree.exists() && !aside.exists(),
+                        "{label}: not moved back"
+                    );
+                    assert!(branch_exists(&main_repo, "feature/slow"), "{label}");
+                    assert_eq!(rows[0].project_path, worktree.to_str().unwrap(), "{label}");
+                }
             }
         }
     }

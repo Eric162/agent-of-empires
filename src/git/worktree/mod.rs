@@ -290,8 +290,13 @@ impl GitWorktree {
             return Err(GitError::WorktreeNotFound(path.to_path_buf()));
         }
         let mut args = vec!["worktree", "remove"];
-        // Stays locked so it stays hidden; `--force` twice overrides the lock.
+        // Stays locked so it stays hidden; `--force` twice overrides the lock and dirtiness alike.
         if Self::is_purging(path) {
+            if !force {
+                if let Some(message) = crate::git::cleanup::dirty_worktree_message(path) {
+                    return Err(GitError::WorktreeCommandFailed(message));
+                }
+            }
             args.extend(["--force", "--force"]);
         } else {
             // A single `--force` does not override a lock.
