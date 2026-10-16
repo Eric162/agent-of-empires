@@ -180,6 +180,12 @@ impl GitWorktree {
         self.lock_with_reason(path, WORKTREE_LOCK_REASON)
     }
 
+    /// Return a purge-locked worktree to an ordinary aoe-managed one.
+    pub fn relock_as_managed(&self, path: &Path) -> Result<()> {
+        self.unlock_worktree(path);
+        self.lock_worktree(path)
+    }
+
     /// Relock `path` as purging, hiding it from `list_worktrees`.
     pub fn lock_for_purge(&self, path: &Path) -> Result<()> {
         self.unlock_worktree(path);
@@ -293,7 +299,9 @@ impl GitWorktree {
         // Stays locked so it stays hidden; `--force` twice overrides the lock and dirtiness alike.
         if Self::is_purging(path) {
             if !force {
-                if let Some(message) = crate::git::cleanup::dirty_worktree_message(path) {
+                let dirty = crate::git::cleanup::checked_dirty_worktree_message(path)
+                    .unwrap_or_else(|error| Some(format!("could not check for changes: {error}")));
+                if let Some(message) = dirty {
                     return Err(GitError::WorktreeCommandFailed(message));
                 }
             }
