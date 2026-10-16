@@ -98,6 +98,7 @@ pub struct App {
     home: HomeView,
     tool_detection: Option<ToolDetection>,
     available_tools_rx: Option<tokio::sync::oneshot::Receiver<AvailableTools>>,
+    pending_forced_tool_detection: bool,
     startup_dialogs_pending: bool,
     force_update_check: bool,
     should_quit: bool,
@@ -299,6 +300,7 @@ impl App {
             home,
             tool_detection: None,
             available_tools_rx: None,
+            pending_forced_tool_detection: false,
             startup_dialogs_pending: !suppress_first_run_dialogs,
             force_update_check,
             should_quit: false,
@@ -371,6 +373,7 @@ impl App {
 
     fn spawn_tool_detection(&mut self, force: bool) {
         if self.available_tools_rx.is_some() {
+            self.pending_forced_tool_detection |= force;
             return;
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -412,7 +415,11 @@ impl App {
             }
             self.available_tools_rx = None;
             self.tool_detection = None;
-            self.finish_startup_dialogs(true);
+            if std::mem::take(&mut self.pending_forced_tool_detection) {
+                self.spawn_tool_detection(true);
+            } else {
+                self.finish_startup_dialogs(true);
+            }
             return true;
         }
         self.finish_startup_dialogs(true)
@@ -3234,6 +3241,116 @@ fn smart_rename_failure(e: &crate::acp::client::HttpError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    async fn forced_recheck_survives_an_in_flight_detection() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD_ENV: &str = "AOE_RECHECK_TEST_CHILD";
+        let thread = std::thread::current();
+        let test = thread.name().expect("named test thread");
+        if std::env::var_os(CHILD_ENV).as_deref() != Some(std::ffi::OsStr::new(test)) {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", test, "--nocapture"])
+                .env_clear()
+                .env(CHILD_ENV, test)
+                .env("PATH", "/usr/bin:/bin")
+                .stdin(std::process::Stdio::null());
+            let output = crate::process::run_with_timeout_process_group(
+                &mut command,
+                Duration::from_secs(30),
+            )
+            .unwrap()
+            .expect("isolated recheck test timed out");
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let memo = crate::tmux::AgentAvailabilityGuard::capture();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        for (name, script) in [
+            ("which", "#!/bin/sh\n[ \"$1\" = claude ]\n"),
+            ("login-shell", "#!/bin/sh\nexit 0\n"),
+        ] {
+            let path = bin.join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("PATH", bin.to_str().unwrap().to_string()),
+            (
+                "SHELL",
+                bin.join("login-shell").to_str().unwrap().to_string(),
+            ),
+        ]);
+
+        for deliver_result in [true, false] {
+            for agent in crate::agents::AGENTS {
+                memo.seed(agent.name, false);
+            }
+            assert!(
+                !AvailableTools::detect().any_available(),
+                "the ordinary probe uses cached negatives"
+            );
+            let mut app = App::new(
+                "test",
+                AvailableTools::with_tools(&[]),
+                true,
+                false,
+                crate::file_watch::FileWatchService::noop(),
+            )
+            .unwrap();
+            app.home.show_no_agents();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            app.available_tools_rx = Some(rx);
+            let action = app
+                .home
+                .handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE), None)
+                .unwrap();
+            assert_eq!(action, Action::RecheckAgents);
+            app.spawn_tool_detection(true);
+            app.spawn_tool_detection(true);
+            assert!(
+                !app.poll_tool_detection(),
+                "Recheck must not wait for the active probe"
+            );
+
+            if deliver_result {
+                tx.send(AvailableTools::with_tools(&[])).unwrap();
+            } else {
+                drop(tx);
+            }
+            assert!(app.poll_tool_detection());
+            assert!(
+                app.available_tools_rx.is_some(),
+                "the forced recheck must run after the current probe finishes or closes"
+            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while app.available_tools_rx.is_some() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "forced detection did not finish"
+                );
+                app.poll_tool_detection();
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(app.home.available_tools.available_list(), &["claude"]);
+            assert!(app.home.no_agents_dialog.is_none());
+            assert!(
+                !app.poll_tool_detection(),
+                "repeated requests coalesce into one forced probe"
+            );
+        }
+    }
 
     #[tokio::test]
     #[cfg(unix)]

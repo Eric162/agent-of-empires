@@ -254,12 +254,15 @@ impl DiskWatchState {
                 }
             }
         }
+        let stored_error_pending = reload_failure
+            .disk_watcher_init_error
+            .as_ref()
+            .and_then(|error| error.profile.as_ref())
+            .and_then(|profile| self.handles.get(profile))
+            .is_some_and(|entry| entry.handle.installation_pending());
         if new_init_error.is_some()
             || reload_failure.disk_watcher_init_error_references_missing_profile(current)
-            || !self
-                .handles
-                .values()
-                .any(|entry| entry.handle.installation_pending())
+            || !stored_error_pending
         {
             reload_failure.apply_disk_watcher_init_pass(new_init_error);
         }
@@ -404,12 +407,20 @@ impl ConfigWatchState {
                 }
             }
         }
+        let stored_error_pending = reload_failure
+            .config_watcher_init_error
+            .as_ref()
+            .and_then(|error| {
+                let key = error
+                    .profile
+                    .as_deref()
+                    .map_or(ConfigWatchKey::Global, ConfigWatchKey::profile);
+                self.handles.get(&key)
+            })
+            .is_some_and(|entry| entry.handle.installation_pending());
         if new_init_error.is_some()
             || reload_failure.config_watcher_init_error_references_missing_profile(current)
-            || !self
-                .handles
-                .values()
-                .any(|entry| entry.handle.installation_pending())
+            || !stored_error_pending
         {
             reload_failure.apply_config_watcher_init_pass(new_init_error);
         }
@@ -595,6 +606,91 @@ pub(in crate::tui) fn log_legacy_duplicates_once(reports: &[crate::session::Dupl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recovered_disk_watch_error_clears_while_another_watch_is_pending() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let current = vec!["recovered".to_string(), "pending".to_string()];
+        for name in &current {
+            crate::session::get_profile_dir(name).unwrap();
+        }
+        let (service, backend) = crate::file_watch::test_support::manual_filewatch();
+        let mut watches = DiskWatchState {
+            dirty: Arc::new(AtomicBool::new(false)),
+            handles: HashMap::new(),
+        };
+        let mut failure = ReloadFailureState::default();
+        watches.rewire(&service, &current[..1], &mut failure);
+        let dir = backend.complete_watch(Err(notify::Error::generic("fixture native failure")));
+        watches.rewire(&service, &current[..1], &mut failure);
+        assert!(failure.disk_watcher_init_error.is_some());
+
+        backend.allow_retry(&dir);
+        watches.rewire(&service, &current, &mut failure);
+        assert!(watches.handles["recovered"].handle.installation_pending());
+        assert!(
+            failure.disk_watcher_init_error.is_some(),
+            "retain the error while its own retry is pending"
+        );
+        assert_eq!(backend.complete_watch(Ok(())), dir);
+        assert!(watches.handles["pending"].handle.installation_pending());
+        watches.rewire(&service, &current, &mut failure);
+        assert!(
+            failure.disk_watcher_init_error.is_none(),
+            "an unrelated pending watch must not retain a recovered error"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recovered_config_watch_error_clears_while_another_watch_is_pending() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        for name in ["recovered", "pending"] {
+            crate::session::get_profile_dir(name).unwrap();
+        }
+        for profile_error in [true, false] {
+            let (service, backend) = crate::file_watch::test_support::manual_filewatch();
+            let mut watches = ConfigWatchState {
+                dirty: Arc::new(AtomicBool::new(false)),
+                link_policy_dirty: Arc::new(AtomicBool::new(false)),
+                handles: HashMap::new(),
+            };
+            let mut failure = ReloadFailureState::default();
+            let mut current = if profile_error {
+                vec!["recovered".to_string()]
+            } else {
+                vec![]
+            };
+            watches.rewire(&service, &current, &mut failure);
+            if profile_error {
+                backend.complete_watch(Ok(()));
+            }
+            let dir = backend.complete_watch(Err(notify::Error::generic("fixture native failure")));
+            watches.rewire(&service, &current, &mut failure);
+            assert!(failure.config_watcher_init_error.is_some());
+
+            backend.allow_retry(&dir);
+            current.push("pending".to_string());
+            watches.rewire(&service, &current, &mut failure);
+            let key = if profile_error {
+                ConfigWatchKey::profile("recovered")
+            } else {
+                ConfigWatchKey::Global
+            };
+            assert!(watches.handles[&key].handle.installation_pending());
+            assert!(
+                failure.config_watcher_init_error.is_some(),
+                "retain the error while its own retry is pending"
+            );
+            assert_eq!(backend.complete_watch(Ok(())), dir);
+            assert!(watches.handles[&ConfigWatchKey::profile("pending")]
+                .handle
+                .installation_pending());
+            watches.rewire(&service, &current, &mut failure);
+            assert!(failure.config_watcher_init_error.is_none(), "an unrelated pending watch must not retain a recovered error (profile_error={profile_error})");
+        }
+    }
 
     #[tokio::test]
     #[serial_test::serial]
