@@ -1882,6 +1882,7 @@ mod tests {
         #[derive(Clone, Copy, Debug, PartialEq)]
         enum Case {
             Clean,
+            Committed,
             Resumed,
             MoveErrorAfterMoving,
             AdoptedBeforeHide,
@@ -1897,6 +1898,7 @@ mod tests {
         };
         for case in [
             Case::Clean,
+            Case::Committed,
             Case::Resumed,
             Case::MoveErrorAfterMoving,
             Case::AdoptedBeforeHide,
@@ -1911,6 +1913,8 @@ mod tests {
                 case,
                 Case::AdoptedBeforeHide | Case::AdoptedAfterHide | Case::UnreadableProfileAfterHide
             );
+            let force_delete =
+                matches!(case, Case::Committed | Case::RemovalFails | Case::HideFails);
             let after_hide = matches!(
                 case,
                 Case::AdoptedAfterHide | Case::UnreadableProfileAfterHide
@@ -1932,7 +1936,13 @@ mod tests {
             if after_hide {
                 GitWorktree::new(main_repo.clone())
                     .unwrap()
-                    .lock_for_purge(&aside)
+                    .lock_for_purge(
+                        &aside,
+                        crate::git::PurgeLock {
+                            row_removed: false,
+                            force: false,
+                        },
+                    )
                     .unwrap();
             }
             if case == Case::UnreadableProfileAfterHide {
@@ -1976,9 +1986,16 @@ mod tests {
                         crate::git::cleanup::read_linked_worktree_gitdir(&aside_probe)
                             .and_then(|admin| std::fs::read_to_string(admin.join("locked")).ok())
                             .unwrap_or_default();
-                    assert!(
-                        lock_reason.contains("purge") && !lock_reason.contains("row removed"),
-                        "a retained-row purge was marked reapable: {lock_reason}"
+                    assert!(lock_reason.contains("purge"), "{case:?}: {lock_reason}");
+                    assert_eq!(
+                        lock_reason.contains("row removed"),
+                        case == Case::Committed,
+                        "{case:?}: only a committed purge is reapable: {lock_reason}"
+                    );
+                    assert_eq!(
+                        lock_reason.contains(", force"),
+                        force_delete,
+                        "{case:?}: lock does not record the purge's force: {lock_reason}"
                     );
                     match case {
                         Case::RemovalFails => {
@@ -2013,7 +2030,7 @@ mod tests {
                 DeletionRequest {
                     delete_worktree: true,
                     delete_branch: true,
-                    force_delete: matches!(case, Case::RemovalFails | Case::HideFails),
+                    force_delete,
                     ..request(owner)
                 },
             )
@@ -2022,7 +2039,14 @@ mod tests {
                 PurgeReservation::Reserved(transaction) => transaction,
                 PurgeReservation::Rejected(_) => panic!("purge reservation was refused"),
             };
-            let result = transaction.complete();
+            let result = if case == Case::Committed {
+                let Ok(committed) = transaction.begin_irreversible() else {
+                    panic!("purge commit was refused");
+                };
+                committed.finish()
+            } else {
+                transaction.complete()
+            };
             BEFORE_DEFERRED_REMOVAL.with(|slot| slot.borrow_mut().take());
 
             let deferred = seen_rx.try_recv().ok();
@@ -2042,7 +2066,7 @@ mod tests {
 
             let rows = Storage::open_unwatched(profile).unwrap().load().unwrap();
             match case {
-                Case::Clean | Case::Resumed | Case::MoveErrorAfterMoving => {
+                Case::Clean | Case::Committed | Case::Resumed | Case::MoveErrorAfterMoving => {
                     assert_eq!(result.disposition, DeletionDisposition::Removed, "{label}");
                     assert!(!aside.exists() && !worktree.exists(), "{label}");
                     assert!(!branch_exists(&main_repo, "feature/slow"), "{label}");

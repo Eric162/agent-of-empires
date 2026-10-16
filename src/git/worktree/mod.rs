@@ -30,6 +30,7 @@ const WORKTREE_LOCK_REASON: &str = "aoe-managed worktree (prevents cross-boundar
 
 /// Lock reason on a worktree whose purge is in progress, followed by the purging pid and its
 /// [`PurgeLock`] flags. Listings skip it so no session can adopt it.
+const PURGE_LOCK_REASON: &str = "aoe purge in progress";
 const PURGE_LOCK_PREFIX: &str = "aoe purge in progress, pid ";
 const ROW_REMOVED_FLAG: &str = "row removed";
 const FORCE_FLAG: &str = "force";
@@ -239,12 +240,12 @@ impl GitWorktree {
     fn is_purging(path: &Path) -> bool {
         crate::git::cleanup::read_linked_worktree_gitdir(path)
             .and_then(|admin| std::fs::read_to_string(admin.join("locked")).ok())
-            .is_some_and(|reason| Self::purge_lock(&reason).is_some())
+            .is_some_and(|reason| reason.trim().starts_with(PURGE_LOCK_REASON))
     }
 
-    /// Finish purges whose process died mid-removal after their row was removed, since nothing
+    /// Remove the checkouts of purges whose process died after their row was removed, since nothing
     /// else retries them and they still hold their branch. A purge whose row remains is retried
-    /// through it instead.
+    /// through it instead. The branch and other session resources are left behind.
     pub fn reap_abandoned_purges(&self) {
         let Ok(repo) = open_repo_at(&self.repo_path) else {
             return;
@@ -267,11 +268,14 @@ impl GitWorktree {
             }
             let path = wt.path().to_path_buf();
             tracing::info!(target: "git.worktree", path = %path.display(), pid, "reaping abandoned purge");
-            let removed = if path.exists() {
-                self.remove_worktree(&path, lock.force)
-            } else {
-                self.unlock_worktree(&path);
-                self.prune_worktrees()
+            // Only a confirmed absence may skip the dirty guard; the caller prunes after unlocking.
+            let removed = match path.try_exists() {
+                Ok(true) => self.remove_worktree(&path, lock.force),
+                Ok(false) => {
+                    self.unlock_worktree(&path);
+                    Ok(())
+                }
+                Err(error) => Err(error.into()),
             };
             if let Err(error) = removed {
                 tracing::warn!(target: "git.worktree", path = %path.display(), %error, "could not reap abandoned purge");
