@@ -2497,7 +2497,7 @@ pub(crate) fn is_agent_available(agent: &crate::agents::AgentDef) -> bool {
 /// A nonblocking UI snapshot: cached answers, with local PATH lookups for misses.
 pub(crate) fn agent_availability_snapshot(agents: &[&crate::agents::AgentDef]) -> HashSet<String> {
     let (mut found, uncached) = partition_cached_agents(agents);
-    // Keep login-shell discoveries visible while the next background refresh runs.
+    // Retain login-shell discoveries until an explicit recheck.
     if let Ok(cache) = AGENT_AVAILABILITY.read() {
         for agent in agents {
             if cache

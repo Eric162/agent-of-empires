@@ -100,6 +100,7 @@ pub struct App {
     available_tools_rx: Option<tokio::sync::oneshot::Receiver<AvailableTools>>,
     pending_forced_tool_detection: bool,
     startup_dialogs_pending: bool,
+    suppress_first_run_dialogs: bool,
     force_update_check: bool,
     should_quit: bool,
     theme: Theme,
@@ -301,7 +302,8 @@ impl App {
             tool_detection: None,
             available_tools_rx: None,
             pending_forced_tool_detection: false,
-            startup_dialogs_pending: !suppress_first_run_dialogs,
+            startup_dialogs_pending: true,
+            suppress_first_run_dialogs,
             force_update_check,
             should_quit: false,
             theme,
@@ -347,6 +349,9 @@ impl App {
         if !self.home.available_tools.any_available() {
             self.home.show_no_agents();
             return true;
+        }
+        if self.suppress_first_run_dialogs {
+            return false;
         }
         let config = Config::load_or_warn();
         let version = env!("CARGO_PKG_VERSION");
@@ -1421,7 +1426,6 @@ impl App {
 
             if last_update_eval.elapsed() >= UPDATE_CHECK_THROTTLE_GAP {
                 last_update_eval = std::time::Instant::now();
-                self.spawn_tool_detection(false);
                 let settings = get_update_settings();
                 if should_spawn_periodic_update_check(
                     last_update_check.map(|t| t.elapsed()),
@@ -3503,17 +3507,28 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn startup_waits_for_full_detection_before_declaring_no_agents() {
-        for tools in [&[][..], &["claude"][..]] {
+        for (tools, suppress) in [
+            (&[][..], false),
+            (&["claude"][..], false),
+            (&[][..], true),
+            (&["claude"][..], true),
+        ] {
             let temp = tempfile::tempdir().unwrap();
             let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
             let mut app = App::new(
                 "test",
                 AvailableTools::with_tools(&[]),
-                false,
+                suppress,
                 false,
                 crate::file_watch::FileWatchService::noop(),
             )
             .unwrap();
+            if suppress {
+                app.home.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                    "Configuration Warning",
+                    "fixture startup warning",
+                ));
+            }
             let (tx, rx) = tokio::sync::oneshot::channel();
             app.available_tools_rx = Some(rx);
             assert!(!app.poll_tool_detection());
@@ -3523,12 +3538,23 @@ mod tests {
 
             tx.send(AvailableTools::with_tools(tools)).unwrap();
             assert!(app.poll_tool_detection());
+            if suppress {
+                assert!(
+                    app.home.no_agents_dialog.is_none(),
+                    "the startup warning keeps priority"
+                );
+                app.home.info_dialog = None;
+                assert_eq!(app.poll_tool_detection(), tools.is_empty());
+            }
             assert_eq!(app.home.available_tools.available_list().len(), tools.len());
             assert_eq!(app.home.no_agents_dialog.is_some(), tools.is_empty());
-            assert_eq!(app.home.intro_dialog.is_some(), !tools.is_empty());
+            assert_eq!(
+                app.home.intro_dialog.is_some(),
+                !tools.is_empty() && !suppress
+            );
             assert_eq!(
                 Config::load_or_warn().app_state.has_seen_welcome,
-                !tools.is_empty()
+                !tools.is_empty() && !suppress
             );
             assert!(
                 !app.poll_tool_detection(),
