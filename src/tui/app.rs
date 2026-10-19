@@ -17,6 +17,7 @@ use super::home::{HomeView, TerminalMode};
 use super::status_poller::StatusUpdate;
 use super::styles::Theme;
 use crate::containers::image_update::ImageUpdate;
+use crate::session::config::AppStateConfig;
 use crate::session::{get_update_settings, update_app_state, Config};
 use crate::tmux::AvailableTools;
 use crate::update::{check_for_update, UpdateInfo};
@@ -353,19 +354,23 @@ impl App {
         if self.suppress_first_run_dialogs {
             return false;
         }
-        let config = Config::load_or_warn();
+        let app_state = match AppStateConfig::load() {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(target: "tui.startup", %error, "could not read onboarding state; skipping startup dialogs");
+                return false;
+            }
+        };
         let version = env!("CARGO_PKG_VERSION");
-        if !config.app_state.has_seen_welcome {
+        if !app_state.has_seen_welcome {
             self.home.show_intro(&self.theme_name);
-        } else if config.app_state.last_seen_version.as_deref() != Some(version) {
+        } else if app_state.last_seen_version.as_deref() != Some(version) {
             self.home
-                .show_changelog(config.app_state.last_seen_version.clone());
-        } else if !config.app_state.has_responded_to_telemetry {
+                .show_changelog(app_state.last_seen_version.clone());
+        } else if !app_state.has_responded_to_telemetry {
             self.home.show_telemetry_consent();
         }
-        if !config.app_state.has_seen_welcome
-            || config.app_state.last_seen_version.as_deref() != Some(version)
-        {
+        if !app_state.has_seen_welcome || app_state.last_seen_version.as_deref() != Some(version) {
             if let Err(error) = update_app_state(|state| {
                 state.has_seen_welcome = true;
                 state.last_seen_version = Some(version.to_string());
@@ -3245,6 +3250,62 @@ fn smart_rename_failure(e: &crate::acp::client::HttpError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn startup_onboarding_preserves_saved_state_during_config_edits() {
+        for readable_state in [true, false] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            update_app_state(|state| {
+                state.has_seen_welcome = true;
+                state.has_responded_to_telemetry = true;
+                state.last_seen_version = Some(env!("CARGO_PKG_VERSION").to_string());
+            })
+            .unwrap();
+            let mut app = App::new(
+                "test",
+                AvailableTools::with_tools(&[]),
+                false,
+                false,
+                crate::file_watch::FileWatchService::noop(),
+            )
+            .unwrap();
+            let state_path = crate::session::config::state_path().unwrap();
+            let saved = if readable_state {
+                format!(
+                    "{}\n# preserve this state file\n",
+                    std::fs::read_to_string(&state_path).unwrap()
+                )
+            } else {
+                "[state\n".to_string()
+            };
+            std::fs::write(&state_path, &saved).unwrap();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            app.available_tools_rx = Some(rx);
+            assert!(!app.poll_tool_detection(), "detection is still pending");
+
+            std::fs::write(crate::session::config::config_path().unwrap(), "[session\n").unwrap();
+            assert!(Config::load().is_err());
+            let saved_state = AppStateConfig::load();
+            assert_eq!(saved_state.is_ok(), readable_state);
+            if let Ok(state) = saved_state {
+                assert!(state.has_seen_welcome);
+            }
+            tx.send(AvailableTools::with_tools(&["claude"])).unwrap();
+            assert!(app.poll_tool_detection());
+
+            assert!(
+                !app.home.has_dialog(),
+                "a malformed global config must not onboard an initialized user"
+            );
+            assert_eq!(
+                std::fs::read_to_string(state_path).unwrap(),
+                saved,
+                "no spurious onboarding write may rewrite saved state"
+            );
+            assert!(!app.poll_tool_detection(), "startup completes only once");
+        }
+    }
 
     #[tokio::test]
     #[cfg(unix)]
