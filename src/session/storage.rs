@@ -67,6 +67,22 @@ pub(crate) fn replace_file_no_follow(root: &Path, rel: &Path, content: &[u8]) ->
     replace_file_no_follow_as(root, rel, content, 0o644)
 }
 
+/// Windows has no `O_NOFOLLOW` walk here; the sandbox this guards against is
+/// Linux and macOS only. Kept so the module compiles.
+#[cfg(not(unix))]
+pub(crate) fn replace_file_no_follow(root: &Path, rel: &Path, content: &[u8]) -> Result<()> {
+    let path = root.join(rel);
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow!("replace_file_no_follow needs a path with a parent"))?;
+    fs::create_dir_all(dir)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(content)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(&path)?;
+    Ok(())
+}
+
 /// [`replace_file_no_follow`] with an explicit mode, for content that must not
 /// stay world readable.
 #[cfg(unix)]
@@ -210,11 +226,6 @@ pub(crate) fn read_file_no_follow(root: &Path, rel: &Path) -> Result<Option<Stri
     Ok(file.read_to_string(&mut content).ok().map(|_| content))
 }
 
-/// Serial for the per-attempt temp name in [`replace_file_no_follow`], so two
-/// writers in one process cannot pick the same one inside a clock tick.
-#[cfg(unix)]
-static NO_FOLLOW_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// Windows keeps the check-then-open the unix arm closes; the sandbox this guards against
 /// is Linux and macOS only.
 #[cfg(not(unix))]
@@ -227,21 +238,10 @@ pub(crate) fn read_file_no_follow(root: &Path, rel: &Path) -> Result<Option<Stri
         .flatten())
 }
 
-/// Windows has no `O_NOFOLLOW` walk here; the sandbox this guards against is
-/// Linux and macOS only. Kept so the module compiles.
-#[cfg(not(unix))]
-pub(crate) fn replace_file_no_follow(root: &Path, rel: &Path, content: &[u8]) -> Result<()> {
-    let path = root.join(rel);
-    let dir = path
-        .parent()
-        .ok_or_else(|| anyhow!("replace_file_no_follow needs a path with a parent"))?;
-    fs::create_dir_all(dir)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-    tmp.write_all(content)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(&path)?;
-    Ok(())
-}
+/// Serial for the per-attempt temp name in [`replace_file_no_follow`], so two
+/// writers in one process cannot pick the same one inside a clock tick.
+#[cfg(unix)]
+static NO_FOLLOW_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Resolve `path` through a symlink chain to the underlying target file.
 pub(crate) fn resolve_symlink_chain(path: &Path) -> Result<PathBuf> {
@@ -350,6 +350,36 @@ where
         }
     }
     Ok(result)
+}
+
+/// Missing or blank registries are empty; unreadable and nonregular paths are errors.
+fn read_nonempty(path: &Path) -> Result<Option<String>> {
+    open_regular_registry(path)?
+        .map(read_registry_file)
+        .transpose()
+        .map(Option::flatten)
+}
+
+fn open_regular_registry(path: &Path) -> Result<Option<fs::File>> {
+    let file = match crate::process::open_read_nonblocking(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+        Ok(file) => file,
+    };
+    if !file.metadata()?.is_file() {
+        anyhow::bail!("{} is not a regular file", path.display());
+    }
+    Ok(Some(file))
+}
+
+fn read_registry_file(mut file: fs::File) -> Result<Option<String>> {
+    use std::io::Read;
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    if content.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(content))
 }
 
 /// Process-wide registry of per-profile save mutexes.
@@ -970,19 +1000,30 @@ impl Storage {
         &self.sessions_path
     }
 
+    /// The session rows, with the ones that could not be deserialised
+    /// quarantined beside the store.
     pub fn load(&self) -> Result<Vec<Instance>> {
-        if !self.sessions_path.exists() {
-            return Ok(Vec::new());
+        let (instances, corrupt) = self.split_instances()?;
+        if !corrupt.is_empty() {
+            self.quarantine_corrupt_rows(&corrupt);
         }
+        Ok(instances)
+    }
+    /// Read session rows without quarantine, repair, or writes.
+    pub(crate) fn load_instances_readonly(&self) -> Result<Vec<Instance>> {
+        self.split_instances().map(|(instances, _)| instances)
+    }
 
-        let content = fs::read_to_string(&self.sessions_path)?;
-        if content.trim().is_empty() {
-            return Ok(Vec::new());
-        }
+    /// Deserialise the session rows, keeping the ones that failed apart from
+    /// the ones that did not. Pure: quarantining is the caller's decision.
+    fn split_instances(&self) -> Result<(Vec<Instance>, Vec<serde_json::Value>)> {
+        let Some(content) = read_nonempty(&self.sessions_path)? else {
+            return Ok((Vec::new(), Vec::new()));
+        };
 
         let rows: Vec<serde_json::Value> = serde_json::from_str(&content)?;
         let mut instances = Vec::with_capacity(rows.len());
-        let mut corrupt: Vec<serde_json::Value> = Vec::new();
+        let mut corrupt = Vec::new();
         for (idx, row) in rows.into_iter().enumerate() {
             match <Instance as serde::Deserialize>::deserialize(&row) {
                 Ok(mut inst) => {
@@ -1005,12 +1046,55 @@ impl Storage {
                 }
             }
         }
+        Ok((instances, corrupt))
+    }
 
-        if !corrupt.is_empty() {
-            self.quarantine_corrupt_rows(&corrupt);
+    fn groups_path(&self) -> std::path::PathBuf {
+        self.sessions_path.with_file_name("groups.json")
+    }
+
+    /// As [`Self::split_instances`], for the group registry.
+    fn split_groups(&self) -> Result<(Vec<Group>, Vec<serde_json::Value>)> {
+        let path = self.groups_path();
+        let Some(content) = read_nonempty(&path)? else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&content)?;
+        let mut groups = Vec::with_capacity(rows.len());
+        let mut corrupt = Vec::new();
+        for (idx, row) in rows.into_iter().enumerate() {
+            match <Group as serde::Deserialize>::deserialize(&row) {
+                Ok(group) => groups.push(group),
+                Err(e) => {
+                    tracing::warn!(
+                        profile = %self.profile,
+                        row = idx,
+                        error = %e,
+                        path = %path.display(),
+                        "skipping corrupt group row"
+                    );
+                    corrupt.push(row);
+                }
+            }
         }
+        Ok((groups, corrupt))
+    }
 
-        Ok(instances)
+    pub fn load_with_groups(&self) -> Result<(Vec<Instance>, Vec<Group>)> {
+        let instances = self.load()?;
+        let (groups, corrupt) = self.split_groups()?;
+        if !corrupt.is_empty() {
+            self.quarantine_corrupt_group_rows(&corrupt);
+        }
+        Ok((instances, groups))
+    }
+
+    /// The group registry alone, with no quarantine sidecar written. The
+    /// served projection already holds the instances in memory, so reading
+    /// `sessions.json` here would buy a discarded result and a write.
+    pub fn load_groups_readonly(&self) -> Result<Vec<Group>> {
+        self.split_groups().map(|(groups, _)| groups)
     }
 
     fn quarantine_corrupt_rows(&self, rows: &[serde_json::Value]) {
@@ -1054,47 +1138,6 @@ impl Storage {
                 "failed to write quarantine file"
             );
         }
-    }
-
-    pub fn load_with_groups(&self) -> Result<(Vec<Instance>, Vec<Group>)> {
-        let instances = self.load()?;
-
-        let groups_path = self.sessions_path.with_file_name("groups.json");
-        let groups = if groups_path.exists() {
-            let content = fs::read_to_string(&groups_path)?;
-            if content.trim().is_empty() {
-                Vec::new()
-            } else {
-                let rows: Vec<serde_json::Value> = serde_json::from_str(&content)?;
-                let mut groups = Vec::with_capacity(rows.len());
-                let mut corrupt: Vec<serde_json::Value> = Vec::new();
-                for (idx, row) in rows.into_iter().enumerate() {
-                    match <Group as serde::Deserialize>::deserialize(&row) {
-                        Ok(group) => groups.push(group),
-                        Err(e) => {
-                            tracing::warn!(
-                                profile = %self.profile,
-                                row = idx,
-                                error = %e,
-                                path = %groups_path.display(),
-                                "skipping corrupt group row"
-                            );
-                            corrupt.push(row);
-                        }
-                    }
-                }
-
-                if !corrupt.is_empty() {
-                    self.quarantine_corrupt_group_rows(&corrupt);
-                }
-
-                groups
-            }
-        } else {
-            Vec::new()
-        };
-
-        Ok((instances, groups))
     }
 
     /// Locked load -> mutate -> save.
@@ -2680,6 +2723,34 @@ mod tests {
     use serial_test::serial;
     use tempfile::tempdir;
 
+    #[test]
+    fn registry_read_keeps_validated_file_after_path_replacement() {
+        let root = tempdir().unwrap();
+        for name in ["sessions.json", "groups.json"] {
+            let path = root.path().join(name);
+            fs::write(&path, "original registry").unwrap();
+            let file = open_regular_registry(&path).unwrap().unwrap();
+            let replacement = path.with_extension("replacement");
+            fs::write(&replacement, "replacement registry").unwrap();
+            fs::rename(replacement, &path).unwrap();
+            assert_eq!(
+                read_registry_file(file).unwrap().as_deref(),
+                Some("original registry")
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), "replacement registry");
+            fs::remove_file(&path).unwrap();
+            assert!(read_nonempty(&path).unwrap().is_none());
+            fs::write(
+                &path, " 
+	",
+            )
+            .unwrap();
+            assert!(read_nonempty(&path).unwrap().is_none());
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(&path).unwrap();
+            assert!(read_nonempty(&path).is_err());
+        }
+    }
     fn setup_test_home(temp: &std::path::Path) -> AppDirGuard {
         isolate_app_dir_at(temp)
     }
