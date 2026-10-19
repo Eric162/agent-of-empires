@@ -342,7 +342,7 @@ impl App {
         if !self.startup_dialogs_pending || self.home.has_dialog() {
             return false;
         }
-        if !self.home.available_tools.any_available() && !detection_finished {
+        if !detection_finished {
             return false;
         }
         self.startup_dialogs_pending = false;
@@ -3507,17 +3507,21 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn startup_waits_for_full_detection_before_declaring_no_agents() {
-        for (tools, suppress) in [
-            (&[][..], false),
-            (&["claude"][..], false),
-            (&[][..], true),
-            (&["claude"][..], true),
+        for (initial_tools, tools, suppress) in [
+            (&[][..], &[][..], false),
+            (&[][..], &["claude"][..], false),
+            (&[][..], &[][..], true),
+            (&[][..], &["claude"][..], true),
+            (&["claude"][..], &[][..], false),
+            (&["claude"][..], &["claude"][..], false),
+            (&["claude"][..], &[][..], true),
+            (&["claude"][..], &["claude"][..], true),
         ] {
             let temp = tempfile::tempdir().unwrap();
             let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
             let mut app = App::new(
                 "test",
-                AvailableTools::with_tools(&[]),
+                AvailableTools::with_tools(initial_tools),
                 suppress,
                 false,
                 crate::file_watch::FileWatchService::noop(),
