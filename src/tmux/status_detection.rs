@@ -1331,6 +1331,12 @@ path: /workspace/secrets.env
     #[test]
     fn claude_hook_reconciliation_table() {
         let parked_over_completion = "\
+✻ Sautéed for 39s\n\
+──────────────────────────────\n\
+❯ stop the monitor\n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on · PR #444 · 1 monitor · ← for agents · ↓ to manage";
+        let monitor_over_completion = "\
 ✻ Sautéed for 39s · 1 monitor still running\n\
 ──────────────────────────────\n\
 ❯ stop the monitor\n\
@@ -1375,7 +1381,7 @@ path: /workspace/secrets.env
             &["✻ Worked for 1m 52s\n❯\n  ? for shortcuts", "  \n \n"],
         );
         // A stale running hook yields to parked evidence under a typed prompt,
-        // never to a blank pane or to prose still streaming.
+        // never to a blank pane, prose still streaming, or a running monitor.
         assert_hook_all(
             "claude",
             running_stale,
@@ -1386,7 +1392,12 @@ path: /workspace/secrets.env
             "claude",
             running_stale,
             Status::Running,
-            &["   \n\n  ", streaming_over_prompt, streaming_over_chrome],
+            &[
+                "   \n\n  ",
+                streaming_over_prompt,
+                streaming_over_chrome,
+                monitor_over_completion,
+            ],
         );
         // The freshness bound is exclusive.
         assert_hook_all(
@@ -2239,6 +2250,37 @@ enter to select · esc to cancel";
 
         let quoted = format!("{mcp}Do you want to proceed?\n❯ 1. Yes\n  2. No\n");
         assert!(!claude_rule_matches("background_mcp_task", &quoted));
+
+        let boxed = |status: &str| {
+            format!(
+                "{status}\n\
+──────────────────────────────\n\
+❯ \n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on · PR #444 · 1 monitor · ← for agents · ↓ to manage"
+            )
+        };
+        // The `Stop` hook writes idle whatever is still running.
+        let idle_hook = || hook(Status::Idle, None);
+        for status in [
+            "✻ Sautéed for 39s · 1 monitor still running",
+            "✻ Worked for 2m 3s · 2 monitors still running",
+        ] {
+            let pane = boxed(status);
+            assert!(claude_rule_matches("background_monitor", &pane), "{pane}");
+            assert_eq!(
+                detect_via_manifest("claude", &pane, "", idle_hook()),
+                Status::Running,
+                "{pane}"
+            );
+        }
+        let stale =
+            boxed("✻ Sautéed for 39s · 1 monitor still running\n  monitor fired\n✻ Worked for 12s");
+        assert!(!claude_rule_matches("background_monitor", &stale));
+        assert_eq!(
+            detect_via_manifest("claude", &stale, "", idle_hook()),
+            Status::Idle
+        );
     }
 
     #[test]
