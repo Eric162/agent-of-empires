@@ -82,14 +82,14 @@ pub enum AcpWorkerStartKind {
 }
 
 /// How the current worker start began; present only while the state is `resuming`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AcpWorkerStart {
     pub kind: AcpWorkerStartKind,
     /// RFC 3339, fixed for one admitted start.
     pub started_at: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextResumeUnavailableReason {
     AgentUnsupported,
