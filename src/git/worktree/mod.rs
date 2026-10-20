@@ -28,8 +28,9 @@ const MUTATION_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// intentional remove or move.
 const WORKTREE_LOCK_REASON: &str = "aoe-managed worktree (prevents cross-boundary prune)";
 
-/// Reason on a worktree whose purge is in progress. Listings skip it so no session can adopt it.
-const PURGE_LOCK_REASON: &str = "aoe purge in progress";
+/// File in a worktree's admin directory marking a purge in progress. Listings skip a marked
+/// worktree so no session can adopt it; its lock and git's dirty refusal are untouched.
+const PURGE_MARKER: &str = "aoe-purge";
 
 pub struct WorktreeEntry {
     pub path: PathBuf,
@@ -177,34 +178,40 @@ impl GitWorktree {
     /// Lock `path`'s admin entry (see `WORKTREE_LOCK_REASON`). A failure only
     /// forfeits prune protection, so callers surface it as a warning.
     pub fn lock_worktree(&self, path: &Path) -> Result<()> {
-        self.lock_with_reason(path, WORKTREE_LOCK_REASON)
-    }
-
-    /// Return a purge-locked worktree to an ordinary aoe-managed one.
-    pub fn relock_as_managed(&self, path: &Path) -> Result<()> {
-        self.unlock_worktree(path);
-        self.lock_worktree(path)
-    }
-
-    /// Relock `path` as purging, hiding it from `list_worktrees`.
-    pub fn lock_for_purge(&self, path: &Path) -> Result<()> {
-        self.unlock_worktree(path);
-        self.lock_with_reason(path, PURGE_LOCK_REASON)
-    }
-
-    fn lock_with_reason(&self, path: &Path, reason: &str) -> Result<()> {
         run_bounded(
             &self.repo_path,
-            ["worktree", "lock", "--reason", reason, path_str(path)?],
+            [
+                "worktree",
+                "lock",
+                "--reason",
+                WORKTREE_LOCK_REASON,
+                path_str(path)?,
+            ],
             "git worktree lock",
         )
         .map(drop)
     }
 
-    fn is_purging(path: &Path) -> bool {
+    fn purge_marker(path: &Path) -> Result<PathBuf> {
         crate::git::cleanup::read_linked_worktree_gitdir(path)
-            .and_then(|admin| std::fs::read_to_string(admin.join("locked")).ok())
-            .is_some_and(|reason| reason.trim() == PURGE_LOCK_REASON)
+            .map(|admin| admin.join(PURGE_MARKER))
+            .ok_or_else(|| GitError::WorktreeNotFound(path.to_path_buf()))
+    }
+
+    /// Hide `path` from `list_worktrees` while its purge runs.
+    pub fn mark_purging(path: &Path) -> Result<()> {
+        Ok(std::fs::write(Self::purge_marker(path)?, "")?)
+    }
+
+    pub fn unmark_purging(path: &Path) -> Result<()> {
+        match std::fs::remove_file(Self::purge_marker(path)?) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
+        }
+    }
+
+    fn is_purging(path: &Path) -> bool {
+        Self::purge_marker(path).is_ok_and(|marker| marker.exists())
     }
 
     /// Unlock `path`'s admin entry, best-effort and idempotent. Must precede
@@ -295,23 +302,11 @@ impl GitWorktree {
         if !path.exists() {
             return Err(GitError::WorktreeNotFound(path.to_path_buf()));
         }
+        // A single `--force` does not override a lock.
+        self.unlock_worktree(path);
         let mut args = vec!["worktree", "remove"];
-        // Stays locked so it stays hidden; `--force` twice overrides the lock and dirtiness alike.
-        if Self::is_purging(path) {
-            if !force {
-                let dirty = crate::git::cleanup::checked_dirty_worktree_message(path)
-                    .unwrap_or_else(|error| Some(format!("could not check for changes: {error}")));
-                if let Some(message) = dirty {
-                    return Err(GitError::WorktreeCommandFailed(message));
-                }
-            }
-            args.extend(["--force", "--force"]);
-        } else {
-            // A single `--force` does not override a lock.
-            self.unlock_worktree(path);
-            if force {
-                args.push("--force");
-            }
+        if force {
+            args.push("--force");
         }
         args.push(path_str(path)?);
         let output = super::command::run_git_throttled(&self.repo_path, &args)?;

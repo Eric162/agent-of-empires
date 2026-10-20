@@ -987,7 +987,7 @@ fn adopted_aside(request: &DeletionRequest, paths_in_use: &PathsInUse) -> Option
         return None;
     }
     // A kept checkout must not stay hidden, or later purges and reaping would treat it as theirs.
-    if let Err(error) = main_repo_git(request).and_then(|git| git.relock_as_managed(&aside)) {
+    if let Err(error) = GitWorktree::unmark_purging(&aside) {
         tracing::warn!(target: "session.delete",
             session_id = %request.session_id,
             %error,
@@ -1033,15 +1033,15 @@ fn hide_for_purge(moved: &DeletionRequest) -> bool {
         return false;
     }
     let aside = PathBuf::from(&moved.instance.project_path);
-    let locked = main_repo_git(moved).and_then(|git| git.lock_for_purge(&aside));
-    if let Err(error) = &locked {
+    let marked = GitWorktree::mark_purging(&aside);
+    if let Err(error) = &marked {
         tracing::warn!(target: "session.delete",
             session_id = %moved.session_id,
             %error,
             "perform_deletion: could not hide the moved worktree; removing it under the store locks"
         );
     }
-    locked.is_ok()
+    marked.is_ok()
 }
 
 fn move_back_from_aside(request: &DeletionRequest) -> crate::git::error::Result<()> {
@@ -1069,7 +1069,7 @@ fn move_back_from_aside(request: &DeletionRequest) -> crate::git::error::Result<
     }
     let git = main_repo_git(request)?;
     if git.move_worktree(&aside, &from).is_ok() {
-        return Ok(());
+        return GitWorktree::unmark_purging(&from);
     }
     // A partial removal can leave no `.git` for git to move; without one, unlocking lets prune
     // reap the entry, and with one, repair points it at the new path.
@@ -1078,6 +1078,7 @@ fn move_back_from_aside(request: &DeletionRequest) -> crate::git::error::Result<
     if has_git {
         git.repair_worktree(&from)?;
         git.lock_worktree(&from)?;
+        GitWorktree::unmark_purging(&from)?;
     }
     Ok(())
 }
@@ -1971,10 +1972,7 @@ mod tests {
                 git_in(&main_repo, &["worktree", "move", from, to]);
             }
             if after_hide {
-                GitWorktree::new(main_repo.clone())
-                    .unwrap()
-                    .lock_for_purge(&aside)
-                    .unwrap();
+                GitWorktree::mark_purging(&aside).unwrap();
             }
             if case == Case::UnreadableProfileAfterHide {
                 let other = Storage::new_unwatched("other").unwrap();
