@@ -1027,11 +1027,9 @@ fn remove_moved_worktree(
     );
     if errors.len() > errors_before {
         if let Err(error) = move_back_from_aside(request) {
-            tracing::warn!(target: "session.delete",
-                session_id = %request.session_id,
-                %error,
-                "perform_deletion: could not move the worktree back after a failed removal"
-            );
+            errors.push(format!(
+                "Worktree: could not move the checkout back after a failed removal: {error}"
+            ));
         }
     }
 }
@@ -1056,10 +1054,22 @@ fn move_back_from_aside(request: &DeletionRequest) -> crate::git::error::Result<
     let Some((from, aside)) = aside_paths(request) else {
         return Ok(());
     };
-    if from.exists() || !aside.exists() {
+    if !aside.exists() {
+        // A restore that moved the checkout back but could not unhide it.
+        if from.exists() {
+            let _ = GitWorktree::unmark_purging(&from);
+        }
         return Ok(());
     }
-    let has_git = aside.join(".git").exists();
+    if from.exists() {
+        return Err(crate::git::error::GitError::WorktreeCommandFailed(format!(
+            "{} is occupied; the checkout remains at {}",
+            from.display(),
+            aside.display()
+        )));
+    }
+    let has_admin = crate::git::cleanup::read_linked_worktree_gitdir(&aside)
+        .is_some_and(|admin| admin.is_dir());
     let branch = request
         .instance
         .worktree_info
@@ -1079,14 +1089,14 @@ fn move_back_from_aside(request: &DeletionRequest) -> crate::git::error::Result<
     if git.move_worktree(&aside, &from).is_ok() {
         return GitWorktree::unmark_purging(&from);
     }
-    // A partial removal can leave no `.git` for git to move; without one, unlocking lets prune
-    // reap the entry, and with one, repair points it at the new path.
+    // A partial removal can leave no admin entry for git to move; without one, unlocking lets
+    // prune reap the entry, and with one, repair points it at the new path.
     git.unlock_worktree(&aside);
     std::fs::rename(&aside, &from)?;
-    if has_git {
+    if has_admin {
         git.repair_worktree(&from)?;
-        git.lock_worktree(&from)?;
         GitWorktree::unmark_purging(&from)?;
+        git.lock_worktree(&from)?;
     }
     Ok(())
 }
@@ -1940,6 +1950,7 @@ mod tests {
             RemovalFails,
             DirtiedAfterCheck,
             StatusUnreadable,
+            OriginalReoccupied,
             HideFails,
         }
         let read_only = |dir: &Path, mode| {
@@ -1955,6 +1966,7 @@ mod tests {
             Case::RemovalFails,
             Case::DirtiedAfterCheck,
             Case::StatusUnreadable,
+            Case::OriginalReoccupied,
             Case::HideFails,
         ] {
             let kept_aside = matches!(
@@ -2032,8 +2044,12 @@ mod tests {
                         .unwrap()
                         .iter()
                         .any(|entry| entry.branch.as_deref() == Some("feature/slow"));
+                    let placed = (worktree_probe.exists(), aside_probe.exists());
                     match case {
-                        Case::RemovalFails => {
+                        Case::RemovalFails | Case::OriginalReoccupied => {
+                            if case == Case::OriginalReoccupied {
+                                std::fs::create_dir(&worktree_probe).unwrap();
+                            }
                             std::fs::create_dir(aside_probe.join("stuck")).unwrap();
                             std::fs::write(aside_probe.join("stuck/file"), "").unwrap();
                             read_only(&aside_probe.join("stuck"), 0o555);
@@ -2052,8 +2068,8 @@ mod tests {
                     seen_tx
                         .send((
                             probe.save_locks_are_free_for_test(),
-                            worktree_probe.exists(),
-                            aside_probe.exists(),
+                            placed.0,
+                            placed.1,
                             listed,
                         ))
                         .unwrap();
@@ -2065,7 +2081,10 @@ mod tests {
                 DeletionRequest {
                     delete_worktree: true,
                     delete_branch: true,
-                    force_delete: matches!(case, Case::RemovalFails | Case::HideFails),
+                    force_delete: matches!(
+                        case,
+                        Case::RemovalFails | Case::OriginalReoccupied | Case::HideFails
+                    ),
                     ..request(owner)
                 },
             )
@@ -2099,6 +2118,14 @@ mod tests {
             }
 
             let rows = Storage::open_unwatched(profile).unwrap().load().unwrap();
+            let listed = || {
+                GitWorktree::new(main_repo.clone())
+                    .unwrap()
+                    .list_worktrees()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry.branch.as_deref() == Some("feature/slow"))
+            };
             match case {
                 Case::Clean | Case::Resumed | Case::MoveErrorAfterMoving => {
                     assert_eq!(result.disposition, DeletionDisposition::Removed, "{label}");
@@ -2111,13 +2138,7 @@ mod tests {
                     assert_eq!(result.disposition, DeletionDisposition::Removed, "{label}");
                     assert!(aside.exists(), "{label}: kept checkout was removed");
                     assert!(branch_exists(&main_repo, "feature/slow"), "{label}");
-                    let listed = GitWorktree::new(main_repo.clone())
-                        .unwrap()
-                        .list_worktrees()
-                        .unwrap()
-                        .iter()
-                        .any(|entry| entry.branch.as_deref() == Some("feature/slow"));
-                    assert!(listed, "{label}: kept checkout is still hidden");
+                    assert!(listed(), "{label}: kept checkout is still hidden");
                     if case != Case::UnreadableProfileAfterHide {
                         assert_eq!(rows.len(), 1, "{label}");
                         assert_eq!(rows[0].project_path, aside.to_str().unwrap(), "{label}");
@@ -2140,6 +2161,21 @@ mod tests {
                         "{label}: not moved back"
                     );
                     assert!(branch_exists(&main_repo, "feature/slow"), "{label}");
+                    // A forced removal that failed partway has already dropped the admin entry.
+                    if matches!(case, Case::DirtiedAfterCheck | Case::StatusUnreadable) {
+                        assert!(listed(), "{label}: restored checkout is still hidden");
+                    }
+                    assert_eq!(rows[0].project_path, worktree.to_str().unwrap(), "{label}");
+                }
+                Case::OriginalReoccupied => {
+                    read_only(&aside.join("stuck"), 0o755);
+                    assert_ne!(result.disposition, DeletionDisposition::Removed, "{label}");
+                    assert!(aside.exists(), "{label}: kept checkout was removed");
+                    let aside_named = aside.to_string_lossy();
+                    assert!(
+                        result.errors.iter().any(|e| e.contains(&*aside_named)),
+                        "{label}: no error names the kept checkout"
+                    );
                     assert_eq!(rows[0].project_path, worktree.to_str().unwrap(), "{label}");
                 }
             }
