@@ -269,6 +269,15 @@ impl GitWorktree {
     }
 
     pub fn list_worktrees(&self) -> Result<Vec<WorktreeEntry>> {
+        self.worktree_entries(false)
+    }
+
+    /// Also lists checkouts marked for purging, for cleanup of purges nothing else will finish.
+    pub fn list_worktrees_with_purges(&self) -> Result<Vec<WorktreeEntry>> {
+        self.worktree_entries(true)
+    }
+
+    fn worktree_entries(&self, include_purging: bool) -> Result<Vec<WorktreeEntry>> {
         let repo = open_repo_at(&self.repo_path)?;
         let mut entries = vec![];
         // Bare repos have no main worktree, only linked ones.
@@ -286,7 +295,7 @@ impl GitWorktree {
             let Ok(path) = wt.path().canonicalize() else {
                 continue;
             };
-            if Self::is_purging(&path) {
+            if !include_purging && Self::is_purging(&path) {
                 continue;
             }
             entries.push(WorktreeEntry {
@@ -583,6 +592,25 @@ mod tests {
             .create_worktree("locked", &wt_path, false, None)
             .unwrap();
         assert!(wt_path.join(".git").is_file());
+    }
+
+    #[test]
+    fn only_cleanup_lists_a_worktree_marked_for_purging() {
+        let (dir, _repo) = init_repo();
+        let git_wt = GitWorktree::new(dir.path().to_path_buf()).unwrap();
+        let parent = TempDir::new().unwrap();
+        let wt_path = parent.path().join("purging");
+        git_wt
+            .create_worktree("purging", &wt_path, true, None)
+            .unwrap();
+        GitWorktree::mark_purging(&wt_path).unwrap();
+        let has = |entries: Vec<WorktreeEntry>| {
+            entries
+                .iter()
+                .any(|entry| entry.branch.as_deref() == Some("purging"))
+        };
+        assert!(!has(git_wt.list_worktrees().unwrap()));
+        assert!(has(git_wt.list_worktrees_with_purges().unwrap()));
     }
 
     /// Every git subprocess reachable from a worktree move or edit is bounded:

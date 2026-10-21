@@ -918,7 +918,7 @@ fn stage_teardown_worktrees(
     // A worktree marked before a failed move was removed where it was; unhide what survived.
     if let Some((from, _)) = aside_paths(request) {
         if from.exists() {
-            let _ = GitWorktree::unmark_purging(&from);
+            unhide(request, &from);
         }
     }
 
@@ -1034,6 +1034,17 @@ fn remove_moved_worktree(
     }
 }
 
+fn unhide(request: &DeletionRequest, path: &Path) {
+    if let Err(error) = GitWorktree::unmark_purging(path) {
+        tracing::warn!(target: "session.delete",
+            session_id = %request.session_id,
+            path = %path.display(),
+            %error,
+            "perform_deletion: could not unhide the surviving worktree"
+        );
+    }
+}
+
 fn mark_for_purge(request: &DeletionRequest, path: &Path) -> bool {
     #[cfg(test)]
     if FAIL_HIDE_FOR_PURGE.with(|fail| fail.replace(false)) {
@@ -1057,7 +1068,7 @@ fn move_back_from_aside(request: &DeletionRequest) -> crate::git::error::Result<
     if !aside.exists() {
         // A restore that moved the checkout back but could not unhide it.
         if from.exists() {
-            let _ = GitWorktree::unmark_purging(&from);
+            unhide(request, &from);
         }
         return Ok(());
     }

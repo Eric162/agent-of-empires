@@ -196,7 +196,7 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
     if GitWorktree::is_git_repo(&current_dir) {
         let main_repo = GitWorktree::find_main_repo(&current_dir)?;
         let git_wt = GitWorktree::new(main_repo)?;
-        let worktrees = git_wt.list_worktrees()?;
+        let worktrees = git_wt.list_worktrees_with_purges()?;
         let tracked: HashSet<String> = instances
             .iter()
             .map(|inst| inst.project_path.clone())
