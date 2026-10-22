@@ -810,7 +810,8 @@ fn perform_deletion_core(
     } else {
         stage(&PathsInUse::Known(Vec::new()))
     };
-    if let Some(moved) = deferred {
+    // The claim keeps cleanup off the moved checkout until its removal is decided.
+    if let Some((moved, _claim)) = deferred {
         #[cfg(test)]
         if let Some(hook) = BEFORE_DEFERRED_REMOVAL.with(|slot| slot.borrow_mut().take()) {
             hook();
@@ -855,7 +856,7 @@ fn perform_deletion_core(
 
 /// Container and worktree teardown, which destroys checkout contents and so must run inside the
 /// same [`PathsInUse`] check that decides what to keep. Returns whether the container is gone and
-/// any worktree moved aside for removal.
+/// any worktree moved aside for removal with its purge claim.
 fn stage_teardown_worktrees(
     request: &DeletionRequest,
     repos: &[super::WorkspaceRepo],
@@ -864,7 +865,7 @@ fn stage_teardown_worktrees(
     teardown: impl FnOnce(&str) -> crate::containers::Teardown,
     errors: &mut Vec<String>,
     messages: &mut Vec<String>,
-) -> (bool, Option<DeletionRequest>) {
+) -> (bool, Option<(DeletionRequest, crate::git::PurgeClaim)>) {
     // A retry after an interrupted removal. A checkout another session adopted before it was
     // hidden is judged where it is; otherwise restore the path every guard below checks.
     let adopted = adopted_aside(request, paths_in_use);
@@ -953,11 +954,12 @@ fn main_repo_git(request: &DeletionRequest) -> crate::git::error::Result<GitWork
 fn move_worktree_aside(
     request: &DeletionRequest,
     preserved_worktree_paths: &std::collections::HashSet<PathBuf>,
-) -> Option<DeletionRequest> {
+) -> Option<(DeletionRequest, crate::git::PurgeClaim)> {
     let (from, aside) = aside_paths(request)?;
-    if preserved_worktree_paths.contains(&from) || !mark_for_purge(request, &from) {
+    if preserved_worktree_paths.contains(&from) {
         return None;
     }
+    let claim = mark_for_purge(request, &from)?;
     #[cfg(test)]
     if let Some(hook) = BEFORE_MOVE_ASIDE.with(|slot| slot.borrow_mut().take()) {
         hook();
@@ -987,7 +989,7 @@ fn move_worktree_aside(
     }
     let mut moved = request.clone();
     moved.instance.project_path = aside.to_string_lossy().into_owned();
-    Some(moved)
+    Some((moved, claim))
 }
 
 fn adopted_aside(request: &DeletionRequest, paths_in_use: &PathsInUse) -> Option<DeletionRequest> {
@@ -1045,10 +1047,10 @@ fn unhide(request: &DeletionRequest, path: &Path) {
     }
 }
 
-fn mark_for_purge(request: &DeletionRequest, path: &Path) -> bool {
+fn mark_for_purge(request: &DeletionRequest, path: &Path) -> Option<crate::git::PurgeClaim> {
     #[cfg(test)]
     if FAIL_HIDE_FOR_PURGE.with(|fail| fail.replace(false)) {
-        return false;
+        return None;
     }
     let marked = GitWorktree::mark_purging(path);
     if let Err(error) = &marked {
@@ -1058,7 +1060,7 @@ fn mark_for_purge(request: &DeletionRequest, path: &Path) -> bool {
             "perform_deletion: could not hide the worktree; removing it under the store locks"
         );
     }
-    marked.is_ok()
+    marked.ok()
 }
 
 fn move_back_from_aside(request: &DeletionRequest) -> crate::git::error::Result<()> {
@@ -2003,7 +2005,7 @@ mod tests {
                 git_in(&main_repo, &["worktree", "move", from, to]);
             }
             if after_hide {
-                GitWorktree::mark_purging(&aside).unwrap();
+                drop(GitWorktree::mark_purging(&aside).unwrap());
             }
             if case == Case::UnreadableProfileAfterHide {
                 let other = Storage::new_unwatched("other").unwrap();
@@ -2049,13 +2051,25 @@ mod tests {
                 (worktree.clone(), aside.clone(), main_repo.clone());
             BEFORE_DEFERRED_REMOVAL.with(|slot| {
                 *slot.borrow_mut() = Some(Box::new(move || {
-                    let listed = GitWorktree::new(repo_probe)
+                    let listed = GitWorktree::new(repo_probe.clone())
                         .unwrap()
                         .list_worktrees()
                         .unwrap()
                         .iter()
                         .any(|entry| entry.branch.as_deref() == Some("feature/slow"));
                     let placed = (worktree_probe.exists(), aside_probe.exists());
+                    // A purge paused here is live: cleanup must not take its row or checkout.
+                    let rows = Storage::open_unwatched(profile).unwrap().load().unwrap();
+                    let git = GitWorktree::new(repo_probe.clone()).unwrap();
+                    let (orphans, _) =
+                        crate::cli::worktree::find_orphaned_worktrees(&rows, &git).unwrap();
+                    let cleanup_sees = !crate::cli::worktree::find_orphaned_sessions(&rows)
+                        .is_empty()
+                        || orphans
+                            .iter()
+                            .any(|entry| entry.branch.as_deref() == Some("feature/slow"))
+                        || GitWorktree::claim_abandoned_purge(&aside_probe).is_some();
+                    assert!(!cleanup_sees, "{case:?}: cleanup could take a live purge");
                     match case {
                         Case::RemovalFails | Case::OriginalReoccupied => {
                             if case == Case::OriginalReoccupied {

@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::git::{GitWorktree, WorktreeEntry};
-use crate::session::Storage;
+use crate::session::{Instance, Storage};
 
 #[derive(Subcommand)]
 pub enum WorktreeCommands {
@@ -170,44 +170,64 @@ fn partition_orphaned_worktrees(
         })
 }
 
+/// Where a purge moves `inst`'s worktree. A row whose checkout is there is mid-purge or awaiting
+/// its retry, so neither is orphaned.
+fn purge_aside(inst: &Instance) -> Option<PathBuf> {
+    let path = Path::new(&inst.project_path);
+    path.parent()?
+        .join(format!(".aoe-purge-{}", inst.id))
+        .canonicalize()
+        .ok()
+}
+
+pub(crate) fn find_orphaned_sessions(instances: &[Instance]) -> Vec<Instance> {
+    instances
+        .iter()
+        .filter(|inst| {
+            if inst.worktree_info.is_some() {
+                !Path::new(&inst.project_path).exists() && purge_aside(inst).is_none()
+            } else if let Some(ws_info) = &inst.workspace_info {
+                !Path::new(&ws_info.workspace_dir).exists()
+            } else {
+                false
+            }
+        })
+        .cloned()
+        .collect()
+}
+
+/// The removable and the protected orphaned worktrees of `git_wt`'s repository.
+pub(crate) fn find_orphaned_worktrees(
+    instances: &[Instance],
+    git_wt: &GitWorktree,
+) -> Result<(Vec<WorktreeEntry>, Vec<WorktreeEntry>)> {
+    let tracked: HashSet<String> = instances
+        .iter()
+        .flat_map(|inst| {
+            let aside = purge_aside(inst).map(|aside| aside.to_string_lossy().into_owned());
+            std::iter::once(inst.project_path.clone()).chain(aside)
+        })
+        .collect();
+    Ok(partition_orphaned_worktrees(
+        git_wt.list_worktrees_with_abandoned_purges()?,
+        &git_wt.repo_path,
+        &tracked,
+        &git_wt.protected_default_branch_names()?,
+    ))
+}
+
 async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
     let (instances, _groups) = storage.load_with_groups()?;
 
-    let mut orphaned_sessions = Vec::new();
+    let orphaned_sessions = find_orphaned_sessions(&instances);
     let mut orphaned_worktrees = Vec::new();
-
-    for inst in &instances {
-        if let Some(_wt_info) = &inst.worktree_info {
-            let worktree_path = PathBuf::from(&inst.project_path);
-            if !worktree_path.exists() {
-                orphaned_sessions.push(inst.clone());
-            }
-        } else if let Some(ws_info) = &inst.workspace_info {
-            let ws_path = PathBuf::from(&ws_info.workspace_dir);
-            if !ws_path.exists() {
-                orphaned_sessions.push(inst.clone());
-            }
-        }
-    }
-
     let mut protected_worktrees = Vec::new();
     let current_dir = std::env::current_dir()?;
     if GitWorktree::is_git_repo(&current_dir) {
         let main_repo = GitWorktree::find_main_repo(&current_dir)?;
         let git_wt = GitWorktree::new(main_repo)?;
-        let worktrees = git_wt.list_worktrees_with_purges()?;
-        let tracked: HashSet<String> = instances
-            .iter()
-            .map(|inst| inst.project_path.clone())
-            .collect();
-
-        (orphaned_worktrees, protected_worktrees) = partition_orphaned_worktrees(
-            worktrees,
-            &git_wt.repo_path,
-            &tracked,
-            &git_wt.protected_default_branch_names()?,
-        );
+        (orphaned_worktrees, protected_worktrees) = find_orphaned_worktrees(&instances, &git_wt)?;
     }
 
     if !protected_worktrees.is_empty() {
@@ -294,6 +314,12 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
         let git_wt = GitWorktree::new(main_repo)?;
 
         for wt in &orphaned_worktrees {
+            // A purge resumed since the listing still owns its checkout.
+            let claim = GitWorktree::claim_abandoned_purge(&wt.path);
+            if claim.is_none() && GitWorktree::is_purging(&wt.path) {
+                eprintln!("✗ Skipped {}: its purge is in progress", wt.path.display());
+                continue;
+            }
             match git_wt.remove_worktree(&wt.path, true) {
                 Ok(_) => {
                     println!("✓ Removed worktree: {}", wt.path.display());
