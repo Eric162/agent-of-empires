@@ -431,7 +431,11 @@ mod tests {
             let git_wt = GitWorktree::new(repo.clone()).unwrap();
             let aside = tmp.path().join(".aoe-purge-x");
             git_wt.create_worktree("feat", &aside, true, None).unwrap();
-            drop(GitWorktree::mark_purging(&aside).unwrap());
+            let terms = crate::git::PurgeTerms {
+                row_removed: true,
+                force: false,
+            };
+            drop(GitWorktree::mark_purging(&aside, terms).unwrap());
             GitWorktree::await_purge_released(&aside);
             let aside = aside.canonicalize().unwrap();
 

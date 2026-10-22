@@ -758,6 +758,7 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
             self.store(),
             None,
             self.additional_protection.as_ref(),
+            false,
         );
         if !result.success {
             result.retained_instance = self.release_reservation(&result.errors).ok().flatten();
@@ -926,6 +927,7 @@ impl<S: SessionStore> CommittedPurge<S> {
             &self.store,
             Some(self.owner.token()),
             self.additional_protection.as_ref(),
+            true,
         );
         result.disposition = DeletionDisposition::Removed;
         if result.success {
@@ -1312,17 +1314,20 @@ pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
     perform_deletion_core(
         request,
         false,
+        false,
         |session_id| DockerContainer::from_session_id(session_id).teardown(session_id),
         &config,
         &[&CleanupProtection::default()],
     )
 }
 
+/// `row_removed` says the durable row is already gone, so nothing will retry a purge that dies.
 fn perform_deletion_teardown_lifecycle_locked(
     request: &DeletionRequest,
     store: &dyn SessionStore,
     except_owner: Option<&str>,
     additional_protection: Option<&CleanupProtection>,
+    row_removed: bool,
 ) -> DeletionResult {
     let config = match store.configuration(Some(store.storage().profile())) {
         Ok(config) => config,
@@ -1364,6 +1369,7 @@ fn perform_deletion_teardown_lifecycle_locked(
     perform_deletion_core(
         request,
         true,
+        row_removed,
         |session_id| DockerContainer::from_session_id(session_id).teardown(session_id),
         &config,
         &protections,
@@ -1389,6 +1395,7 @@ fn perform_deletion_with(
     perform_deletion_core(
         request,
         false,
+        false,
         teardown,
         &config,
         &[&CleanupProtection::default()],
@@ -1399,6 +1406,7 @@ fn perform_deletion_with(
 fn perform_deletion_core(
     request: &DeletionRequest,
     lifecycle_locked: bool,
+    row_removed: bool,
     teardown: impl FnOnce(&str) -> crate::containers::Teardown,
     config: &crate::session::Config,
     protection: &[&CleanupProtection],
@@ -1464,7 +1472,7 @@ fn perform_deletion_core(
             .is_some_and(|wt| wt.managed_by_aoe)
             || request.instance.workspace_info.is_some());
     let stage = |paths_in_use: &PathsInUse| {
-        stage_teardown_worktrees(
+        let (container_gone, moved) = stage_teardown_worktrees(
             request,
             repos,
             is_sandboxed,
@@ -1473,7 +1481,23 @@ fn perform_deletion_core(
             teardown,
             &mut errors,
             &mut messages,
-        )
+        );
+        // Only a purge whose row is already gone may be reaped if its process dies.
+        if let Some((moved, _)) = moved.as_ref().filter(|_| row_removed) {
+            let terms = crate::git::PurgeTerms {
+                row_removed,
+                force: request.force_delete,
+            };
+            let aside = Path::new(&moved.instance.project_path);
+            if let Err(error) = GitWorktree::set_purge_terms(aside, terms) {
+                tracing::warn!(target: "session.delete",
+                    session_id = %request.session_id,
+                    %error,
+                    "perform_deletion: could not mark the purge reapable"
+                );
+            }
+        }
+        (container_gone, moved)
     };
     let (container_gone, deferred) = if lifecycle_locked && removes_managed_worktree {
         with_paths_in_use_locked(&request.session_id, stage)
@@ -1781,7 +1805,11 @@ fn mark_for_purge(request: &DeletionRequest, path: &Path) -> Option<crate::git::
     if FAIL_HIDE_FOR_PURGE.with(|fail| fail.replace(false)) {
         return None;
     }
-    let marked = GitWorktree::mark_purging(path);
+    let terms = crate::git::PurgeTerms {
+        row_removed: false,
+        force: request.force_delete,
+    };
+    let marked = GitWorktree::mark_purging(path, terms);
     if let Err(error) = &marked {
         tracing::warn!(target: "session.delete",
             session_id = %request.session_id,
@@ -4463,6 +4491,7 @@ mod tests {
         #[derive(Clone, Copy, Debug, PartialEq)]
         enum Case {
             Clean,
+            Committed,
             Resumed,
             MoveErrorAfterMoving,
             AdoptedBeforeHide,
@@ -4479,6 +4508,7 @@ mod tests {
         };
         for case in [
             Case::Clean,
+            Case::Committed,
             Case::Resumed,
             Case::MoveErrorAfterMoving,
             Case::AdoptedBeforeHide,
@@ -4493,6 +4523,10 @@ mod tests {
             let kept_aside = matches!(
                 case,
                 Case::AdoptedBeforeHide | Case::AdoptedAfterHide | Case::UnreadableProfileAfterHide
+            );
+            let force_delete = matches!(
+                case,
+                Case::Committed | Case::RemovalFails | Case::OriginalReoccupied | Case::HideFails
             );
             let after_hide = matches!(
                 case,
@@ -4517,7 +4551,16 @@ mod tests {
                 test_git_in(&main_repo, &["worktree", "move", from, to]);
             }
             if after_hide {
-                drop(GitWorktree::mark_purging(&aside).unwrap());
+                drop(
+                    GitWorktree::mark_purging(
+                        &aside,
+                        crate::git::PurgeTerms {
+                            row_removed: false,
+                            force: false,
+                        },
+                    )
+                    .unwrap(),
+                );
             }
             if case == Case::UnreadableProfileAfterHide {
                 let other = Storage::new_unwatched("other").unwrap();
@@ -4570,6 +4613,19 @@ mod tests {
                         .iter()
                         .any(|entry| entry.branch.as_deref() == Some("feature/slow"));
                     let placed = (worktree_probe.exists(), aside_probe.exists());
+                    let marker = crate::git::cleanup::read_linked_worktree_gitdir(&aside_probe)
+                        .and_then(|admin| std::fs::read_to_string(admin.join("aoe-purge")).ok())
+                        .unwrap_or_default();
+                    assert_eq!(
+                        marker.contains("row removed"),
+                        case == Case::Committed,
+                        "{case:?}: only a committed purge is reapable: {marker}"
+                    );
+                    assert_eq!(
+                        marker.split(", ").any(|flag| flag == "force"),
+                        force_delete,
+                        "{case:?}: marker does not record the purge's force: {marker}"
+                    );
                     // A purge paused here is live: cleanup must not take its row or checkout.
                     let rows = Storage::open_unwatched(profile).unwrap().load().unwrap();
                     let git = GitWorktree::new(repo_probe.clone()).unwrap();
@@ -4618,10 +4674,7 @@ mod tests {
                 DeletionRequest {
                     delete_worktree: true,
                     delete_branch: true,
-                    force_delete: matches!(
-                        case,
-                        Case::RemovalFails | Case::OriginalReoccupied | Case::HideFails
-                    ),
+                    force_delete,
                     ..test_request(owner)
                 },
                 None,
@@ -4631,7 +4684,14 @@ mod tests {
                 Ok(transaction) => transaction,
                 Err(_) => panic!("purge reservation was refused"),
             };
-            let result = transaction.complete();
+            let result = if case == Case::Committed {
+                let Ok(committed) = transaction.begin_irreversible(None) else {
+                    panic!("purge commit was refused");
+                };
+                committed.finish(|_, _| Ok(()))
+            } else {
+                transaction.complete()
+            };
             BEFORE_DEFERRED_REMOVAL.with(|slot| slot.borrow_mut().take());
             BEFORE_MOVE_ASIDE.with(|slot| slot.borrow_mut().take());
 
@@ -4665,7 +4725,7 @@ mod tests {
                     .any(|entry| entry.branch.as_deref() == Some("feature/slow"))
             };
             match case {
-                Case::Clean | Case::Resumed | Case::MoveErrorAfterMoving => {
+                Case::Clean | Case::Committed | Case::Resumed | Case::MoveErrorAfterMoving => {
                     assert_eq!(result.disposition, DeletionDisposition::Removed, "{label}");
                     assert!(!aside.exists() && !worktree.exists(), "{label}");
                     assert!(!test_branch_exists(&main_repo, "feature/slow"), "{label}");
