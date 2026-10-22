@@ -28,10 +28,13 @@ const MUTATION_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// intentional remove or move.
 const WORKTREE_LOCK_REASON: &str = "aoe-managed worktree (prevents cross-boundary prune)";
 
-/// File in a worktree's admin directory marking a purge in progress. Listings skip a marked
-/// worktree so no session can adopt it; its lock and git's dirty refusal are untouched.
+/// File in a worktree's admin directory marking a purge in progress, holding the purging pid and
+/// its [`PurgeTerms`] flags. Listings skip a marked worktree so no session can adopt it; its lock
+/// and git's dirty refusal are untouched.
 const PURGE_MARKER: &str = "aoe-purge";
 const PURGE_CLAIM: &str = "aoe-purge.claim";
+const ROW_REMOVED_FLAG: &str = "row removed";
+const FORCE_FLAG: &str = "force";
 
 /// An `flock` on a marked worktree's claim file, held by whoever is finishing its purge. A marked
 /// worktree whose claim is free was abandoned.
@@ -44,6 +47,21 @@ pub(crate) struct WorktreeCreation {
     pub branch_created: bool,
     pub checkout_created: bool,
 }
+
+/// The terms an abandoned purge may be finished on: only once its session row is gone, and
+/// discarding changes only when the purge was forced.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PurgeTerms {
+    pub row_removed: bool,
+    pub force: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_REAP_CLAIM: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 pub struct WorktreeEntry {
     pub path: PathBuf,
     pub branch: Option<String>,
@@ -211,27 +229,116 @@ impl GitWorktree {
     }
 
     /// Hide `path` from `list_worktrees` while its purge runs, owned by the returned claim.
-    pub fn mark_purging(path: &Path) -> Result<PurgeClaim> {
-        let claim = Self::claim_purge(path)?;
-        std::fs::write(Self::purge_marker(path)?, "")?;
+    pub fn mark_purging(path: &Path, terms: PurgeTerms) -> Result<PurgeClaim> {
+        let claim = Self::claim_admin(Self::purge_marker(path)?.parent().unwrap_or(path))?;
+        Self::set_purge_terms(path, terms)?;
         Ok(claim)
     }
 
-    fn claim_purge(path: &Path) -> Result<PurgeClaim> {
+    /// Rewrite the terms of a purge whose claim the caller holds.
+    pub fn set_purge_terms(path: &Path, terms: PurgeTerms) -> Result<()> {
+        let flags: Vec<&str> = [
+            (terms.row_removed, ROW_REMOVED_FLAG),
+            (terms.force, FORCE_FLAG),
+        ]
+        .into_iter()
+        .filter_map(|(set, flag)| set.then_some(flag))
+        .collect();
+        // Written aside and renamed so a reader never sees a partial marker.
+        let target = Self::purge_marker(path)?;
+        let staged = target.with_extension("tmp");
+        std::fs::write(&staged, flags.join(", "))?;
+        Ok(std::fs::rename(staged, target)?)
+    }
+
+    fn parse_purge_marker(marker: &str) -> PurgeTerms {
+        let flags: Vec<&str> = marker.trim().split(", ").collect();
+        PurgeTerms {
+            row_removed: flags.contains(&ROW_REMOVED_FLAG),
+            force: flags.contains(&FORCE_FLAG),
+        }
+    }
+
+    /// Remove the checkouts of purges abandoned after their row was removed, since nothing else
+    /// retries them and they still hold their branch. A purge whose row remains is retried
+    /// through it instead. The branch and other session resources are left behind.
+    pub fn reap_abandoned_purges(&self) {
+        let Ok(repo) = open_repo_at(&self.repo_path) else {
+            return;
+        };
+        let Ok(names) = repo.worktrees() else {
+            return;
+        };
+        for name in names.iter().filter_map(|name| name.ok().flatten()) {
+            let admin = repo.commondir().join("worktrees").join(name);
+            if !admin.join(PURGE_MARKER).exists() {
+                continue;
+            }
+            #[cfg(test)]
+            if let Some(hook) = BEFORE_REAP_CLAIM.with(|slot| slot.borrow_mut().take()) {
+                hook();
+            }
+            // Another reaper may have kept or removed it since; only the marker read under the
+            // claim decides.
+            let Ok(_claim) = Self::claim_admin(&admin) else {
+                continue;
+            };
+            let Ok(marker) = std::fs::read_to_string(admin.join(PURGE_MARKER)) else {
+                continue;
+            };
+            let terms = Self::parse_purge_marker(&marker);
+            if !terms.row_removed {
+                continue;
+            }
+            let Ok(wt) = repo.find_worktree(name) else {
+                continue;
+            };
+            let path = wt.path().to_path_buf();
+            tracing::info!(target: "git.worktree", path = %path.display(), "reaping abandoned purge");
+            // Only a confirmed absence may skip git's dirty refusal; the caller prunes after
+            // unlocking.
+            let removed = match path.try_exists() {
+                Ok(true) => self
+                    .remove_worktree(&path, terms.force)
+                    .inspect_err(|error| {
+                        // Relock whatever remains; a checkout kept for its changes also goes back
+                        // to an ordinary, visible worktree, while other failures stay marked.
+                        if self.lock_worktree(&path).is_ok()
+                            && crate::git::cleanup::is_dirty_worktree_error(&error.to_string())
+                        {
+                            let _ = std::fs::remove_file(admin.join(PURGE_MARKER));
+                        }
+                    }),
+                Ok(false) => {
+                    self.unlock_worktree(&path);
+                    Ok(())
+                }
+                Err(error) => Err(error.into()),
+            };
+            if let Err(error) = removed {
+                tracing::warn!(target: "git.worktree", path = %path.display(), %error, "could not reap abandoned purge");
+            }
+        }
+    }
+
+    fn claim_admin(admin: &Path) -> Result<PurgeClaim> {
         use fs2::FileExt;
-        let claim_path = Self::purge_marker(path)?.with_file_name(PURGE_CLAIM);
         let lock = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(false)
-            .open(claim_path)?;
+            .open(admin.join(PURGE_CLAIM))?;
         lock.try_lock_exclusive().map_err(|_| {
             GitError::WorktreeCommandFailed(format!(
                 "{} is being purged by another process",
-                path.display()
+                admin.display()
             ))
         })?;
         Ok(PurgeClaim { _lock: lock })
+    }
+
+    fn claim_purge(path: &Path) -> Result<PurgeClaim> {
+        Self::claim_admin(Self::purge_marker(path)?.parent().unwrap_or(path))
     }
 
     /// Claims a marked worktree whose purge was abandoned, or `None` if its purge is live or it is
@@ -708,7 +815,14 @@ mod tests {
         git_wt
             .create_worktree("purging", &wt_path, true, None)
             .unwrap();
-        let live = GitWorktree::mark_purging(&wt_path).unwrap();
+        let live = GitWorktree::mark_purging(
+            &wt_path,
+            PurgeTerms {
+                row_removed: false,
+                force: false,
+            },
+        )
+        .unwrap();
         let listed = |abandoned: bool| {
             let entries = match abandoned {
                 true => git_wt.list_worktrees_with_abandoned_purges(),

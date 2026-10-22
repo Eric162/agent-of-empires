@@ -99,7 +99,7 @@ Without Force, purge preserves a dirty worktree and retains its session for retr
 
 Native daemon clients can abandon a stuck purge using its current reservation generation. Abandon removes the session record and schedules runtime cleanup; it does not cancel a hook or cleanup already underway, and does not start another worktree or branch removal.
 
-**Purging first moves the worktree** to a sibling `.aoe-purge-<session-id>`, marked by an `aoe-purge` file in its git admin directory, which `git worktree list` still shows but aoe hides from sessions, then removes it. A failed removal moves it back. A purge interrupted by a crash is finished on the next purge attempt while its session still exists; otherwise (web deletes remove the session first) `aoe worktree cleanup` lists the `.aoe-purge-<session-id>` checkout as orphaned once no process is still purging it, and can remove it.
+**Purging first moves the worktree** to a sibling `.aoe-purge-<session-id>`, marked by an `aoe-purge` file in its git admin directory, which `git worktree list` still shows but aoe hides from sessions, then removes it. A failed removal moves it back. A purge interrupted by a crash is finished by the next purge attempt while its session still exists; once the session is gone (web deletes) and the moved checkout was already marked reapable, the next worktree creation in that repository removes the checkout after the purging process has exited, keeping the branch. `aoe worktree cleanup` also lists such a checkout as orphaned once no process is still purging it. Uncommitted changes are only discarded by a forced purge; otherwise the checkout is kept as an ordinary worktree, still at `.aoe-purge-<session-id>`.
 
 ### The default branch's checkout is never removed
 
