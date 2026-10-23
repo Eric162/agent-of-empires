@@ -1019,6 +1019,23 @@ impl Storage {
         )
     }
 
+    /// [`Self::acquire_instance_lifecycle_lock`] without the wait; `None` while another holder has it.
+    pub(crate) fn try_acquire_instance_lifecycle_lock(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<StorageFlock>> {
+        super::validate_instance_id(instance_id)
+            .context("refusing lifecycle lock for invalid instance id")?;
+        let profile_dir = self
+            .sessions_path
+            .parent()
+            .ok_or_else(|| anyhow!("sessions path has no profile directory"))?;
+        try_acquire_storage_flock(
+            profile_dir,
+            &format!("{INSTANCE_LIFECYCLE_LOCK_PREFIX}{instance_id}.lock"),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn save_locks_are_free_for_test(&self) -> bool {
         let profile_dir = self.sessions_path.parent().expect("profile directory");

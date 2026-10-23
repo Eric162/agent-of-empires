@@ -180,20 +180,53 @@ fn purge_aside(inst: &Instance) -> Option<PathBuf> {
         .ok()
 }
 
+/// A row is orphaned once its checkout is gone and no lifecycle operation, such as a purge that
+/// may restore it, has it reserved.
+fn is_orphaned_session(inst: &Instance, now: chrono::DateTime<chrono::Utc>) -> bool {
+    if inst.has_fresh_lifecycle_reservation(now) {
+        return false;
+    }
+    if inst.worktree_info.is_some() {
+        !Path::new(&inst.project_path).exists() && purge_aside(inst).is_none()
+    } else if let Some(ws_info) = &inst.workspace_info {
+        !Path::new(&ws_info.workspace_dir).exists()
+    } else {
+        false
+    }
+}
+
 pub(crate) fn find_orphaned_sessions(instances: &[Instance]) -> Vec<Instance> {
+    let now = chrono::Utc::now();
     instances
         .iter()
-        .filter(|inst| {
-            if inst.worktree_info.is_some() {
-                !Path::new(&inst.project_path).exists() && purge_aside(inst).is_none()
-            } else if let Some(ws_info) = &inst.workspace_info {
-                !Path::new(&ws_info.workspace_dir).exists()
-            } else {
-                false
-            }
-        })
+        .filter(|inst| is_orphaned_session(inst, now))
         .cloned()
         .collect()
+}
+
+/// Removes the listed rows that are still orphaned, judged again under each row's lifecycle lock
+/// and the store lock. Returns how many were removed.
+pub(crate) fn remove_orphaned_sessions(storage: &Storage, orphans: &[Instance]) -> Result<usize> {
+    let mut held = Vec::new();
+    let mut ids = HashSet::new();
+    for orphan in orphans {
+        match storage.try_acquire_instance_lifecycle_lock(&orphan.id)? {
+            Some(lock) => {
+                held.push(lock);
+                ids.insert(orphan.id.clone());
+            }
+            None => eprintln!("✗ Skipped session {}: it is busy", orphan.id),
+        }
+    }
+    let mut removed = 0;
+    storage.update(|instances, _groups| {
+        let now = chrono::Utc::now();
+        let before = instances.len();
+        instances.retain(|inst| !(ids.contains(&inst.id) && is_orphaned_session(inst, now)));
+        removed = before - instances.len();
+        Ok(())
+    })?;
+    Ok(removed)
 }
 
 /// The removable and the protected orphaned worktrees of `git_wt`'s repository.
@@ -298,14 +331,9 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
     let mut removed_count = 0;
 
     if !orphaned_sessions.is_empty() {
-        let orphan_ids: HashSet<String> = orphaned_sessions.iter().map(|o| o.id.clone()).collect();
-        storage.update(|all_instances, _groups| {
-            all_instances.retain(|inst| !orphan_ids.contains(&inst.id));
-            Ok(())
-        })?;
-
-        removed_count += orphaned_sessions.len();
-        println!("✓ Removed {} orphaned sessions", orphaned_sessions.len());
+        let removed = remove_orphaned_sessions(&storage, &orphaned_sessions)?;
+        removed_count += removed;
+        println!("✓ Removed {removed} orphaned sessions");
     }
 
     if !orphaned_worktrees.is_empty() {
@@ -347,6 +375,53 @@ mod tests {
             branch: branch.map(str::to_string),
             is_detached: branch.is_none(),
         }
+    }
+
+    /// Cleanup lists rows, then removes them only if they are still orphaned: a purge may restore a
+    /// checkout in between, or hold the row while it runs.
+    #[test]
+    #[serial_test::serial]
+    fn cleanup_removes_only_rows_still_orphaned() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("home"));
+        let storage = Storage::new_unwatched("cleanup").unwrap();
+        let row = |name: &str| {
+            let mut inst = Instance::new(name, tmp.path().join(name).to_str().unwrap());
+            inst.worktree_info = Some(crate::session::WorktreeInfo {
+                branch: name.to_string(),
+                main_repo_path: tmp.path().join("main").to_string_lossy().into_owned(),
+                managed_by_aoe: true,
+                created_at: chrono::Utc::now(),
+                base_branch: None,
+            });
+            inst
+        };
+        let (gone, restored, locked, mut reserved) =
+            (row("gone"), row("restored"), row("locked"), row("reserved"));
+        reserved
+            .try_acquire_lifecycle_reservation(
+                crate::session::LifecycleOperation::Purge,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        let rows = vec![gone.clone(), restored.clone(), locked.clone(), reserved];
+        storage
+            .update(|instances, _groups| {
+                instances.extend(rows.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        let orphans = find_orphaned_sessions(&rows);
+        let ids = |rows: &[Instance]| rows.iter().map(|r| r.title.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&orphans), ["gone", "restored", "locked"]);
+
+        std::fs::create_dir(&restored.project_path).unwrap();
+        let _purging = storage.acquire_instance_lifecycle_lock(&locked.id).unwrap();
+        assert_eq!(remove_orphaned_sessions(&storage, &orphans).unwrap(), 1);
+        let left = storage.load().unwrap();
+        assert_eq!(ids(&left), ["restored", "locked", "reserved"]);
     }
 
     #[test]
