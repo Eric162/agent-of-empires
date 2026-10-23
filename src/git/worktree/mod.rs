@@ -39,6 +39,11 @@ pub struct PurgeClaim {
     _lock: std::fs::File,
 }
 
+#[derive(Default)]
+pub(crate) struct WorktreeCreation {
+    pub branch_created: bool,
+    pub checkout_created: bool,
+}
 pub struct WorktreeEntry {
     pub path: PathBuf,
     pub branch: Option<String>,
@@ -340,6 +345,16 @@ impl GitWorktree {
         Ok(entries)
     }
 
+    /// Worktrees of the repo containing `path` that have a branch checked
+    /// out, the main checkout included. Detached ones cannot be attached by branch.
+    pub fn list_branch_worktrees_at(path: &Path) -> Result<Vec<WorktreeEntry>> {
+        let worktrees = Self::new(Self::find_main_repo(path)?)?.list_worktrees()?;
+        Ok(worktrees
+            .into_iter()
+            .filter(|wt| !wt.is_detached && wt.branch.as_deref().is_some_and(|b| b != "HEAD"))
+            .collect())
+    }
+
     pub fn remove_worktree(&self, path: &Path, force: bool) -> Result<()> {
         if !path.exists() {
             return Err(GitError::WorktreeNotFound(path.to_path_buf()));
@@ -526,6 +541,51 @@ mod tests {
     }
 
     #[test]
+    fn branch_worktrees_skip_detached_and_resolve_from_linked_path() {
+        let (dir, _repo) = init_repo();
+        let main = dir.path();
+        let feature = TempDir::new().unwrap();
+        let detached = TempDir::new().unwrap();
+        let feature_path = feature.path().join("wt");
+        let detached_path = detached.path().join("wt");
+        run_git(
+            main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feat/x",
+                feature_path.to_str().unwrap(),
+            ],
+        );
+        run_git(
+            main,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                detached_path.to_str().unwrap(),
+            ],
+        );
+
+        let branches = |start: &Path| {
+            let mut b: Vec<String> = GitWorktree::list_branch_worktrees_at(start)
+                .unwrap()
+                .into_iter()
+                .filter_map(|wt| wt.branch)
+                .collect();
+            b.sort();
+            b
+        };
+        let main_branch = GitWorktree::get_current_branch(main).unwrap();
+        let mut want = vec![main_branch, "feat/x".to_string()];
+        want.sort();
+        assert_eq!(branches(main), want);
+        assert_eq!(branches(&feature_path), want);
+        assert!(GitWorktree::list_branch_worktrees_at(&main.join("missing")).is_err());
+    }
+
+    #[test]
     fn create_worktree_in_each_layout() {
         let (regular, _repo) = init_repo();
         let linked = linked_bare_layout();
@@ -627,6 +687,18 @@ mod tests {
         assert!(wt_path.join(".git").is_file());
     }
 
+    /// A child forked by a concurrent test can hold a dropped claim's descriptor until it execs.
+    pub(crate) fn await_released(path: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while GitWorktree::claim_purge(path).is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "purge claim never released"
+            );
+            std::thread::yield_now();
+        }
+    }
+
     #[test]
     fn only_cleanup_lists_an_abandoned_purge() {
         let (dir, _repo) = init_repo();
@@ -651,6 +723,7 @@ mod tests {
         assert!(GitWorktree::claim_abandoned_purge(&wt_path).is_none());
 
         drop(live);
+        await_released(&wt_path);
         assert!(
             !listed(false) && listed(true),
             "an abandoned purge was not listed"
