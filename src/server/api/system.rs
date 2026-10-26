@@ -1671,29 +1671,79 @@ pub async fn browse_filesystem(
     }
 }
 
-#[derive(Serialize)]
+#[derive(Debug, PartialEq, Serialize)]
 pub struct GroupInfo {
     pub path: String,
+    /// Sessions directly in this group, not in its children.
     pub session_count: usize,
+    pub archived: bool,
 }
 
-pub async fn list_groups(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let instances = state.instances.read().await;
-    let mut group_counts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    for inst in instances.iter() {
-        if !inst.group_path.is_empty() {
-            *group_counts.entry(inst.group_path.clone()).or_default() += 1;
-        }
+#[derive(Deserialize)]
+pub struct GroupsQuery {
+    profile: Option<String>,
+}
+
+/// `GET /api/groups[?profile=]`: the profile's groups for the wizard's Group field.
+pub async fn list_groups(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<GroupsQuery>,
+) -> impl IntoResponse {
+    let _namespace = state.profile_namespace.read().await;
+    let (profile, stored) = {
+        let metadata = state.canonical_metadata.read().await;
+        let served = state.served_profile().to_string();
+        let name = query.profile.filter(|p| !p.is_empty()).unwrap_or_else(|| {
+            if served.is_empty() {
+                metadata.default_profile.clone()
+            } else {
+                served
+            }
+        });
+        let Some(profile) = metadata.profiles.iter().find(|p| p.name == name) else {
+            return Json(Vec::<GroupInfo>::new());
+        };
+        (profile.name.clone(), profile.groups.clone())
+    };
+    let session_groups: Vec<String> = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .filter(|inst| {
+            inst.source_profile == profile
+                && inst.trashed_at.is_none()
+                && inst.archived_at.is_none()
+        })
+        .map(|inst| inst.group_path.clone())
+        .collect();
+    Json(group_infos(&session_groups, &stored))
+}
+
+/// Every group in the profile's tree (stored groups, the groups sessions are in,
+/// and each parent of a nested path), with its direct session count, sorted by
+/// path. The synthetic Archived, Trash and Scratch sections are left out.
+fn group_infos(session_groups: &[String], stored: &[crate::session::Group]) -> Vec<GroupInfo> {
+    let tree = crate::session::GroupTree::new_with_group_paths(
+        session_groups.iter().map(String::as_str),
+        stored,
+    );
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for path in session_groups {
+        *counts.entry(path.as_str()).or_default() += 1;
     }
-    let groups: Vec<GroupInfo> = group_counts
+    let mut groups: Vec<GroupInfo> = tree
+        .get_all_groups()
         .into_iter()
-        .map(|(path, session_count)| GroupInfo {
-            path,
-            session_count,
+        .filter(|g| !g.path.is_empty() && !crate::session::is_synthetic_project_header(&g.path))
+        .map(|g| GroupInfo {
+            session_count: counts.get(g.path.as_str()).copied().unwrap_or_default(),
+            archived: g.is_archived(),
+            path: g.path,
         })
         .collect();
-    Json(groups)
+    groups.sort_by(|a, b| a.path.cmp(&b.path));
+    groups
 }
 
 /// One agent row on the health readout. Every figure is optional for the same
@@ -2597,6 +2647,137 @@ pub async fn serve_sound_file(
 
 #[cfg(test)]
 mod tests {
+    /// A served profile deleted from disk lists no Groups, and listing doesn't recreate it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn list_groups_never_recreates_a_missing_profile() -> anyhow::Result<()> {
+        use axum::response::IntoResponse;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        let served = state.served_profile().to_string();
+        state.rename_served_profile(&served, "ghost");
+        let response = super::list_groups(
+            axum::extract::State(state),
+            axum::extract::Query(super::GroupsQuery { profile: None }),
+        )
+        .await
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(body.as_ref(), b"[]");
+        let ghost = crate::session::get_app_dir()?
+            .join("profiles")
+            .join("ghost");
+        assert!(!ghost.exists(), "{}", ghost.display());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn list_groups_uses_canonical_profiles_and_counts_only_live_sessions(
+    ) -> anyhow::Result<()> {
+        use crate::daemon::ProfileSnapshot;
+        use crate::session::{Group, Instance};
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut live = Instance::new("live", "/tmp");
+        live.source_profile = "memory".into();
+        live.group_path = "client/api".into();
+        let mut archived = live.clone();
+        archived.id = "archived".into();
+        archived.archived_at = Some(chrono::Utc::now());
+        let mut trashed = live.clone();
+        trashed.id = "trashed".into();
+        trashed.trashed_at = Some(chrono::Utc::now());
+        let mut other = live.clone();
+        other.id = "other".into();
+        other.source_profile = "other".into();
+        let state =
+            crate::server::test_support::build_test_app_state(vec![live, archived, trashed, other]);
+        let served = state.served_profile().to_string();
+        state.rename_served_profile(&served, "memory");
+        {
+            let mut metadata = state.canonical_metadata.write().await;
+            metadata.default_profile = "memory".into();
+            metadata.profiles = vec![ProfileSnapshot {
+                name: "memory".into(),
+                description: None,
+                groups: vec![Group::new("empty", "empty")],
+                projects: Vec::new(),
+            }];
+        }
+        let read = |profile: Option<&str>| {
+            let state = state.clone();
+            let query = GroupsQuery {
+                profile: profile.map(str::to_owned),
+            };
+            async move {
+                let response = list_groups(State(state), axum::extract::Query(query))
+                    .await
+                    .into_response();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+            }
+        };
+        let expected = serde_json::json!([
+            {"path": "client", "session_count": 0, "archived": false},
+            {"path": "client/api", "session_count": 1, "archived": false},
+            {"path": "empty", "session_count": 0, "archived": false},
+        ]);
+        for query in [None, Some(""), Some("memory")] {
+            assert_eq!(read(query).await, expected, "{query:?}");
+        }
+        assert_eq!(read(Some("missing")).await, serde_json::json!([]));
+        state.rename_served_profile("memory", "");
+        assert_eq!(read(None).await, expected, "canonical default profile");
+        let root = crate::session::get_app_dir()?;
+        assert!(
+            !root.join("profiles/memory").exists(),
+            "reads must not create a profile"
+        );
+        Ok(())
+    }
+
+    /// The wizard's Group list holds every group the sidebar can show: stored
+    /// empty groups and the parents of nested paths, but not the synthetic shelves.
+    #[test]
+    fn group_infos_merge_the_tree_with_session_counts() {
+        use crate::session::{
+            Group, ARCHIVED_SECTION_PATH, SCRATCH_GROUP_PATH, TRASH_SECTION_PATH,
+        };
+        let mut archived = Group::new("old", "old");
+        archived.archived_at = Some(chrono::Utc::now());
+        let stored = [Group::new("empty", "empty"), archived];
+        let sessions: Vec<String> = [
+            "client/api",
+            "client/api",
+            "zeta",
+            "",
+            SCRATCH_GROUP_PATH,
+            &format!("{ARCHIVED_SECTION_PATH}/repo"),
+            TRASH_SECTION_PATH,
+        ]
+        .iter()
+        .map(|p| p.to_string())
+        .collect();
+        let got: Vec<(String, usize, bool)> = group_infos(&sessions, &stored)
+            .into_iter()
+            .map(|g| (g.path, g.session_count, g.archived))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("client".to_string(), 0, false),
+                ("client/api".to_string(), 2, false),
+                ("empty".to_string(), 0, false),
+                ("old".to_string(), 0, true),
+                ("zeta".to_string(), 1, false),
+            ]
+        );
+        assert!(group_infos(&[], &[]).is_empty());
+    }
+
     use super::*;
     use axum::body::to_bytes;
     use std::collections::HashMap;
