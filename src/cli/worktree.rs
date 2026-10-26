@@ -441,10 +441,15 @@ mod tests {
                 purging.contains(&aside),
                 "kept {kept}: abandoned purge not listed"
             );
-            assert!(
-                crate::session::builder::ensure_not_purging(&aside).is_err(),
-                "kept {kept}: a session could take the listed checkout"
-            );
+            let inside = aside.join("src");
+            std::fs::create_dir(&inside).unwrap();
+            for path in [&aside, &inside] {
+                assert!(
+                    crate::session::builder::ensure_not_purging(path).is_err(),
+                    "kept {kept}: a session could take {}",
+                    path.display()
+                );
+            }
             if kept {
                 GitWorktree::unmark_purging(&aside).unwrap();
             }

@@ -621,7 +621,7 @@ pub fn build_instance(
 
 /// A checkout marked for purging is about to be removed, so no new session may take it.
 pub(crate) fn ensure_not_purging(path: &std::path::Path) -> Result<()> {
-    if crate::git::GitWorktree::is_purging(path) {
+    if crate::git::GitWorktree::is_within_purging(path) {
         bail!("Project path is being purged: {}", path.display());
     }
     Ok(())

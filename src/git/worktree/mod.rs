@@ -261,6 +261,13 @@ impl GitWorktree {
         }
     }
 
+    /// Whether the checkout containing `path`, which may be a subdirectory, is marked for purging.
+    pub(crate) fn is_within_purging(path: &Path) -> bool {
+        path.ancestors()
+            .find(|dir| dir.join(".git").exists())
+            .is_some_and(Self::is_purging)
+    }
+
     pub(crate) fn is_purging(path: &Path) -> bool {
         Self::purge_marker(path).is_ok_and(|marker| marker.exists())
     }
