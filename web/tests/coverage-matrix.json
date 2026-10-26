@@ -1864,8 +1864,14 @@
       "id": "sidebar.reorder-click-after-drag-suppressed",
       "kind": "mocked-playwright",
       "risk": "high",
-      "specs": ["tests/sidebar-reorder.spec.ts"],
-      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+      "specs": ["tests/sidebar-reorder.spec.ts", "src/components/sidebar/dnd.test.ts"],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/SidebarGroupHeader.tsx",
+        "web/src/components/sidebar/dnd.ts",
+        "web/src/components/sidebar/Sortable.tsx"
+      ],
+      "notes": "End, cancel and mid-drag unmount suppress only the release click; a fresh press disarms the guard. Browser regressions observe installation and removal of the sensor click listener before one deliberate click, without a fixed delay or click retries."
     },
     {
       "id": "sidebar.reorder-cross-group-noop",
