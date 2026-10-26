@@ -234,6 +234,19 @@ impl GitWorktree {
         Ok(PurgeClaim { _lock: lock })
     }
 
+    /// A child forked by a concurrent test can hold a dropped claim's descriptor until it execs.
+    #[cfg(test)]
+    pub(crate) fn await_purge_released(path: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while Self::claim_purge(path).is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "purge claim never released"
+            );
+            std::thread::yield_now();
+        }
+    }
+
     /// Claims a marked worktree whose purge was abandoned, or `None` if its purge is live or it is
     /// no longer marked.
     pub fn claim_abandoned_purge(path: &Path) -> Option<PurgeClaim> {
@@ -717,18 +730,6 @@ mod tests {
         assert!(wt_path.join(".git").is_file());
     }
 
-    /// A child forked by a concurrent test can hold a dropped claim's descriptor until it execs.
-    pub(crate) fn await_released(path: &Path) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while GitWorktree::claim_purge(path).is_err() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "purge claim never released"
-            );
-            std::thread::yield_now();
-        }
-    }
-
     #[test]
     fn only_cleanup_lists_an_abandoned_purge() {
         let (dir, _repo) = init_repo();
@@ -753,7 +754,7 @@ mod tests {
         assert!(GitWorktree::claim_abandoned_purge(&wt_path).is_none());
 
         drop(live);
-        await_released(&wt_path);
+        GitWorktree::await_purge_released(&wt_path);
         assert!(
             !listed(false) && listed(true),
             "an abandoned purge was not listed"
