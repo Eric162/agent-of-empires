@@ -294,6 +294,7 @@ mod tests {
             path: path.to_path_buf(),
             branch: branch.map(str::to_string),
             is_detached: false,
+            abandoned_purge: false,
         }
     }
 

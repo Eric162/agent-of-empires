@@ -249,26 +249,13 @@ pub(crate) fn find_orphaned_worktrees(
     ))
 }
 
-/// The listed worktrees that are abandoned purges, which keep that classification until removal.
-pub(crate) fn purging_paths(orphans: &[WorktreeEntry]) -> HashSet<PathBuf> {
-    orphans
-        .iter()
-        .filter(|wt| GitWorktree::is_purging(&wt.path))
-        .map(|wt| wt.path.clone())
-        .collect()
-}
-
 /// Removes the listed orphaned worktrees and returns how many were removed. An abandoned purge is
 /// removed only while it is still marked and its claim held: recovery may since have kept it for
 /// a session to adopt.
-pub(crate) fn remove_orphaned_worktrees(
-    git_wt: &GitWorktree,
-    orphans: &[WorktreeEntry],
-    purging: &HashSet<PathBuf>,
-) -> usize {
+pub(crate) fn remove_orphaned_worktrees(git_wt: &GitWorktree, orphans: &[WorktreeEntry]) -> usize {
     let mut removed = 0;
     for wt in orphans {
-        let _claim = if purging.contains(&wt.path) {
+        let _claim = if wt.abandoned_purge {
             let Some(claim) = GitWorktree::claim_abandoned_purge(&wt.path) else {
                 eprintln!(
                     "✗ Skipped {}: its purge was resumed or kept",
@@ -309,7 +296,6 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
         let git_wt = GitWorktree::new(main_repo)?;
         (orphaned_worktrees, protected_worktrees) = find_orphaned_worktrees(&instances, &git_wt)?;
     }
-    let purging = purging_paths(&orphaned_worktrees);
 
     if !protected_worktrees.is_empty() {
         println!("Skipped (default-branch checkouts, never removed):\n");
@@ -389,7 +375,7 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
         let main_repo = GitWorktree::find_main_repo(&current_dir)?;
         let git_wt = GitWorktree::new(main_repo)?;
 
-        removed_count += remove_orphaned_worktrees(&git_wt, &orphaned_worktrees, &purging);
+        removed_count += remove_orphaned_worktrees(&git_wt, &orphaned_worktrees);
     }
 
     println!("\n✓ Cleanup complete: {} items removed", removed_count);
@@ -406,6 +392,7 @@ mod tests {
             path: PathBuf::from(path),
             branch: branch.map(str::to_string),
             is_detached: branch.is_none(),
+            abandoned_purge: false,
         }
     }
 
@@ -440,9 +427,10 @@ mod tests {
             let aside = aside.canonicalize().unwrap();
 
             let (orphans, _) = find_orphaned_worktrees(&[], &git_wt).unwrap();
-            let purging = purging_paths(&orphans);
             assert!(
-                purging.contains(&aside),
+                orphans
+                    .iter()
+                    .any(|wt| wt.abandoned_purge && wt.path == aside),
                 "kept {kept}: abandoned purge not listed"
             );
             let inside = aside.join("src");
@@ -466,7 +454,7 @@ mod tests {
                 GitWorktree::unmark_purging(&aside).unwrap();
             }
 
-            let removed = remove_orphaned_worktrees(&git_wt, &orphans, &purging);
+            let removed = remove_orphaned_worktrees(&git_wt, &orphans);
             assert_eq!(removed, usize::from(!kept), "kept {kept}");
             assert_eq!(aside.exists(), kept, "kept {kept}");
         }

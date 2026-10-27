@@ -28,8 +28,8 @@ const MUTATION_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// intentional remove or move.
 const WORKTREE_LOCK_REASON: &str = "aoe-managed worktree (prevents cross-boundary prune)";
 
-/// File in a worktree's admin directory marking a purge in progress, holding the purging pid and
-/// its [`PurgeTerms`] flags. Listings skip a marked worktree so no session can adopt it; its lock
+/// File in a worktree's admin directory marking a purge in progress, holding its [`PurgeTerms`]
+/// flags; the claim flock, not the marker, shows whether its purger is alive. Listings skip a marked worktree so no session can adopt it; its lock
 /// and git's dirty refusal are untouched.
 const PURGE_MARKER: &str = "aoe-purge";
 const PURGE_CLAIM: &str = "aoe-purge.claim";
@@ -66,6 +66,8 @@ pub struct WorktreeEntry {
     pub path: PathBuf,
     pub branch: Option<String>,
     pub is_detached: bool,
+    /// A checkout marked for a purge whose claim was free, listed only for cleanup.
+    pub abandoned_purge: bool,
 }
 
 pub struct GitWorktree {
@@ -259,10 +261,11 @@ impl GitWorktree {
         }
     }
 
-    /// Remove the checkouts of purges abandoned after their row was removed, since nothing else
-    /// retries them and they still hold their branch. A purge whose row remains is retried
-    /// through it instead. The branch and other session resources are left behind.
-    pub fn reap_abandoned_purges(&self) {
+    /// Remove the checkout of a purge abandoned after its row was removed that still holds
+    /// `branch`, since nothing else retries it. A purge whose row remains is retried through it
+    /// instead, and other branches' are left to `aoe worktree cleanup`.
+    pub fn reap_abandoned_purge(&self, branch: &str) {
+        let head = format!("ref: refs/heads/{branch}");
         let Ok(repo) = open_repo_at(&self.repo_path) else {
             return;
         };
@@ -271,7 +274,9 @@ impl GitWorktree {
         };
         for name in names.iter().filter_map(|name| name.ok().flatten()) {
             let admin = repo.commondir().join("worktrees").join(name);
-            if !admin.join(PURGE_MARKER).exists() {
+            let on_branch =
+                std::fs::read_to_string(admin.join("HEAD")).is_ok_and(|found| found.trim() == head);
+            if !on_branch || !admin.join(PURGE_MARKER).exists() {
                 continue;
             }
             #[cfg(test)]
@@ -479,6 +484,7 @@ impl GitWorktree {
                 path: self.repo_path.clone(),
                 branch: Self::get_current_branch(&self.repo_path).ok(),
                 is_detached: repo.head_detached()?,
+                abandoned_purge: false,
             });
         }
         for name in repo.worktrees()?.iter().filter_map(|r| r.ok().flatten()) {
@@ -488,13 +494,15 @@ impl GitWorktree {
             let Ok(path) = wt.path().canonicalize() else {
                 continue;
             };
-            if Self::is_purging(&path) && !(include_abandoned && Self::claim_purge(&path).is_ok()) {
+            let abandoned_purge = Self::is_purging(&path);
+            if abandoned_purge && !(include_abandoned && Self::claim_purge(&path).is_ok()) {
                 continue;
             }
             entries.push(WorktreeEntry {
                 branch: Self::get_current_branch(&path).ok(),
                 path,
                 is_detached: false,
+                abandoned_purge,
             });
         }
         Ok(entries)

@@ -145,7 +145,7 @@ impl GitWorktree {
         // skips locked entries; siblings keep their locks.
         self.unlock_worktree(path);
         let t = Instant::now();
-        self.reap_abandoned_purges();
+        self.reap_abandoned_purge(branch);
         self.prune_worktrees()?;
         tracing::info!(target: "git.worktree", "worktree create: prune done in {:?}", t.elapsed());
 
@@ -675,6 +675,10 @@ pub(super) mod tests {
                 Setup::CorruptIndex => std::fs::write(admin.join("index"), "not an index").unwrap(),
                 Setup::None | Setup::UnstattableCheckout => {}
             }
+            let other = parent.path().join(".aoe-purge-other");
+            git_wt.create_worktree("other", &other, true, None).unwrap();
+            drop(GitWorktree::mark_purging(&other, terms).unwrap());
+            GitWorktree::await_purge_released(&other);
             let set_mode = |mode| {
                 std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(mode))
                     .unwrap()
@@ -699,6 +703,7 @@ pub(super) mod tests {
                 assert!(admin.join("locked").exists(), "{label}: left unlocked");
             }
             assert_eq!(aside.exists(), !reaped, "{label}");
+            assert!(other.exists(), "{label}: reaped another branch's purge");
         }
     }
 
@@ -728,7 +733,7 @@ pub(super) mod tests {
                 super::super::BEFORE_REAP_CLAIM.with(|slot| {
                     *slot.borrow_mut() = Some(Box::new(move || {
                         let first = GitWorktree::new(repo).unwrap();
-                        first.reap_abandoned_purges();
+                        first.reap_abandoned_purge("feat");
                         assert!(listed_on(&first, "feat"), "first reaper did not keep it");
                         let git = |args: &[&str]| {
                             let status = std::process::Command::new("git")
@@ -744,7 +749,7 @@ pub(super) mod tests {
                     }));
                 });
             }
-            git_wt.reap_abandoned_purges();
+            git_wt.reap_abandoned_purge("feat");
             super::super::BEFORE_REAP_CLAIM.with(|slot| slot.borrow_mut().take());
             assert!(aside.exists(), "claim held {claim_held}: checkout removed");
             assert_eq!(
