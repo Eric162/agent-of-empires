@@ -1057,9 +1057,11 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
     let created_ids = storage.update(|all_instances, groups| {
         let mut ids = Vec::new();
         for (s, session_config) in to_import.iter().zip(&session_configs) {
-            if already_imported(all_instances, &s.session_id)
-                || crate::git::GitWorktree::is_within_purging(std::path::Path::new(&s.cwd))
-            {
+            if already_imported(all_instances, &s.session_id) {
+                continue;
+            }
+            if crate::git::GitWorktree::is_within_purging(std::path::Path::new(&s.cwd)) {
+                eprintln!("Skipping {}: its project path is being purged", s.cwd);
                 continue;
             }
             let inst = build_import_instance(s, structured, &group, session_config);

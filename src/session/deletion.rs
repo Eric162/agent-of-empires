@@ -1834,7 +1834,10 @@ fn move_back_from_aside(request: &DeletionRequest) -> crate::git::error::Result<
     // A partial removal can leave no admin entry for git to move; without one, unlocking lets
     // prune reap the entry, and with one, repair points it at the new path.
     git.unlock_worktree(&aside);
-    std::fs::rename(&aside, &from)?;
+    if let Err(error) = std::fs::rename(&aside, &from) {
+        let _ = git.lock_worktree(&aside);
+        return Err(error.into());
+    }
     if has_admin {
         git.repair_worktree(&from)?;
         GitWorktree::unmark_purging(&from)?;

@@ -443,7 +443,15 @@ mod tests {
             );
             let inside = aside.join("src");
             std::fs::create_dir(&inside).unwrap();
-            for path in [&aside, &inside] {
+            let nested = aside.join("nested");
+            std::fs::create_dir(&nested).unwrap();
+            assert!(std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&nested)
+                .status()
+                .unwrap()
+                .success());
+            for path in [&aside, &inside, &nested] {
                 assert!(
                     crate::session::builder::ensure_not_purging(path).is_err(),
                     "kept {kept}: a session could take {}",
