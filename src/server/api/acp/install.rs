@@ -339,7 +339,14 @@ mod tests {
         let get = |id: &'static str| fetch(state.clone(), id);
         let claude_npm = "npm install -g @agentclientprotocol/claude-agent-acp@latest";
         for (id, agent, name, command, npm, sandboxed) in [
-            ("claude", "claude", "Claude", Some(claude_npm), true, false),
+            (
+                "claude",
+                "claude",
+                "Claude Code",
+                Some(claude_npm),
+                true,
+                false,
+            ),
             (
                 "opencode",
                 "opencode",
@@ -360,7 +367,7 @@ mod tests {
             (
                 "sandboxed",
                 "claude",
-                "Claude",
+                "Claude Code",
                 Some(claude_npm),
                 true,
                 true,
