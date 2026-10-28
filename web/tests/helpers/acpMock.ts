@@ -21,6 +21,12 @@ export interface AcpSessionMockOptions {
   trashedAt?: string;
   /** Report the session archived with a stopped worker (#4116). */
   archivedAt?: string;
+  /** Report the worker as still starting. */
+  workerStarting?: boolean;
+  /** The starting Session's `acp_agent`; defaults to claude. */
+  startingAgent?: string;
+  /** Overrides the reported `acp_worker_state`. */
+  workerState?: "absent" | "resuming" | "running" | "stopping";
 }
 
 export interface AcpSessionMock {
@@ -157,6 +163,23 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
       }),
     );
   }
+  await page.route("**/api/agents", (r) =>
+    r.fulfill({
+      json: [
+        {
+          name: "claude",
+          display_name: "Claude Code",
+          kind: "builtin",
+          binary: "claude",
+          host_only: false,
+          installed: true,
+          install_hint: "",
+          acp_capable: true,
+          acp_installed: true,
+        },
+      ],
+    }),
+  );
   await page.route("**/api/about", (r) => r.fulfill({ json: opts.about ?? {} }));
   await page.route("**/api/telemetry/seen", (r) => {
     const body = r.request().postData();
@@ -195,7 +218,10 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
             archived_at: opts.archivedAt ?? null,
             workspace_repos: [],
             view: "structured",
-            acp_worker_state: opts.trashedAt || opts.archivedAt ? "stopped" : "running",
+            acp_worker_state:
+              opts.workerState ??
+              (opts.trashedAt || opts.archivedAt ? "stopped" : opts.workerStarting ? "resuming" : "running"),
+            ...(opts.workerStarting ? { acp_agent: opts.startingAgent ?? "claude" } : {}),
             claude_fullscreen: false,
           },
         ],

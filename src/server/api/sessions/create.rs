@@ -659,12 +659,12 @@ pub(super) async fn wait_until_left_starting(
 pub async fn create_session(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<CreateSessionQuery>,
-    local: Option<axum::Extension<crate::server::auth::LocalAuthorization>>,
+    local: Option<axum::Extension<crate::server::principal::Principal>>,
     body: Result<Json<CreateSessionBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    let local_owner = matches!(
+    let local_owner = crate::server::principal::authorize(
         local.as_deref(),
-        Some(crate::server::auth::LocalAuthorization::UnixOwner(_))
+        crate::server::principal::Capability::CreateHookDetail,
     );
     if state.read_only {
         return crate::server::api::read_only_response();
@@ -764,6 +764,7 @@ pub async fn create_session(
         body.command_override = String::new();
         body.extra_args = String::new();
         body.extra_env = Vec::new();
+        body.hook_env = Vec::new();
         body.yolo_mode = false;
         body.worktree_enabled = false;
         body.worktree_branch = None;
@@ -833,6 +834,14 @@ pub async fn create_session(
         );
     }
 
+    if !body.hook_env.is_empty() && !body.sandbox {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "hook_env requires sandbox; host_hooks.before_start only runs for sandboxed sessions",
+        );
+    }
+
     // Validate user inputs for shell injection. `path` is server-provisioned
     // for scratch sessions, so skip it there.
     let mut shell_checks: Vec<(&str, &str)> = vec![(body.extra_args.as_str(), "extra_args")];
@@ -899,6 +908,61 @@ pub async fn create_session(
                 crate::acp::supervisor::SupervisorError::AgentNotAllowed(agent_key.to_string())
                     .to_string(),
             );
+        }
+    }
+
+    // A structured session whose adapter resolves nowhere could only fail to
+    // start, so refuse it before anything is provisioned. An import is
+    // always structured, and its listing below would launch the adapter.
+    let importing = body
+        .import_acp_session_id
+        .as_deref()
+        .is_some_and(|id| !id.trim().is_empty());
+    if body.view == crate::session::View::Structured || importing {
+        let profile = validation_profile.to_string();
+        let project_path = std::path::PathBuf::from(&body.path);
+        // These launch in a directory provisioned later, not `body.path`.
+        let launch_dir_known = !(body.scratch
+            || create_body_uses_worktree(&body)
+            || !body.extra_repo_paths.is_empty());
+        let (tool, agent_name) = (body.tool.clone(), body.agent_name.clone());
+        let (command_override, sandboxed) = (body.command_override.clone(), body.sandbox);
+        let (scratch, trust_hooks) = (body.scratch, body.trust_hooks);
+        let missing = tokio::task::spawn_blocking(move || {
+            use crate::session::builder::structured::{
+                preparation_hooks_apply, validate_structured_choice, StructuredChoice,
+                StructuredChoiceError,
+            };
+            let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+                &profile,
+                &project_path,
+            );
+            let choice = StructuredChoice {
+                tool: &tool,
+                agent_name: agent_name.as_deref(),
+                command_override: &command_override,
+                sandboxed,
+                project_path: launch_dir_known.then_some(project_path.as_path()),
+                // The repository's hooks are merged into `config` whatever their trust.
+                preparation_hooks: &|| {
+                    preparation_hooks_apply(
+                        &crate::session::config::profile_config::resolve_config_or_warn(&profile)
+                            .hooks,
+                        &project_path,
+                        scratch,
+                        trust_hooks,
+                    )
+                },
+            };
+            match validate_structured_choice(&choice, &config) {
+                Err(StructuredChoiceError::AdapterMissing(msg)) => Some(msg),
+                _ => None,
+            }
+        })
+        .await
+        .unwrap_or(None);
+        if let Some(msg) = missing {
+            return api_error(StatusCode::BAD_REQUEST, "acp_adapter_missing", msg);
         }
     }
 
@@ -1096,6 +1160,7 @@ pub async fn create_session(
         sandbox_image: body.sandbox_image,
         yolo_mode: body.yolo_mode,
         extra_env: body.extra_env,
+        before_start_hook_env: body.hook_env,
         extra_args: body.extra_args,
         command_override: body.command_override,
         extra_repo_paths: body.extra_repo_paths,
@@ -1263,7 +1328,7 @@ fn create_failure(e: &anyhow::Error) -> Option<crate::server::create_progress::C
 pub async fn create_session_progress(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
-    local: Option<axum::Extension<crate::server::auth::LocalAuthorization>>,
+    local: Option<axum::Extension<crate::server::principal::Principal>>,
 ) -> impl IntoResponse {
     match state.create_progress.snapshot(&key, local.as_deref()) {
         Some(snapshot) => Json(snapshot).into_response(),
@@ -1331,6 +1396,7 @@ pub(super) fn public_create_session_error(e: &anyhow::Error) -> String {
             GitError::WorktreeAlreadyExists(_)
             | GitError::BranchAlreadyCheckedOut(_)
             | GitError::BranchNotFound(_)
+            | GitError::InvalidTemplate(_)
             | GitError::NotAGitRepo => return git_err.to_string(),
             // Raw command output / libgit2 / IO: not safe to expose.
             GitError::WorktreeCommandFailed(_)

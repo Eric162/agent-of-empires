@@ -44,7 +44,9 @@ pub use delete::DeleteSessionOutcome;
 pub use errors::{AcpError, IncompatibleAgentError};
 pub use list::{list_native_sessions, ListSessionsError};
 pub use reset::ResetSessionOutcome;
-pub use resolve_command::{resolve_agent_command, ResolvedAgentCommand, Unresolved};
+pub use resolve_command::{
+    is_bare_command, on_agent_path, resolve_agent_command, ResolvedAgentCommand, Unresolved,
+};
 pub(crate) use runner::wrap_in_scope;
 pub use session_sandbox::SessionSandbox;
 pub(crate) use spawn::host_environment_denyreason;
@@ -524,7 +526,7 @@ impl AcpClient {
             // runner's process group first or its children leak (#1689).
             crate::process::worker_registry::terminate_and_wait(&session_id.0)
                 .await
-                .map_err(|e| AcpError::Spawn(format!("previous runtime cleanup: {e}")))?;
+                .map_err(|e| AcpError::Spawn(format!("previous runtime cleanup: {e:#}")))?;
             if cancellation.is_cancelled() {
                 return Err(AcpError::Spawn("launch cancelled before spawning".into()));
             }

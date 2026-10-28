@@ -147,6 +147,7 @@ impl From<NewSessionData> for crate::session::builder::InstanceParams {
             sandbox_image: data.sandbox_image,
             yolo_mode: data.yolo_mode,
             extra_env: data.extra_env,
+            before_start_hook_env: Vec::new(),
             extra_args: data.extra_args,
             command_override: data.command_override,
             extra_repo_paths: data.extra_repo_paths,
@@ -194,7 +195,7 @@ pub struct NewSessionDialog {
     pub(super) yolo_mode: bool,
     pub(super) yolo_mode_default: bool,
     pub(super) structured_enabled: bool,
-    /// Configured opening state (`acp.default_new_session_view`), re-applied
+    /// Configured opening state (`acp.structured_view`), re-applied
     /// when a tool change makes the structured view available again.
     pub(super) structured_default: bool,
     /// The user's own toggle choice, restored instead of the configured
@@ -388,8 +389,8 @@ const OVERRIDES_UNRESOLVED_ERROR: &str = "Could not load this project's settings
 /// Whether `tool` can back a structured-view (ACP) session, judged against
 /// the resolved config.
 fn compute_structured_capable(tool: &str, config: &crate::session::Config) -> bool {
-    // Opt-in setting, shared with `session_switch_view_target`.
-    config.acp.offer_structured_in_new_session
+    // Shared with `session_switch_view_target`.
+    config.acp.structured_view.is_offered()
         && crate::session::builder::structured::tool_acp_capable(tool, config)
 }
 
@@ -509,8 +510,7 @@ impl NewSessionDialog {
             .unwrap_or_default();
         let command_override_value = config.session.resolve_tool_command(selected_tool);
         let structured_capable = compute_structured_capable(selected_tool, &config);
-        let structured_default = config.acp.default_new_session_view
-            == crate::session::config::NewSessionView::Structured;
+        let structured_default = config.acp.structured_view.starts_structured();
 
         let (extra_env, inherited_settings) = if sandbox_enabled {
             let inherited = build_inherited_settings(&config.sandbox);
@@ -977,8 +977,7 @@ impl NewSessionDialog {
 
         self.yolo_mode_default = config.session.yolo_mode_default;
         self.yolo_mode = self.yolo_mode_default;
-        self.structured_default = config.acp.default_new_session_view
-            == crate::session::config::NewSessionView::Structured;
+        self.structured_default = config.acp.structured_view.starts_structured();
         // Each profile has its own registry, so an earlier resolution says nothing about this one. A
         // scratch session belongs to no project, so a retained path's overrides do not apply.
         self.overrides_resolved_for = None;
@@ -2127,12 +2126,29 @@ impl NewSessionDialog {
         }
         let profile = self.selected_profile().to_string();
         let config = self.resolve_config_for_path(&profile);
-        if let Err(msg) = crate::session::builder::structured::validate_structured_choice(
-            &self.available_tools[self.tool_index],
-            self.command_override.value(),
-            &config,
-        ) {
-            self.error_message = Some(msg);
+        let path = path_input::expand_tilde(self.path.value().trim());
+        let choice = crate::session::builder::structured::StructuredChoice {
+            tool: &self.available_tools[self.tool_index],
+            agent_name: None,
+            command_override: self.command_override.value(),
+            sandboxed: self.sandbox_enabled,
+            // A worktree or scratch session launches in a directory created later.
+            project_path: (!self.scratch && !self.worktree_enabled)
+                .then(|| std::path::Path::new(&path)),
+            // The dialog asks for hook trust itself, so an unapproved hook still counts here.
+            preparation_hooks: &|| {
+                crate::session::builder::structured::preparation_hooks_apply(
+                    &crate::session::config::profile_config::resolve_config_or_warn(&profile).hooks,
+                    std::path::Path::new(&path),
+                    self.scratch,
+                    None,
+                )
+            },
+        };
+        if let Err(e) =
+            crate::session::builder::structured::validate_structured_choice(&choice, &config)
+        {
+            self.error_message = Some(e.to_string());
             return false;
         }
         true
